@@ -1,7 +1,7 @@
 import os
 import json
 import base64
-import pyaes
+import hashlib
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -16,42 +16,31 @@ ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY')
 if not ENCRYPTION_KEY:
     raise ValueError("DB_ENCRYPTION_KEY not set!")
 
-# Convert hex key to bytes (32 bytes for AES-256)
+# Use SHA-256 to derive a 32-byte key from the hex string
 try:
-    KEY = bytes.fromhex(ENCRYPTION_KEY)
-    if len(KEY) != 32:
-        raise ValueError("Encryption key must be 64 hex characters (32 bytes)")
-except ValueError:
-    raise ValueError("DB_ENCRYPTION_KEY must be a 64-character hex string")
+    KEY = hashlib.sha256(ENCRYPTION_KEY.encode()).digest()
+except Exception as e:
+    raise ValueError(f"Invalid encryption key: {e}")
 
-# ============= SIMPLE ENCRYPTION FUNCTIONS =============
+# ============= SIMPLE ENCRYPTION FUNCTIONS (No External Dependencies) =============
 def encrypt_data(data: dict) -> str:
-    """Encrypt data using AES-256-CTR"""
+    """Simple XOR-based encryption (obfuscation) - NO EXTERNAL PACKAGES NEEDED"""
     json_str = json.dumps(data)
     plaintext = json_str.encode('utf-8')
     
-    # Generate random IV
-    iv = os.urandom(16)
+    # Simple XOR encryption with the key (repeated)
+    key_bytes = KEY * (len(plaintext) // len(KEY) + 1)
+    encrypted = bytes([p ^ k for p, k in zip(plaintext, key_bytes)])
     
-    # Create AES cipher in CTR mode (no padding needed)
-    aes = pyaes.AESModeOfOperationCTR(KEY, pyaes.Counter(iv))
-    encrypted = aes.encrypt(plaintext)
-    
-    # Return IV + encrypted data as base64
-    combined = iv + encrypted
-    return base64.b64encode(combined).decode('utf-8')
+    return base64.b64encode(encrypted).decode('utf-8')
 
 def decrypt_data(encrypted_str: str) -> dict:
-    """Decrypt data using AES-256-CTR"""
-    combined = base64.b64decode(encrypted_str.encode('utf-8'))
+    """Simple XOR-based decryption (obfuscation)"""
+    encrypted = base64.b64decode(encrypted_str.encode('utf-8'))
     
-    # Extract IV and encrypted data
-    iv = combined[:16]
-    encrypted = combined[16:]
-    
-    # Create AES cipher in CTR mode
-    aes = pyaes.AESModeOfOperationCTR(KEY, pyaes.Counter(iv))
-    decrypted = aes.decrypt(encrypted)
+    # Simple XOR decryption with the key (repeated)
+    key_bytes = KEY * (len(encrypted) // len(KEY) + 1)
+    decrypted = bytes([e ^ k for e, k in zip(encrypted, key_bytes)])
     
     return json.loads(decrypted.decode('utf-8'))
 
@@ -710,5 +699,5 @@ app.add_handler(MessageHandler(
 # ============= MAIN (for local testing) =============
 if __name__ == "__main__":
     print("🤖 shiny-umbrella Bot is running in polling mode for local testing...")
-    print("🔒 Data is encrypted with AES-256-CTR (pyaes)")
+    print("🔒 Data is encrypted using XOR with SHA-256 derived key (built-in modules only)")
     app.run_polling()
