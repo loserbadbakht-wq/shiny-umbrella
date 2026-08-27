@@ -1,0 +1,79 @@
+name: Reset Cloudflare Worker
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install Wrangler
+        run: npm install -g wrangler
+      
+      - name: Delete Existing Worker
+        run: |
+          echo "🗑️ Deleting Worker: shiny-umbrella..."
+          wrangler delete || echo "⚠️ Worker may not exist, continuing..."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      
+      - name: Delete KV Namespace
+        run: |
+          echo "🗑️ Deleting KV Namespace..."
+          # Get KV namespace ID from wrangler.toml or use the one from secrets
+          KV_ID="${{ secrets.KV_NAMESPACE_ID }}"
+          if [ -z "$KV_ID" ]; then
+            echo "⚠️ KV_NAMESPACE_ID not set, skipping KV deletion"
+          else
+            wrangler kv:namespace delete --binding=KV "$KV_ID" || echo "⚠️ KV may not exist, continuing..."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      
+      - name: Create New KV Namespace
+        run: |
+          echo "🆕 Creating new KV Namespace..."
+          OUTPUT=$(wrangler kv:namespace create "SHINY_STORAGE")
+          echo "$OUTPUT"
+          # Extract the ID from the output
+          NEW_KV_ID=$(echo "$OUTPUT" | grep -oP 'Created namespace with ID: \K[^ ]+' || echo "")
+          echo "NEW_KV_ID=$NEW_KV_ID" >> $GITHUB_ENV
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      
+      - name: Update wrangler.toml with new KV ID
+        run: |
+          echo "📝 Updating wrangler.toml with new KV ID..."
+          sed -i "s/id = \".*\"/id = \"${{ env.NEW_KV_ID }}\"/" wrangler.toml
+          cat wrangler.toml
+      
+      - name: Deploy Worker
+        run: |
+          echo "🚀 Deploying Worker..."
+          wrangler deploy \
+            --var BOT_TOKEN:${{ secrets.BOT_TOKEN }} \
+            --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      
+      - name: Set Webhook
+        run: |
+          WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "🔗 Setting webhook to: ${WORKER_URL}"
+          curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
+      
+      - name: Verify Deployment
+        run: |
+          echo "✅ Reset complete!"
+          echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "🆔 New KV ID: ${{ env.NEW_KV_ID }}"
+          echo "💡 Add this KV ID to your GitHub Secrets as KV_NAMESPACE_ID for future resets"
