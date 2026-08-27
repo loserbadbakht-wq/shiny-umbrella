@@ -1,116 +1,147 @@
 import os
 import json
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ChatMemberHandler
+from cryptography.fernet import Fernet
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ============= CONFIGURATION =============
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("BOT_TOKEN not set in environment variables!")
 
-DB_ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY')
-if not DB_ENCRYPTION_KEY:
-    raise ValueError("DB_ENCRYPTION_KEY not set in environment variables!")
+ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY')
+if not ENCRYPTION_KEY:
+    raise ValueError("DB_ENCRYPTION_KEY not set!")
 
-# ============= ENCRYPTED DATABASE SETUP =============
-from pysqlcipher3 import dbapi2 as sqlite
+# Initialize encryption
+cipher = Fernet(ENCRYPTION_KEY)
 
-def get_db_connection():
-    """Get a connection to the encrypted SQLite database"""
-    conn = sqlite.connect('bot_data.db')
-    conn.execute("PRAGMA key = '{}'".format(DB_ENCRYPTION_KEY))
-    return conn
+# ============= PERSISTENT STORAGE FUNCTIONS =============
+async def get_kv_data(context: ContextTypes.DEFAULT_TYPE, key: str, default=None):
+    """Get data from KV storage"""
+    try:
+        # For Cloudflare Workers, you'd access KV via env
+        # For python-telegram-bot, we'll use context.bot_data
+        if hasattr(context.bot, 'kv'):
+            value = await context.bot.kv.get(key)
+            if value:
+                return decrypt_data(value)
+        return default
+    except:
+        return default
 
-def init_db():
-    """Initialize the database tables if they don't exist"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS groups (
-            group_id TEXT PRIMARY KEY,
-            data TEXT NOT NULL
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_languages (
-            user_id TEXT PRIMARY KEY,
-            language TEXT NOT NULL
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+async def set_kv_data(context: ContextTypes.DEFAULT_TYPE, key: str, value: dict):
+    """Save data to KV storage (encrypted)"""
+    try:
+        encrypted = encrypt_data(value)
+        if hasattr(context.bot, 'kv'):
+            await context.bot.kv.put(key, encrypted)
+    except:
+        pass
 
-def get_group_data(chat_id: int) -> dict:
-    """Get or create data structure for a specific group"""
+def encrypt_data(data: dict) -> str:
+    """Encrypt data before storage"""
+    json_str = json.dumps(data)
+    encrypted = cipher.encrypt(json_str.encode())
+    return encrypted.decode()
+
+def decrypt_data(encrypted_str: str) -> dict:
+    """Decrypt data after retrieval"""
+    decrypted = cipher.decrypt(encrypted_str.encode())
+    return json.loads(decrypted)
+
+# ============= HELPER FUNCTIONS =============
+async def get_group_data(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Get or create data structure for a specific group from KV"""
     chat_id_str = str(chat_id)
-    conn = get_db_connection()
-    cursor = conn.cursor()
     
-    cursor.execute("SELECT data FROM groups WHERE group_id = ?", (chat_id_str,))
-    result = cursor.fetchone()
-    
-    if result:
-        data = json.loads(result[0])
-    else:
+    # Try to get from KV
+    data = await get_kv_data(context, f'group_{chat_id_str}')
+    if data is None:
         data = {"gifs": [], "stickers": []}
-        cursor.execute(
-            "INSERT INTO groups (group_id, data) VALUES (?, ?)",
-            (chat_id_str, json.dumps(data))
-        )
-        conn.commit()
+        await set_kv_data(context, f'group_{chat_id_str}', data)
     
-    conn.close()
     return data
 
-def save_group_data(chat_id: int, data: dict):
-    """Save group data to the encrypted database"""
+async def save_group_data(chat_id: int, data: dict, context: ContextTypes.DEFAULT_TYPE):
+    """Save group data to KV (encrypted)"""
     chat_id_str = str(chat_id)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        "UPDATE groups SET data = ? WHERE group_id = ?",
-        (json.dumps(data), chat_id_str)
-    )
-    conn.commit()
-    conn.close()
+    await set_kv_data(context, f'group_{chat_id_str}', data)
 
-def get_user_language(user_id: int) -> str:
-    """Get user's preferred language"""
+async def get_user_language(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Get user's language preference from KV"""
     user_id_str = str(user_id)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT language FROM user_languages WHERE user_id = ?", (user_id_str,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    return result[0] if result else "en"
+    data = await get_kv_data(context, f'user_lang_{user_id_str}')
+    return data if data else "en"
 
-def save_user_language(user_id: int, language: str):
-    """Save user's language preference"""
+async def save_user_language(user_id: int, language: str, context: ContextTypes.DEFAULT_TYPE):
+    """Save user's language preference to KV"""
     user_id_str = str(user_id)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        "INSERT OR REPLACE INTO user_languages (user_id, language) VALUES (?, ?)",
-        (user_id_str, language)
-    )
-    conn.commit()
-    conn.close()
+    await set_kv_data(context, f'user_lang_{user_id_str}', language)
 
-# Initialize the database on startup
-init_db()
+async def get_media_info(chat_id: int, file_id: str, media_type: str, context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Get media info from banned data for a specific group"""
+    group_data = await get_group_data(chat_id, context)
+    key = "gifs" if media_type == "gif" else "stickers"
+    for item in group_data[key]:
+        if item["file_id"] == file_id:
+            return item
+    return None
+
+def format_date(date_str: str) -> str:
+    """Format date string for display"""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except:
+        return date_str
+
+def is_owner(update: Update) -> bool:
+    """Check if user is the group owner"""
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+    
+    try:
+        member = chat.get_member(user_id)
+        return member.status in ["creator", "administrator"] and member.is_chat_owner()
+    except:
+        return False
+
+async def check_bot_status(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if bot is admin in the group"""
+    try:
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        return bot_member.status in ["administrator", "creator"]
+    except:
+        return False
+
+async def get_owner_mention(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+    """Get the group owner's mention and language"""
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        
+        for admin in admins:
+            if admin.status == "creator":
+                owner = admin.user
+                lang = await get_user_language(owner.id, context)
+                
+                if owner.first_name:
+                    mention = f"[{owner.first_name}](tg://user?id={owner.id})"
+                else:
+                    mention = f"[Owner](tg://user?id={owner.id})"
+                
+                return mention, lang, owner.first_name
+        
+        return None, "en", None
+    except Exception as e:
+        print(f"Error getting owner: {e}")
+        return None, "en", None
 
 # ============= TEXT DICTIONARIES =============
 TEXTS = {
     "en": {
-        "welcome": """🤖 **Welcome to the Group Guardian Bot!**
+        "welcome": """🤖 **Welcome to the shiny-umbrella Bot!**
 
 This bot can help the owner of groups to prevent users from sending specific GIFs and sticker packs chosen by the owner, even if they are admins.
 
@@ -138,10 +169,8 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         
         "filter_added_owner": "Master {owner_name}, this {media_type} is now in the Filter List!🐵\n**Reason:** {reason}",
         "filter_added_not_owner": "Sorry, you don't seem to be the owner🦍",
-        "filter_removed_original": "🗑️ Original media removed as requested!",
         
-        # New messages
-        "group_start": "Hello {group_name}, I'm the FilterOwnerBot🦍. I help by keeping the group clean by filtering Owner's Desired GIFs and stickers, even if it used by admins\n\nCommands for the group owner:\n• /filterowner <reason> - Reply to a GIF/sticker to ban it (optional reason)\n• /unfilterowner <ID> - Remove a specific media from filter\n• /listfiltered - See all banned media\n• /clearfiltered - Remove ALL filters\n\nFor more info, use /start in my pv🙈",
+        "group_start": "Hello {group_name}, I'm shiny-umbrella Bot🦍. I help by keeping the group clean by filtering Owner's Desired GIFs and stickers, even if it used by admins\n\nCommands for the group owner:\n• /filterowner <reason> - Reply to a GIF/sticker to ban it (optional reason)\n• /unfilterowner <ID> - Remove a specific media from filter\n• /listfiltered - See all banned media\n• /clearfiltered - Remove ALL filters\n\nFor more info, use /start in my pv🙈",
         
         "already_banned": "{owner_name}-sama, this {media_type} is already in the Filter List🦍",
         
@@ -163,7 +192,7 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
     },
     
     "fa": {
-        "welcome": """🤖 **به ربات نگهبان گروه خوش آمدید!**
+        "welcome": """🤖 **به ربات shiny-umbrella خوش آمدید!**
 
 این ربات می‌تونه به مالک کمک کنه تا ممبرهای گروه نتونن گیف و استیکر پک‌های موردنظر مالک رو بفرستن حتی اگه ادمین گروه باشن.
 
@@ -191,10 +220,8 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         
         "filter_added_owner": "ارباب {owner_name}، این {media_type} حالا تو لیست فیلتره!🐵\n**دلیل:** {reason}",
         "filter_added_not_owner": "ببخشیدا، ولی تو مالک بنظر نمیای🦍",
-        "filter_removed_original": "🗑️ مدیا اصلی طبق درخواست شما حذف شد!",
         
-        # New messages
-        "group_start": "سلام {group_name}، من ربات FilterOwnerBot هستم.🦍  من با فیلتر کردن گیف‌ها و استیکرهای موردنظر مالک، حتی اگه توسط ادمین‌ها استفاده بشه، به تمیز نگه داشتن گروه کمک می‌کنم.\n\nدستورات برای مالک گروه:\n• /filterowner <reason>\nپاسخ به یک گیف/استیکر برای مسدود کردن آن (دلیل اختیاری)\n• /unfilterowner <ID>\nحذف یک رسانه خاص از فیلتر\n• /listfiltered \nمشاهده همه رسانه‌های مسدود شده\n• /clearfiltered \nحذف همه فیلترها\n\nبرای اطلاعات بیشتر، من رو در pv استارت کنید🙈",
+        "group_start": "سلام {group_name}، من ربات shiny-umbrella هستم.🦍  من با فیلتر کردن گیف‌ها و استیکرهای موردنظر مالک، حتی اگه توسط ادمین‌ها استفاده بشه، به تمیز نگه داشتن گروه کمک می‌کنم.\n\nدستورات برای مالک گروه:\n• /filterowner <reason>\nپاسخ به یک گیف/استیکر برای مسدود کردن آن (دلیل اختیاری)\n• /unfilterowner <ID>\nحذف یک رسانه خاص از فیلتر\n• /listfiltered \nمشاهده همه رسانه‌های مسدود شده\n• /clearfiltered \nحذف همه فیلترها\n\nبرای اطلاعات بیشتر، من رو در pv استارت کنید🙈",
         
         "already_banned": "{owner_name}-ساما، این {media_type} از قبل تو لیست فیلتر هست🦍",
         
@@ -216,107 +243,11 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
     }
 }
 
-# ============= HELPER FUNCTIONS =============
-def get_media_info(chat_id: int, file_id: str, media_type: str) -> dict:
-    """Get media info from banned data for a specific group"""
-    group_data = get_group_data(chat_id)
-    key = "gifs" if media_type == "gif" else "stickers"
-    for item in group_data[key]:
-        if item["file_id"] == file_id:
-            return item
-    return None
-
-def format_date(date_str: str) -> str:
-    """Format date string for display"""
-    try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except:
-        return date_str
-
-async def get_owner_mention(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
-    """Get the group owner's mention and language"""
-    try:
-        admins = await context.bot.get_chat_administrators(chat_id)
-        
-        for admin in admins:
-            if admin.status == "creator":
-                owner = admin.user
-                lang = get_user_language(owner.id)
-                
-                if owner.first_name:
-                    mention = f"[{owner.first_name}](tg://user?id={owner.id})"
-                else:
-                    mention = f"[Owner](tg://user?id={owner.id})"
-                
-                return mention, lang, owner.first_name
-        
-        return None, "en", None
-    except Exception as e:
-        print(f"Error getting owner: {e}")
-        return None, "en", None
-
-async def check_bot_status(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if bot is admin in the group"""
-    try:
-        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-        return bot_member.status in ["administrator", "creator"]
-    except:
-        return False
-
-async def send_status_message(chat_id: int, context: ContextTypes.DEFAULT_TYPE, is_admin: bool, owner_mention: str = None, lang: str = "en"):
-    """Send status message to group"""
-    try:
-        chat = await context.bot.get_chat(chat_id)
-        group_name = chat.title or "Group"
-        
-        if is_admin and owner_mention:
-            message = TEXTS[lang]["is_admin"].format(owner_mention=owner_mention)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode="Markdown"
-            )
-        else:
-            message = TEXTS[lang]["not_admin"].format(group_name=group_name)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message
-            )
-    except Exception as e:
-        print(f"Error sending status message: {e}")
-
-# ============= CHAT MEMBER HANDLER =============
-async def track_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bot status changes in groups"""
-    chat_member_update = update.chat_member
-    
-    if chat_member_update.new_chat_member.user.id != context.bot.id:
-        return
-    
-    if chat_member_update.chat.type not in ["group", "supergroup"]:
-        return
-    
-    chat_id = chat_member_update.chat.id
-    new_status = chat_member_update.new_chat_member.status
-    
-    if new_status in ["member", "administrator", "creator"]:
-        owner_mention, lang, _ = await get_owner_mention(chat_id, context)
-        is_admin = new_status in ["administrator", "creator"]
-        
-        await send_status_message(
-            chat_id=chat_id,
-            context=context,
-            is_admin=is_admin,
-            owner_mention=owner_mention,
-            lang=lang
-        )
-
-# ============= PV START COMMAND =============
+# ============= COMMAND HANDLERS =============
 async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start in private chat"""
     user_id = update.effective_user.id
-    lang = get_user_language(user_id)
+    lang = await get_user_language(user_id, context)
     
     keyboard = [
         [
@@ -332,7 +263,6 @@ async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ============= GROUP START COMMAND =============
 async def start_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start in group chat"""
     chat_id = update.effective_chat.id
@@ -348,20 +278,26 @@ async def start_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    lang = get_user_language(update.effective_user.id)
+    lang = await get_user_language(update.effective_user.id, context)
     await update.message.reply_text(
         TEXTS[lang]["group_start"].format(group_name=group_name),
         parse_mode="Markdown"
     )
 
-# ============= CALLBACK QUERY HANDLER =============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dispatch /start to appropriate handler based on chat type"""
+    if update.effective_chat.type == "private":
+        await start_private(update, context)
+    else:
+        await start_group(update, context)
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button clicks"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
-    current_lang = get_user_language(user_id)
+    current_lang = await get_user_language(user_id, context)
     
     if query.data == "change_language":
         keyboard = [
@@ -379,7 +315,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data.startswith("lang_"):
         lang_code = query.data.split("_")[1]
-        save_user_language(user_id, lang_code)
+        await save_user_language(user_id, lang_code, context)
         
         keyboard = [
             [
@@ -422,7 +358,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-# ============= FILTER COMMANDS =============
 async def filterowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a GIF or sticker pack to the filter list with optional reason"""
     
@@ -479,7 +414,7 @@ async def filterowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
     
-    group_data = get_group_data(chat_id)
+    group_data = await get_group_data(chat_id, context)
     key = "gifs" if media_type == "gif" else "stickers"
     
     existing = None
@@ -509,7 +444,7 @@ async def filterowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     group_data[key].append(new_entry)
-    save_group_data(chat_id, group_data)
+    await save_group_data(chat_id, group_data, context)
     
     owner_first_name = owner_name or "Owner"
     media_display = media_name_fa if lang == "fa" else media_name_en
@@ -555,9 +490,9 @@ async def unfilterowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     search_id = args[0]
-    lang = get_user_language(update.effective_user.id)
+    lang = await get_user_language(update.effective_user.id, context)
     
-    group_data = get_group_data(chat_id)
+    group_data = await get_group_data(chat_id, context)
     
     found = False
     removed_item = None
@@ -581,7 +516,7 @@ async def unfilterowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
     
     if found and removed_item:
-        save_group_data(chat_id, group_data)
+        await save_group_data(chat_id, group_data, context)
         media_display = media_name_fa if lang == "fa" else media_name_en
         await update.message.reply_text(
             TEXTS[lang]["removed_from_filter"].format(media_type=media_display)
@@ -599,9 +534,9 @@ async def listfiltered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     chat_id = update.effective_chat.id
-    lang = get_user_language(update.effective_user.id)
+    lang = await get_user_language(update.effective_user.id, context)
     
-    group_data = get_group_data(chat_id)
+    group_data = await get_group_data(chat_id, context)
     gif_count = len(group_data["gifs"])
     sticker_count = len(group_data["stickers"])
     total = gif_count + sticker_count
@@ -657,8 +592,8 @@ async def clearfiltered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Only the group owner can use this command!")
         return
     
-    lang = get_user_language(update.effective_user.id)
-    group_data = get_group_data(chat_id)
+    lang = await get_user_language(update.effective_user.id, context)
+    group_data = await get_group_data(chat_id, context)
     total = len(group_data["gifs"]) + len(group_data["stickers"])
     
     if total == 0:
@@ -667,11 +602,10 @@ async def clearfiltered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     group_data["gifs"] = []
     group_data["stickers"] = []
-    save_group_data(chat_id, group_data)
+    await save_group_data(chat_id, group_data, context)
     
     await update.message.reply_text(TEXTS[lang]["cleared_filters"].format(total=total))
 
-# ============= MESSAGE HANDLER (The Filter) =============
 async def filter_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete messages that contain banned GIFs or stickers from banned sticker packs"""
     
@@ -684,16 +618,14 @@ async def filter_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     message = update.message
-    group_data = get_group_data(chat_id)
-    lang = get_user_language(update.effective_user.id)
+    group_data = await get_group_data(chat_id, context)
+    lang = await get_user_language(update.effective_user.id, context)
     
     if message.animation:
         file_id = message.animation.file_id
         for item in group_data["gifs"]:
             if item["file_id"] == file_id:
-                # Delete the media
                 await message.delete()
-                # Send warning with reason
                 media_display = "GIF" if lang == "en" else "گیف"
                 await message.reply_text(
                     TEXTS[lang]["filtered_media_warning"].format(
@@ -731,78 +663,38 @@ async def filter_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-# ============= START HANDLER DISPATCHER =============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dispatch /start to appropriate handler based on chat type"""
-    if update.effective_chat.type == "private":
-        await start_private(update, context)
-    else:
-        await start_group(update, context)
-
-def is_owner(update: Update) -> bool:
-    """Check if user is the group owner"""
-    chat = update.effective_chat
-    user_id = update.effective_user.id
+# ============= WEBHOOK HANDLER =============
+async def webhook(request):
+    """Handle incoming webhook requests from Telegram"""
+    if request.method == "POST":
+        try:
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            await app.process_update(update)
+            return {"status": "ok"}
+        except Exception as e:
+            print(f"Error processing update: {e}")
+            return {"status": "error", "message": str(e)}, 500
     
-    try:
-        member = chat.get_member(user_id)
-        return member.status in ["creator", "administrator"] and member.is_chat_owner()
-    except:
-        return False
+    return {"status": "ok", "message": "Webhook is active"}
 
-# ============= HEALTH CHECK ENDPOINT =============
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+# ============= BUILD APPLICATION =============
+app = ApplicationBuilder().token(TOKEN).build()
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Handle health check requests to keep the bot alive on Render"""
-    
-    def do_GET(self):
-        if self.path == '/health' or self.path == '/':
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        # Suppress logging to keep console clean
-        pass
+# Add all handlers
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(handle_callback))
+app.add_handler(CommandHandler("filterowner", filterowner))
+app.add_handler(CommandHandler("unfilterowner", unfilterowner))
+app.add_handler(CommandHandler("listfiltered", listfiltered))
+app.add_handler(CommandHandler("clearfiltered", clearfiltered))
+app.add_handler(MessageHandler(
+    filters.ANIMATION | filters.Sticker.ALL, 
+    filter_media
+))
 
-def run_health_server():
-    """Run a simple HTTP server for health checks on Render's required port"""
-    port = int(os.getenv('PORT', 8000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    print(f"🩺 Health check server running on port {port}")
-    print(f"🔗 Health check URL: http://0.0.0.0:{port}/health")
-    server.serve_forever()
-
-# Start the health check server in a separate thread
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
-
-# ============= MAIN APPLICATION =============
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(ChatMemberHandler(track_chat_members, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(CommandHandler("filterowner", filterowner))
-    app.add_handler(CommandHandler("unfilterowner", unfilterowner))
-    app.add_handler(CommandHandler("listfiltered", listfiltered))
-    app.add_handler(CommandHandler("clearfiltered", clearfiltered))
-    app.add_handler(MessageHandler(
-        filters.ANIMATION | filters.Sticker.ALL, 
-        filter_media
-    ))
-    
-    print("🤖 Bot is running...")
-    print("🔒 Database is encrypted with SQLCipher")
-    print("📊 Using encrypted SQLite database for data storage")
-    print("💡 Press Ctrl+C to stop")
-    app.run_polling()
-
+# ============= MAIN (for local testing) =============
 if __name__ == "__main__":
-    main()
+    print("🤖 shiny-umbrella Bot is running in polling mode for local testing...")
+    print("🔒 Data is encrypted with Fernet encryption and stored in Cloudflare KV")
+    app.run_polling()
