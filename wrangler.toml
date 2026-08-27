@@ -5,4 +5,4 @@ compatibility_date = "2024-01-01"
 # Add KV binding for persistent storage
 [[kv_namespaces]]
 binding = "KV"
-id = "17668c3046714449af7c095019635311"  # ← Replace with your actual KV Namespace ID
+id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
