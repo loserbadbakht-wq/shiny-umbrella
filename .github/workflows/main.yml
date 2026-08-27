@@ -33,23 +33,23 @@ jobs:
       - name: Install Wrangler
         run: npm install -g wrangler
       
-      - name: Deploy to Cloudflare Workers
+      - name: Deploy to Cloudflare Workers with KV
         run: |
-          # Create .env file from GitHub Secrets
-          echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}" > .env
-          echo "DB_ENCRYPTION_KEY=${{ secrets.DB_ENCRYPTION_KEY }}" >> .env
-          
           # Deploy with environment variables
-          wrangler deploy --env-var BOT_TOKEN=${{ secrets.BOT_TOKEN }} --env-var DB_ENCRYPTION_KEY=${{ secrets.DB_ENCRYPTION_KEY }}
+          wrangler deploy \
+            --env-var BOT_TOKEN=${{ secrets.BOT_TOKEN }} \
+            --env-var DB_ENCRYPTION_KEY=${{ secrets.DB_ENCRYPTION_KEY }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       
       - name: Set Webhook
         run: |
-          WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
+          WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "Setting webhook to: ${WORKER_URL}/webhook"
           curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook?url=${WORKER_URL}/webhook"
       
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev"
+          echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "💾 Data is now persistent in Cloudflare KV!"
