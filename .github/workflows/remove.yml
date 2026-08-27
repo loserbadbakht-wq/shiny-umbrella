@@ -26,36 +26,6 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       
-      - name: Delete KV Namespace
-        run: |
-          echo "🗑️ Deleting KV Namespace..."
-          # Get KV namespace ID from wrangler.toml or use the one from secrets
-          KV_ID="${{ secrets.KV_NAMESPACE_ID }}"
-          if [ -z "$KV_ID" ]; then
-            echo "⚠️ KV_NAMESPACE_ID not set, skipping KV deletion"
-          else
-            wrangler kv:namespace delete --binding=KV "$KV_ID" || echo "⚠️ KV may not exist, continuing..."
-          fi
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      
-      - name: Create New KV Namespace
-        run: |
-          echo "🆕 Creating new KV Namespace..."
-          OUTPUT=$(wrangler kv:namespace create "SHINY_STORAGE")
-          echo "$OUTPUT"
-          # Extract the ID from the output
-          NEW_KV_ID=$(echo "$OUTPUT" | grep -oP 'Created namespace with ID: \K[^ ]+' || echo "")
-          echo "NEW_KV_ID=$NEW_KV_ID" >> $GITHUB_ENV
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      
-      - name: Update wrangler.toml with new KV ID
-        run: |
-          echo "📝 Updating wrangler.toml with new KV ID..."
-          sed -i "s/id = \".*\"/id = \"${{ env.NEW_KV_ID }}\"/" wrangler.toml
-          cat wrangler.toml
-      
       - name: Deploy Worker
         run: |
           echo "🚀 Deploying Worker..."
@@ -75,5 +45,3 @@ jobs:
         run: |
           echo "✅ Reset complete!"
           echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          echo "🆔 New KV ID: ${{ env.NEW_KV_ID }}"
-          echo "💡 Add this KV ID to your GitHub Secrets as KV_NAMESPACE_ID for future resets"
