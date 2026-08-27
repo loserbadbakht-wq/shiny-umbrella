@@ -13,43 +13,40 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
       
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Setup Node.js (for Wrangler)
-        uses: actions/setup-node@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
       
       - name: Install Wrangler
         run: npm install -g wrangler
       
-      - name: Deploy to Cloudflare Workers with KV
+      - name: Create .env file
         run: |
-          # Deploy with environment variables
-          wrangler deploy \
-            --env-var BOT_TOKEN=${{ secrets.BOT_TOKEN }} \
-            --env-var DB_ENCRYPTION_KEY=${{ secrets.DB_ENCRYPTION_KEY }}
+          echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}" > .env
+          echo "DB_ENCRYPTION_KEY=${{ secrets.DB_ENCRYPTION_KEY }}" >> .env
+      
+      - name: Deploy to Cloudflare Workers
+        run: wrangler deploy --env-file .env
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       
       - name: Set Webhook
         run: |
           WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          echo "Setting webhook to: ${WORKER_URL}/webhook"
           curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook?url=${WORKER_URL}/webhook"
       
       - name: Verify Deployment
-        run: |
-          echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          echo "💾 Data is now persistent in Cloudflare KV!"
+        run: echo "✅ Deployment successful! Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
