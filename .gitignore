@@ -1,25 +1,18 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# ⚠️ Encrypted database files - NEVER commit these!
-bot_data.db
-bot_data.db-shm
-bot_data.db-wal
-
-# ⚠️ Environment variables - NEVER commit!
+# Environment variables
 .env
-*.env
 .env.local
 .env.*.local
+
+# Cloudflare Workers
+.wrangler/
+dist/
+build/
 
 # IDE
 .vscode/
