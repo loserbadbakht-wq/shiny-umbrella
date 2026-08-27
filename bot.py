@@ -1,7 +1,8 @@
 import os
 import json
+import base64
+import pyaes
 from datetime import datetime
-from cryptography.fernet import Fernet
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -10,25 +11,61 @@ TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("BOT_TOKEN not set in environment variables!")
 
+# Encryption key (from GitHub Secrets via environment)
 ENCRYPTION_KEY = os.getenv('DB_ENCRYPTION_KEY')
 if not ENCRYPTION_KEY:
     raise ValueError("DB_ENCRYPTION_KEY not set!")
 
-# Initialize encryption
-cipher = Fernet(ENCRYPTION_KEY)
+# Convert hex key to bytes (32 bytes for AES-256)
+try:
+    KEY = bytes.fromhex(ENCRYPTION_KEY)
+    if len(KEY) != 32:
+        raise ValueError("Encryption key must be 64 hex characters (32 bytes)")
+except ValueError:
+    raise ValueError("DB_ENCRYPTION_KEY must be a 64-character hex string")
+
+# ============= SIMPLE ENCRYPTION FUNCTIONS =============
+def encrypt_data(data: dict) -> str:
+    """Encrypt data using AES-256-CTR"""
+    json_str = json.dumps(data)
+    plaintext = json_str.encode('utf-8')
+    
+    # Generate random IV
+    iv = os.urandom(16)
+    
+    # Create AES cipher in CTR mode (no padding needed)
+    aes = pyaes.AESModeOfOperationCTR(KEY, pyaes.Counter(iv))
+    encrypted = aes.encrypt(plaintext)
+    
+    # Return IV + encrypted data as base64
+    combined = iv + encrypted
+    return base64.b64encode(combined).decode('utf-8')
+
+def decrypt_data(encrypted_str: str) -> dict:
+    """Decrypt data using AES-256-CTR"""
+    combined = base64.b64decode(encrypted_str.encode('utf-8'))
+    
+    # Extract IV and encrypted data
+    iv = combined[:16]
+    encrypted = combined[16:]
+    
+    # Create AES cipher in CTR mode
+    aes = pyaes.AESModeOfOperationCTR(KEY, pyaes.Counter(iv))
+    decrypted = aes.decrypt(encrypted)
+    
+    return json.loads(decrypted.decode('utf-8'))
 
 # ============= PERSISTENT STORAGE FUNCTIONS =============
 async def get_kv_data(context: ContextTypes.DEFAULT_TYPE, key: str, default=None):
     """Get data from KV storage"""
     try:
-        # For Cloudflare Workers, you'd access KV via env
-        # For python-telegram-bot, we'll use context.bot_data
         if hasattr(context.bot, 'kv'):
             value = await context.bot.kv.get(key)
             if value:
                 return decrypt_data(value)
         return default
-    except:
+    except Exception as e:
+        print(f"Error getting KV data: {e}")
         return default
 
 async def set_kv_data(context: ContextTypes.DEFAULT_TYPE, key: str, value: dict):
@@ -37,31 +74,17 @@ async def set_kv_data(context: ContextTypes.DEFAULT_TYPE, key: str, value: dict)
         encrypted = encrypt_data(value)
         if hasattr(context.bot, 'kv'):
             await context.bot.kv.put(key, encrypted)
-    except:
-        pass
-
-def encrypt_data(data: dict) -> str:
-    """Encrypt data before storage"""
-    json_str = json.dumps(data)
-    encrypted = cipher.encrypt(json_str.encode())
-    return encrypted.decode()
-
-def decrypt_data(encrypted_str: str) -> dict:
-    """Decrypt data after retrieval"""
-    decrypted = cipher.decrypt(encrypted_str.encode())
-    return json.loads(decrypted)
+    except Exception as e:
+        print(f"Error setting KV data: {e}")
 
 # ============= HELPER FUNCTIONS =============
 async def get_group_data(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> dict:
     """Get or create data structure for a specific group from KV"""
     chat_id_str = str(chat_id)
-    
-    # Try to get from KV
     data = await get_kv_data(context, f'group_{chat_id_str}')
     if data is None:
         data = {"gifs": [], "stickers": []}
         await set_kv_data(context, f'group_{chat_id_str}', data)
-    
     return data
 
 async def save_group_data(chat_id: int, data: dict, context: ContextTypes.DEFAULT_TYPE):
@@ -79,15 +102,6 @@ async def save_user_language(user_id: int, language: str, context: ContextTypes.
     """Save user's language preference to KV"""
     user_id_str = str(user_id)
     await set_kv_data(context, f'user_lang_{user_id_str}', language)
-
-async def get_media_info(chat_id: int, file_id: str, media_type: str, context: ContextTypes.DEFAULT_TYPE) -> dict:
-    """Get media info from banned data for a specific group"""
-    group_data = await get_group_data(chat_id, context)
-    key = "gifs" if media_type == "gif" else "stickers"
-    for item in group_data[key]:
-        if item["file_id"] == file_id:
-            return item
-    return None
 
 def format_date(date_str: str) -> str:
     """Format date string for display"""
@@ -696,5 +710,5 @@ app.add_handler(MessageHandler(
 # ============= MAIN (for local testing) =============
 if __name__ == "__main__":
     print("🤖 shiny-umbrella Bot is running in polling mode for local testing...")
-    print("🔒 Data is encrypted with Fernet encryption and stored in Cloudflare KV")
+    print("🔒 Data is encrypted with AES-256-CTR (pyaes)")
     app.run_polling()
