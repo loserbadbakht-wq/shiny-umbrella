@@ -39,32 +39,22 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         filter_help: 'Reply to a GIF or sticker with /filterowner <reason> to filter it.\n\nExample: Send a GIF, then reply to it with /filterowner Spam GIF\nReason is optional',
         wrong_media_type: 'This bot can only filter GIF and Sticker Pack🦍',
         filtered_media_warning: 'This {media_type} is in the Filter List 🦍\nReason: {reason}',
-        
-        // ❌ Messages
         cmd_only_groups: 'This command only work in Groups 🦍',
         need_admin_first: 'This bot needs to admin to work, admin it🦍',
         need_admin_short: 'This bot needs to admin to work🦍',
         verify_failed: 'Couldn\'t verify your permissions, are you sure you are the owner?🦍',
         only_owner: 'Sorry dude, only group owner can use this command🦍',
-        
-        // ⚠️ Messages
         need_admin_with_delete: 'This bot must be an admin with delete access to filter🦍',
         provide_file_id: 'After /unfilterowner you need to enter the ID of that {media_type}🦍\nThe ID of the filtered files is here🦧: /listfiltered',
-        
-        // Copy messages
         copied_id: '📋 **Copied!**\n\n`{file_id}`\n\n_Tap and hold the ID above to copy it_',
         id_sent: '🆔 **File ID:**\n\n`{file_id}`\n\n_Tap and hold to copy_',
         copy_confirm: '✅ ID ready to copy!',
-        
-        // Language command
         language_command: '🌍 Please select your desired language:',
-        
-        // Status command
         status_ok: '✅ Bot status: **{status}**',
         status_error: '❌ Error checking bot status: {error}',
-        
-        // Language change confirmation
-        lang_changed: '✅ Your language has been changed to English!'
+        lang_changed: '✅ Your language has been changed to English!',
+        reset_success: '✅ Group data has been reset! The bot should work now.',
+        reset_error: '❌ Error resetting group data. Please try again.'
     },
     fa: {
         welcome: `🤖 **به ربات FilterOwner خوش آمدید!**
@@ -103,47 +93,46 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         filter_help: 'برای فیلتر کردن یک گیف یا استیکر، با\n/filterowner <دلیل>\nبه اون ریپلای بزنید. \n\nمثال: یک گیف ارسال کنید، بعد با \n/filterowner Spam GIF\nبهش ریپلای بزنید.\nدلیل اختیاریه',
         wrong_media_type: 'این ربات فقط میتونه گیف و استیکر پک رو فیلتر کنه🦍',
         filtered_media_warning: 'این {media_type} در لیست فیلتر قرار داره🦍\nدلیل: {reason}',
-        
-        // ❌ Messages
         cmd_only_groups: 'این کامند فقط تو گروه ها کار میکنه🦍',
         need_admin_first: 'این ربات برای فیلتر کردن باید ادمین باشه، ادمینش کنید🦍',
         need_admin_short: 'این ربات برای فیلتر کردن نیاز داره که ادمین باشه🦍',
         verify_failed: 'نمیتونم دسترسی هاتو تشخیص بدم، مطمئنی مالکی؟🦍',
         only_owner: 'شرمنده مشتی، فقط مالک گروه میتونه از این کامند استفاده کنه🦍',
-        
-        // ⚠️ Messages
         need_admin_with_delete: 'این ربات برای فیلتر کردن باید ادمین با دسترسی پاک کردن باشه🦍',
         provide_file_id: 'بعد از /unfilterowner باید آیدی اون {media_type} رو وارد کنی🦍\nآیدی فایل های فیلتر شده اینجان🦧: /listfiltered',
-        
-        // Copy messages
         copied_id: '📋 **کپی شد!**\n\n`{file_id}`\n\n_برای کپی کردن آیدی، روی آن فشار دهید و نگه دارید_',
         id_sent: '🆔 **آیدی فایل:**\n\n`{file_id}`\n\n_برای کپی کردن، روی آن فشار دهید و نگه دارید_',
         copy_confirm: '✅ آیدی آماده کپی است!',
-        
-        // Language command
         language_command: '🌍 لطفاً زبان مورد نظر خود را انتخاب کنید:',
-        
-        // Status command
         status_ok: '✅ وضعیت ربات: **{status}**',
         status_error: '❌ خطا در بررسی وضعیت ربات: {error}',
-        
-        // Language change confirmation
-        lang_changed: '✅ زبان شما به فارسی تغییر کرد!'
+        lang_changed: '✅ زبان شما به فارسی تغییر کرد!',
+        reset_success: '✅ اطلاعات گروه بازنشانی شد! ربات باید الان کار کنه.',
+        reset_error: '❌ خطا در بازنشانی اطلاعات گروه. لطفاً دوباره تلاش کنید.'
     }
 };
 
 // ============= KV STORAGE HELPERS =============
 async function getGroupData(kv, chatId) {
     const key = `group_${chatId}`;
-    const data = await kv.get(key);
-    if (data) {
-        try {
-            return decryptData(data);
-        } catch (e) {
-            return { gifs: [], stickers: [] };
+    try {
+        const data = await kv.get(key);
+        if (data) {
+            try {
+                return decryptData(data);
+            } catch (e) {
+                console.error(`[ERROR] Failed to decrypt data for group ${chatId}:`, e);
+                // If decryption fails, reset the data
+                const freshData = { gifs: [], stickers: [] };
+                await kv.put(key, encryptData(freshData));
+                return freshData;
+            }
         }
+        return { gifs: [], stickers: [] };
+    } catch (e) {
+        console.error(`[ERROR] Failed to get data for group ${chatId}:`, e);
+        return { gifs: [], stickers: [] };
     }
-    return { gifs: [], stickers: [] };
 }
 
 async function saveGroupData(kv, chatId, data) {
@@ -245,7 +234,6 @@ async function startGroupHandler(ctx) {
 }
 
 async function languageCommandHandler(ctx) {
-    // Check if in a group
     if (!['group', 'supergroup'].includes(ctx.chat.type)) {
         await ctx.reply('❌ This command only works in groups!');
         return;
@@ -266,6 +254,40 @@ async function languageCommandHandler(ctx) {
     await ctx.reply(TEXTS[lang].language_command, {
         reply_markup: keyboard
     });
+}
+
+async function resetGroupHandler(ctx) {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+    const lang = await getUserLanguage(ctx.kv, userId);
+    
+    if (!['group', 'supergroup'].includes(ctx.chat.type)) {
+        await ctx.reply('❌ This command only works in groups!');
+        return;
+    }
+    
+    let isOwner = false;
+    try {
+        const member = await ctx.api.getChatMember(chatId, userId);
+        isOwner = member.status === 'creator' || (member.status === 'administrator' && member.is_chat_owner);
+    } catch (e) {
+        await ctx.reply(TEXTS[lang].verify_failed);
+        return;
+    }
+    
+    if (!isOwner) {
+        await ctx.reply(TEXTS[lang].only_owner);
+        return;
+    }
+    
+    try {
+        const key = `group_${chatId}`;
+        await ctx.kv.put(key, encryptData({ gifs: [], stickers: [] }));
+        await ctx.reply(TEXTS[lang].reset_success);
+    } catch (error) {
+        console.error('Reset error:', error);
+        await ctx.reply(TEXTS[lang].reset_error);
+    }
 }
 
 async function filterOwnerHandler(ctx) {
@@ -628,7 +650,6 @@ async function callbackHandler(ctx) {
     const userId = ctx.from.id;
     const currentLang = await getUserLanguage(ctx.kv, userId);
     
-    // Handle copy buttons
     if (ctx.callbackQuery.data.startsWith('copy_')) {
         const fileId = ctx.callbackQuery.data.replace('copy_', '');
         
@@ -663,7 +684,6 @@ async function callbackHandler(ctx) {
         return;
     }
     
-    // Handle language and navigation buttons
     if (ctx.callbackQuery.data === 'change_language') {
         const keyboard = {
             inline_keyboard: [
@@ -715,28 +735,19 @@ async function callbackHandler(ctx) {
         const langCode = ctx.callbackQuery.data.split('_')[1];
         
         try {
-            // Save the language preference
             await saveUserLanguage(ctx.kv, userId, langCode);
             
-            // Check if we're in a group or private chat
             const isGroup = ctx.chat?.type && ['group', 'supergroup'].includes(ctx.chat.type);
             
             if (isGroup) {
-                // In group, send a new message instead of editing
                 const message = TEXTS[langCode].lang_changed;
-                
                 await ctx.reply(message);
                 await ctx.answerCallbackQuery();
-                
-                // Delete the original language selection message to clean up
                 try {
                     await ctx.deleteMessage();
-                } catch (e) {
-                    // Ignore if can't delete
-                }
+                } catch (e) {}
                 return;
             } else {
-                // In PV, go back to main menu
                 const keyboard = {
                     inline_keyboard: [
                         [
@@ -745,7 +756,6 @@ async function callbackHandler(ctx) {
                         ]
                     ]
                 };
-                
                 await ctx.editMessageText(TEXTS[langCode].welcome, {
                     parse_mode: 'Markdown',
                     reply_markup: keyboard
@@ -791,6 +801,7 @@ export default {
         bot.command('language', languageCommandHandler);
         bot.command('lang', languageCommandHandler);
         bot.command('status', statusHandler);
+        bot.command('resetgroup', resetGroupHandler); // New command
 
         bot.command('filterowner', filterOwnerHandler);
         bot.command('unfilterowner', unFilterOwnerHandler);
