@@ -67,7 +67,7 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         lang_changed: '✅ Your language has been changed to English!'
     },
     fa: {
-        welcome: `🤖 **به ربات OwnerFilter خوش آمدید!**
+        welcome: `🤖 **به ربات FilterOwner خوش آمدید!**
 
 این ربات می‌تونه به مالک کمک کنه تا ممبرهای گروه نتونن گیف و استیکر پک‌های موردنظر مالک رو بفرستن حتی اگه ادمین گروه باشن.
 
@@ -718,4 +718,89 @@ async function callbackHandler(ctx) {
             // Save the language preference
             await saveUserLanguage(ctx.kv, userId, langCode);
             
-            // Check if we're in a group
+            // Check if we're in a group or private chat
+            const isGroup = ctx.chat?.type && ['group', 'supergroup'].includes(ctx.chat.type);
+            
+            if (isGroup) {
+                // In group, send a new message instead of editing
+                const message = TEXTS[langCode].lang_changed;
+                
+                await ctx.reply(message);
+                await ctx.answerCallbackQuery();
+                
+                // Delete the original language selection message to clean up
+                try {
+                    await ctx.deleteMessage();
+                } catch (e) {
+                    // Ignore if can't delete
+                }
+                return;
+            } else {
+                // In PV, go back to main menu
+                const keyboard = {
+                    inline_keyboard: [
+                        [
+                            { text: TEXTS[langCode].language_btn, callback_data: 'change_language' },
+                            { text: TEXTS[langCode].how_it_works_btn, callback_data: 'how_it_works' }
+                        ]
+                    ]
+                };
+                
+                await ctx.editMessageText(TEXTS[langCode].welcome, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard
+                });
+                await ctx.answerCallbackQuery();
+            }
+        } catch (error) {
+            console.error('Language change error:', error);
+            await ctx.answerCallbackQuery('❌ Error changing language');
+            await ctx.reply('❌ There was an error changing your language. Please try again.');
+        }
+        return;
+    }
+}
+
+// ============= BUILD BOT =============
+export default {
+    async fetch(request, env) {
+        const BOT_TOKEN = env.BOT_TOKEN;
+        if (!BOT_TOKEN) {
+            console.error("BOT_TOKEN is not set");
+            return new Response("Bot token missing", { status: 500 });
+        }
+
+        ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
+
+        const bot = new Bot(BOT_TOKEN);
+        const kv = env.KV;
+
+        bot.use(async (ctx, next) => {
+            ctx.kv = kv;
+            await next();
+        });
+
+        bot.command('start', async (ctx) => {
+            if (ctx.chat.type === 'private') {
+                await startHandler(ctx);
+            } else {
+                await startGroupHandler(ctx);
+            }
+        });
+
+        bot.command('language', languageCommandHandler);
+        bot.command('lang', languageCommandHandler);
+        bot.command('status', statusHandler);
+
+        bot.command('filterowner', filterOwnerHandler);
+        bot.command('unfilterowner', unFilterOwnerHandler);
+        bot.command('listfiltered', listFilteredHandler);
+        bot.command('clearfiltered', clearFilteredHandler);
+
+        bot.on([':animation', ':sticker'], filterMediaHandler);
+        bot.on('callback_query:data', callbackHandler);
+
+        const handler = webhookCallback(bot, 'cloudflare-mod');
+        return handler(request);
+    }
+};
