@@ -54,9 +54,7 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         status_error: '❌ Error checking bot status: {error}',
         lang_changed: '✅ Your language has been changed to English!',
         reset_success: '✅ Group data has been reset! The bot should work now.',
-        reset_error: '❌ Error resetting group data. Please try again.',
-        force_reset_success: '✅ Group data has been completely deleted! The bot should work now.\nPlease use /start to reinitialize the bot.',
-        force_reset_error: '❌ Error force resetting group data. Error: {error}'
+        reset_error: '❌ Error resetting group data. Please try again.'
     },
     fa: {
         welcome: `🤖 **به ربات FilterOwner خوش آمدید!**
@@ -110,9 +108,7 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         status_error: '❌ خطا در بررسی وضعیت ربات: {error}',
         lang_changed: '✅ زبان شما به فارسی تغییر کرد!',
         reset_success: '✅ اطلاعات گروه بازنشانی شد! ربات باید الان کار کنه.',
-        reset_error: '❌ خطا در بازنشانی اطلاعات گروه. لطفاً دوباره تلاش کنید.',
-        force_reset_success: '✅ اطلاعات گروه کاملاً حذف شد! ربات باید الان کار کنه.\nلطفاً برای راه‌اندازی مجدد از /start استفاده کنید.',
-        force_reset_error: '❌ خطا در حذف اطلاعات گروه. خطا: {error}'
+        reset_error: '❌ خطا در بازنشانی اطلاعات گروه. لطفاً دوباره تلاش کنید.'
     }
 };
 
@@ -291,40 +287,6 @@ async function resetGroupHandler(ctx) {
     } catch (error) {
         console.error('Reset error:', error);
         await ctx.reply(TEXTS[lang].reset_error);
-    }
-}
-
-async function forceResetHandler(ctx) {
-    const chatId = ctx.chat.id;
-    const userId = ctx.from.id;
-    const lang = await getUserLanguage(ctx.kv, userId);
-    
-    if (!['group', 'supergroup'].includes(ctx.chat.type)) {
-        await ctx.reply('❌ This command only works in groups!');
-        return;
-    }
-    
-    let isOwner = false;
-    try {
-        const member = await ctx.api.getChatMember(chatId, userId);
-        isOwner = member.status === 'creator' || (member.status === 'administrator' && member.is_chat_owner);
-    } catch (e) {
-        await ctx.reply(TEXTS[lang].verify_failed);
-        return;
-    }
-    
-    if (!isOwner) {
-        await ctx.reply(TEXTS[lang].only_owner);
-        return;
-    }
-    
-    try {
-        const key = `group_${chatId}`;
-        await ctx.kv.delete(key);
-        await ctx.reply(TEXTS[lang].force_reset_success);
-    } catch (error) {
-        console.error('Force reset error:', error);
-        await ctx.reply(TEXTS[lang].force_reset_error.replace('{error}', error.message));
     }
 }
 
@@ -839,8 +801,7 @@ export default {
         bot.command('language', languageCommandHandler);
         bot.command('lang', languageCommandHandler);
         bot.command('status', statusHandler);
-        bot.command('resetgroup', resetGroupHandler);
-        bot.command('forcereset', forceResetHandler); // New aggressive reset
+        bot.command('resetgroup', resetGroupHandler); // New command
 
         bot.command('filterowner', filterOwnerHandler);
         bot.command('unfilterowner', unFilterOwnerHandler);
