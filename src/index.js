@@ -523,7 +523,7 @@ async function unFilterOwnerHandler(ctx) {
     }
 }
 
-// ============= FIXED LISTFILTERED HANDLER =============
+// ============= UPDATED LISTFILTERED HANDLER (NO BUTTONS) =============
 async function listFilteredHandler(ctx) {
     const chatId = ctx.chat.id;
     const lang = await getUserLanguage(ctx.kv, ctx.from.id);
@@ -539,12 +539,7 @@ async function listFilteredHandler(ctx) {
     const groupName = chat.title || 'This Group';
     
     let message = `📋 **Filtered Media in ${groupName}** (${total} total)\n\n`;
-    message += `_Tap and hold any ID to copy it, or use the buttons below_\n\n`;
-    
-    // Limit to prevent keyboard overflow
-    const MAX_ITEMS = 15;
-    let shownCount = 0;
-    const inlineKeyboard = [];
+    message += `_Tap and hold any ID to copy it_\n\n`;
     
     // Helper function to safely format date
     function formatDate(dateStr) {
@@ -566,71 +561,65 @@ async function listFilteredHandler(ctx) {
         return item.file_id || 'unknown';
     }
     
-    function addItems(items, typeLabel) {
-        for (const item of items) {
-            if (shownCount >= MAX_ITEMS) break;
+    if (groupData.gifs && groupData.gifs.length > 0) {
+        if (lang === 'fa') {
+            message += `**🎬 گیف ها (${groupData.gifs.length}):**\n`;
+        } else {
+            message += `**🎬 GIFs (${groupData.gifs.length}):**\n`;
+        }
+        for (const item of groupData.gifs) {
             try {
                 const date = formatDate(item.added_date);
                 const fileId = getFileId(item);
                 const reason = getReason(item);
                 
-                // Show FULL ID (not truncated)
-                message += `${shownCount + 1}. \`${fileId}\`\n`;
+                message += `${groupData.gifs.indexOf(item) + 1}. \`${fileId}\`\n`;
                 message += `   📅 ${date}\n`;
                 message += `   📝 ${reason}\n\n`;
-                inlineKeyboard.push([
-                    { 
-                        text: `📋 Copy ${typeLabel} #${shownCount + 1}`, 
-                        callback_data: `copy_${fileId}`
-                    }
-                ]);
-                shownCount++;
             } catch (e) {
-                console.error(`[ERROR] Failed to process item:`, item, e);
-                // Skip this item and continue
+                console.error(`[ERROR] Failed to process GIF item:`, item, e);
             }
         }
     }
     
-    if (groupData.gifs && groupData.gifs.length > 0) {
-        message += `**🎬 GIFs (${groupData.gifs.length}):**\n`;
-        addItems(groupData.gifs, 'GIF');
+    if (groupData.stickers && groupData.stickers.length > 0) {
+        if (lang === 'fa') {
+            message += `**🖼️ استیکر پک ها (${groupData.stickers.length}):**\n`;
+        } else {
+            message += `**🖼️ Sticker Packs (${groupData.stickers.length}):**\n`;
+        }
+        for (const item of groupData.stickers) {
+            try {
+                const date = formatDate(item.added_date);
+                const fileId = getFileId(item);
+                const reason = getReason(item);
+                
+                message += `${groupData.stickers.indexOf(item) + 1}. \`${fileId}\`\n`;
+                message += `   📅 ${date}\n`;
+                message += `   📝 ${reason}\n\n`;
+            } catch (e) {
+                console.error(`[ERROR] Failed to process Sticker item:`, item, e);
+            }
+        }
     }
     
-    if (groupData.stickers && groupData.stickers.length > 0 && shownCount < MAX_ITEMS) {
-        message += `**🖼️ Sticker Packs (${groupData.stickers.length}):**\n`;
-        addItems(groupData.stickers, 'Sticker');
+    if (lang === 'fa') {
+        message += `\n💡 **برای حذف:**\n`;
+        message += `/unfilterowner <file_id>\n`;
+        message += `برای کپی کردن هر آیدی در بالا، اون را فشار بدید و نگه دارید`;
+    } else {
+        message += `\n💡 **To remove:** \`/unfilterowner <file_id>\`\n`;
+        message += `   Tap and hold any ID above to copy it`;
     }
-    
-    if (total > MAX_ITEMS) {
-        message += `\n_Showing ${MAX_ITEMS} of ${total} items. Use /clearfiltered to remove all._\n`;
-    }
-    
-    message += `\n💡 **To remove:** \`/unfilterowner <file_id>\`\n`;
-    message += `   Tap and hold any ID above to copy it, or tap a button below`;
-    
-    const keyboard = {
-        inline_keyboard: inlineKeyboard
-    };
     
     try {
         await ctx.reply(message, { 
             parse_mode: 'Markdown',
-            reply_markup: keyboard,
             disable_web_page_preview: true
         });
     } catch (error) {
         console.error('[ERROR] Failed to send listFiltered response:', error);
-        // Fallback: Send without buttons
-        try {
-            await ctx.reply(message, { 
-                parse_mode: 'Markdown',
-                disable_web_page_preview: true
-            });
-        } catch (fallbackError) {
-            console.error('[ERROR] Fallback also failed:', fallbackError);
-            await ctx.reply('❌ Error displaying filtered list. Please use /resetgroup to reset the data.');
-        }
+        await ctx.reply('❌ Error displaying filtered list. Please use /resetgroup to reset the data.');
     }
 }
 
