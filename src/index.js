@@ -38,7 +38,26 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         no_media_to_remove: 'There is no GIF or Sticker Pack to remove in the Filter List🦍',
         filter_help: 'Reply to a GIF or sticker with /filterowner <reason> to filter it.\n\nExample: Send a GIF, then reply to it with /filterowner Spam GIF\nReason is optional',
         wrong_media_type: 'This bot can only filter GIF and Sticker Pack🦍',
-        filtered_media_warning: 'This {media_type} is in the Filter List 🦍\nReason: {reason}'
+        filtered_media_warning: 'This {media_type} is in the Filter List 🦍\nReason: {reason}',
+        
+        // ❌ Messages
+        cmd_only_groups: 'This command only work in Groups 🦍',
+        need_admin_first: 'This bot needs to admin to work, admin it🦍',
+        need_admin_short: 'This bot needs to admin to work🦍',
+        verify_failed: 'Couldn\'t verify your permissions, are you sure you are the owner?🦍',
+        only_owner: 'Sorry dude, only group owner can use this command🦍',
+        
+        // ⚠️ Messages
+        need_admin_with_delete: 'This bot must be an admin with delete access to filter🦍',
+        provide_file_id: 'After /unfilterowner you need to enter the ID of that {media_type}🦍\nThe ID of the filtered files is here🦧: /listfiltered',
+        
+        // Copy messages
+        copied_id: '📋 **Copied!**\n\n`{file_id}`\n\n_Tap and hold the ID above to copy it_',
+        id_sent: '🆔 **File ID:**\n\n`{file_id}`\n\n_Tap and hold to copy_',
+        copy_confirm: '✅ ID ready to copy!',
+        
+        // Language command
+        language_command: '🌍 Please select your desired language:'
     },
     fa: {
         welcome: `🤖 **به ربات shiny-umbrella خوش آمدید!**
@@ -76,7 +95,26 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         no_media_to_remove: 'گیف یا استیکر پکی در لیست برای حذف کردن وجود نداره🦍',
         filter_help: 'برای فیلتر کردن یک گیف یا استیکر، با\n/filterowner <دلیل>\nبه اون ریپلای بزنید. \n\nمثال: یک گیف ارسال کنید، بعد با \n/filterowner Spam GIF\nبهش ریپلای بزنید.\nدلیل اختیاریه',
         wrong_media_type: 'این ربات فقط میتونه گیف و استیکر پک رو فیلتر کنه🦍',
-        filtered_media_warning: 'این {media_type} در لیست فیلتر قرار داره🦍\nدلیل: {reason}'
+        filtered_media_warning: 'این {media_type} در لیست فیلتر قرار داره🦍\nدلیل: {reason}',
+        
+        // ❌ Messages
+        cmd_only_groups: 'این کامند فقط تو گروه ها کار میکنه🦍',
+        need_admin_first: 'این ربات برای فیلتر کردن باید ادمین باشه، ادمینش کنید🦍',
+        need_admin_short: 'این ربات برای فیلتر کردن نیاز داره که ادمین باشه🦍',
+        verify_failed: 'نمیتونم دسترسی هاتو تشخیص بدم، مطمئنی مالکی؟🦍',
+        only_owner: 'شرمنده مشتی، فقط مالک گروه میتونه از این کامند استفاده کنه🦍',
+        
+        // ⚠️ Messages
+        need_admin_with_delete: 'این ربات برای فیلتر کردن باید ادمین با دسترسی پاک کردن باشه🦍',
+        provide_file_id: 'بعد از /unfilterowner باید آیدی اون {media_type} رو وارد کنی🦍\nآیدی فایل های فیلتر شده اینجان🦧: /listfiltered',
+        
+        // Copy messages
+        copied_id: '📋 **کپی شد!**\n\n`{file_id}`\n\n_برای کپی کردن آیدی، روی آن فشار دهید و نگه دارید_',
+        id_sent: '🆔 **آیدی فایل:**\n\n`{file_id}`\n\n_برای کپی کردن، روی آن فشار دهید و نگه دارید_',
+        copy_confirm: '✅ آیدی آماده کپی است!',
+        
+        // Language command
+        language_command: '🌍 لطفاً زبان مورد نظر خود را انتخاب کنید:'
     }
 };
 
@@ -118,7 +156,6 @@ async function saveUserLanguage(kv, userId, lang) {
 }
 
 // ============= ENCRYPTION HELPERS =============
-// These will be initialized with the encryption key when the worker starts
 let ENCRYPTION_KEY = 'default-key-please-change-me';
 
 function encryptData(data) {
@@ -169,41 +206,66 @@ async function startGroupHandler(ctx) {
     const chatId = ctx.chat.id;
     const chat = await ctx.api.getChat(chatId);
     const groupName = chat.title || 'Group';
+    const lang = await getUserLanguage(ctx.kv, ctx.from.id);
     
     try {
         const botMember = await ctx.api.getChatMember(chatId, ctx.bot.id);
         if (!['administrator', 'creator'].includes(botMember.status)) {
-            await ctx.reply('⚠️ I need to be an admin to filter messages!\nPlease promote me to admin with delete messages permission.');
+            await ctx.reply(TEXTS[lang].need_admin_with_delete);
             return;
         }
     } catch (e) {
-        await ctx.reply('⚠️ I need to be an admin to filter messages!\nPlease promote me to admin with delete messages permission.');
+        await ctx.reply(TEXTS[lang].need_admin_with_delete);
         return;
     }
     
-    const lang = await getUserLanguage(ctx.kv, ctx.from.id);
     await ctx.reply(TEXTS[lang].group_start.replace('{group_name}', groupName), {
         parse_mode: 'Markdown'
+    });
+}
+
+async function languageCommandHandler(ctx) {
+    // Check if in a group
+    if (!['group', 'supergroup'].includes(ctx.chat.type)) {
+        await ctx.reply('❌ This command only works in groups!');
+        return;
+    }
+    
+    const userId = ctx.from.id;
+    const lang = await getUserLanguage(ctx.kv, userId);
+    
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: '🇮🇷 فارسی', callback_data: 'lang_fa' },
+                { text: '🇬🇧 English', callback_data: 'lang_en' }
+            ]
+        ]
+    };
+    
+    await ctx.reply(TEXTS[lang].language_command, {
+        reply_markup: keyboard
     });
 }
 
 async function filterOwnerHandler(ctx) {
     const chatId = ctx.chat.id;
     const userId = ctx.from.id;
+    const lang = await getUserLanguage(ctx.kv, userId);
     
     if (!['group', 'supergroup'].includes(ctx.chat.type)) {
-        await ctx.reply('❌ This command only works in groups!');
+        await ctx.reply(TEXTS[lang].cmd_only_groups);
         return;
     }
     
     try {
         const botMember = await ctx.api.getChatMember(chatId, ctx.bot.id);
         if (!['administrator', 'creator'].includes(botMember.status)) {
-            await ctx.reply('❌ I need to be an admin to filter messages! Please promote me first.');
+            await ctx.reply(TEXTS[lang].need_admin_first);
             return;
         }
     } catch (e) {
-        await ctx.reply('❌ I need to be an admin to filter messages!');
+        await ctx.reply(TEXTS[lang].need_admin_short);
         return;
     }
     
@@ -212,11 +274,9 @@ async function filterOwnerHandler(ctx) {
         const member = await ctx.api.getChatMember(chatId, userId);
         isOwner = member.status === 'creator' || (member.status === 'administrator' && member.is_chat_owner);
     } catch (e) {
-        await ctx.reply('❌ Could not verify your permissions.');
+        await ctx.reply(TEXTS[lang].verify_failed);
         return;
     }
-    
-    const lang = await getUserLanguage(ctx.kv, userId);
     
     const args = ctx.message.text.split(' ').slice(1);
     const reason = args.length > 0 ? args.join(' ') : 'Not specified';
@@ -305,20 +365,21 @@ async function filterOwnerHandler(ctx) {
 async function unFilterOwnerHandler(ctx) {
     const chatId = ctx.chat.id;
     const userId = ctx.from.id;
+    const lang = await getUserLanguage(ctx.kv, userId);
     
     if (!['group', 'supergroup'].includes(ctx.chat.type)) {
-        await ctx.reply('❌ This command only works in groups!');
+        await ctx.reply(TEXTS[lang].cmd_only_groups);
         return;
     }
     
     try {
         const botMember = await ctx.api.getChatMember(chatId, ctx.bot.id);
         if (!['administrator', 'creator'].includes(botMember.status)) {
-            await ctx.reply('❌ I need to be an admin to filter messages! Please promote me first.');
+            await ctx.reply(TEXTS[lang].need_admin_first);
             return;
         }
     } catch (e) {
-        await ctx.reply('❌ I need to be an admin to filter messages!');
+        await ctx.reply(TEXTS[lang].need_admin_short);
         return;
     }
     
@@ -327,29 +388,26 @@ async function unFilterOwnerHandler(ctx) {
         const member = await ctx.api.getChatMember(chatId, userId);
         isOwner = member.status === 'creator' || (member.status === 'administrator' && member.is_chat_owner);
     } catch (e) {
-        await ctx.reply('❌ Could not verify your permissions.');
+        await ctx.reply(TEXTS[lang].verify_failed);
         return;
     }
     
     if (!isOwner) {
-        await ctx.reply('❌ Only the group owner can use this command!');
+        await ctx.reply(TEXTS[lang].only_owner);
         return;
     }
     
     const args = ctx.message.text.split(' ').slice(1);
     if (args.length === 0) {
-        await ctx.reply(
-            '⚠️ Please provide the file ID to remove.\n\n' +
-            'Usage: `/unfilterowner <file_id>`\n' +
-            'Example: `/unfilterowner CgACAgQAAxkBAA...`\n\n' +
-            '💡 Get the ID from `/listfiltered`'
-        );
+        let mediaTypeDisplay = 'GIF (sticker pack)';
+        if (lang === 'fa') {
+            mediaTypeDisplay = 'گیف (استیکر پک)';
+        }
+        await ctx.reply(TEXTS[lang].provide_file_id.replace('{media_type}', mediaTypeDisplay));
         return;
     }
     
     const searchId = args[0];
-    const lang = await getUserLanguage(ctx.kv, userId);
-    
     const groupData = await getGroupData(ctx.kv, chatId);
     
     let found = false;
@@ -400,6 +458,9 @@ async function listFilteredHandler(ctx) {
     const groupName = chat.title || 'This Group';
     
     let message = `📋 **Filtered Media in ${groupName}** (${total} total)\n\n`;
+    message += `_Tap on an ID to copy it_\n\n`;
+    
+    const inlineKeyboard = [];
     
     if (groupData.gifs.length > 0) {
         message += `**🎬 GIFs (${groupData.gifs.length}):**\n`;
@@ -407,9 +468,14 @@ async function listFilteredHandler(ctx) {
             const date = item.added_date.slice(0, 16).replace('T', ' ');
             message += `${i+1}. \`${item.file_id}\`\n`;
             message += `   📅 ${date}\n`;
-            message += `   📝 ${item.reason}\n`;
+            message += `   📝 ${item.reason}\n\n`;
+            inlineKeyboard.push([
+                { 
+                    text: `📋 Copy GIF #${i+1}`, 
+                    callback_data: `copy_${item.file_id}`
+                }
+            ]);
         });
-        message += '\n';
     }
     
     if (groupData.stickers.length > 0) {
@@ -418,34 +484,48 @@ async function listFilteredHandler(ctx) {
             const date = item.added_date.slice(0, 16).replace('T', ' ');
             message += `${i+1}. \`${item.file_id}\`\n`;
             message += `   📅 ${date}\n`;
-            message += `   📝 ${item.reason}\n`;
+            message += `   📝 ${item.reason}\n\n`;
+            inlineKeyboard.push([
+                { 
+                    text: `📋 Copy Sticker #${i+1}`, 
+                    callback_data: `copy_${item.file_id}`
+                }
+            ]);
         });
-        message += '\n';
     }
     
-    message += `💡 **To remove:** \`/unfilterowner <file_id>\`\n`;
-    message += `   Copy the full ID from above`;
+    message += `\n💡 **To remove:** \`/unfilterowner <file_id>\`\n`;
+    message += `   Tap a button below to copy the ID, then paste it in the command`;
     
-    await ctx.reply(message, { parse_mode: 'Markdown' });
+    const keyboard = {
+        inline_keyboard: inlineKeyboard
+    };
+    
+    await ctx.reply(message, { 
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+        disable_web_page_preview: true
+    });
 }
 
 async function clearFilteredHandler(ctx) {
     const chatId = ctx.chat.id;
     const userId = ctx.from.id;
+    const lang = await getUserLanguage(ctx.kv, userId);
     
     if (!['group', 'supergroup'].includes(ctx.chat.type)) {
-        await ctx.reply('❌ This command only works in groups!');
+        await ctx.reply(TEXTS[lang].cmd_only_groups);
         return;
     }
     
     try {
         const botMember = await ctx.api.getChatMember(chatId, ctx.bot.id);
         if (!['administrator', 'creator'].includes(botMember.status)) {
-            await ctx.reply('❌ I need to be an admin to filter messages! Please promote me first.');
+            await ctx.reply(TEXTS[lang].need_admin_first);
             return;
         }
     } catch (e) {
-        await ctx.reply('❌ I need to be an admin to filter messages!');
+        await ctx.reply(TEXTS[lang].need_admin_short);
         return;
     }
     
@@ -454,16 +534,15 @@ async function clearFilteredHandler(ctx) {
         const member = await ctx.api.getChatMember(chatId, userId);
         isOwner = member.status === 'creator' || (member.status === 'administrator' && member.is_chat_owner);
     } catch (e) {
-        await ctx.reply('❌ Could not verify your permissions.');
+        await ctx.reply(TEXTS[lang].verify_failed);
         return;
     }
     
     if (!isOwner) {
-        await ctx.reply('❌ Only the group owner can use this command!');
+        await ctx.reply(TEXTS[lang].only_owner);
         return;
     }
     
-    const lang = await getUserLanguage(ctx.kv, userId);
     const groupData = await getGroupData(ctx.kv, chatId);
     const total = groupData.gifs.length + groupData.stickers.length;
     
@@ -535,6 +614,42 @@ async function callbackHandler(ctx) {
     const userId = ctx.from.id;
     const currentLang = await getUserLanguage(ctx.kv, userId);
     
+    // Handle copy buttons
+    if (ctx.callbackQuery.data.startsWith('copy_')) {
+        const fileId = ctx.callbackQuery.data.replace('copy_', '');
+        
+        await ctx.reply(
+            TEXTS[currentLang].copied_id.replace('{file_id}', fileId),
+            {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { 
+                                text: '📋 Copy ID', 
+                                callback_data: `copy_send_${fileId}`
+                            }
+                        ]
+                    ]
+                }
+            }
+        );
+        await ctx.answerCallbackQuery(TEXTS[currentLang].copy_confirm);
+        return;
+    }
+    
+    if (ctx.callbackQuery.data.startsWith('copy_send_')) {
+        const fileId = ctx.callbackQuery.data.replace('copy_send_', '');
+        
+        await ctx.reply(
+            TEXTS[currentLang].id_sent.replace('{file_id}', fileId),
+            { parse_mode: 'Markdown' }
+        );
+        await ctx.answerCallbackQuery(TEXTS[currentLang].copy_confirm);
+        return;
+    }
+    
+    // Handle language and navigation buttons
     if (ctx.callbackQuery.data === 'change_language') {
         const keyboard = {
             inline_keyboard: [
@@ -586,15 +701,30 @@ async function callbackHandler(ctx) {
         const langCode = ctx.callbackQuery.data.split('_')[1];
         await saveUserLanguage(ctx.kv, userId, langCode);
         
-        const keyboard = {
-            inline_keyboard: [
-                [
-                    { text: TEXTS[langCode].language_btn, callback_data: 'change_language' },
-                    { text: TEXTS[langCode].how_it_works_btn, callback_data: 'how_it_works' }
+        // Check if we're in a group or private chat
+        const isGroup = ctx.chat?.type && ['group', 'supergroup'].includes(ctx.chat.type);
+        
+        let message;
+        let keyboard;
+        
+        if (isGroup) {
+            // In group, just show confirmation
+            message = langCode === 'fa' ? '✅ زبان شما به فارسی تغییر کرد!' : '✅ Your language has been changed to English!';
+            keyboard = null;
+        } else {
+            // In PV, go back to main menu
+            keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: TEXTS[langCode].language_btn, callback_data: 'change_language' },
+                        { text: TEXTS[langCode].how_it_works_btn, callback_data: 'how_it_works' }
+                    ]
                 ]
-            ]
-        };
-        await ctx.editMessageText(TEXTS[langCode].welcome, {
+            };
+            message = TEXTS[langCode].welcome;
+        }
+        
+        await ctx.editMessageText(message, {
             parse_mode: 'Markdown',
             reply_markup: keyboard
         });
@@ -605,29 +735,22 @@ async function callbackHandler(ctx) {
 // ============= BUILD BOT =============
 export default {
     async fetch(request, env) {
-        // Read secrets from the env object passed by Cloudflare
         const BOT_TOKEN = env.BOT_TOKEN;
         if (!BOT_TOKEN) {
             console.error("BOT_TOKEN is not set");
             return new Response("Bot token missing", { status: 500 });
         }
 
-        // Set the encryption key for the helper functions
         ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
 
-        // Create the bot instance
         const bot = new Bot(BOT_TOKEN);
-
-        // Store the KV binding for handlers
         const kv = env.KV;
 
-        // Middleware to pass KV to all handlers
         bot.use(async (ctx, next) => {
             ctx.kv = kv;
             await next();
         });
 
-        // Register handlers
         bot.command('start', async (ctx) => {
             if (ctx.chat.type === 'private') {
                 await startHandler(ctx);
@@ -636,20 +759,16 @@ export default {
             }
         });
 
+        bot.command('language', languageCommandHandler);
         bot.command('filterowner', filterOwnerHandler);
         bot.command('unfilterowner', unFilterOwnerHandler);
         bot.command('listfiltered', listFilteredHandler);
         bot.command('clearfiltered', clearFilteredHandler);
 
-        // Media filter
         bot.on([':animation', ':sticker'], filterMediaHandler);
-
-        // Callback queries
         bot.on('callback_query:data', callbackHandler);
 
-        // Create webhook handler
         const handler = webhookCallback(bot, 'cloudflare-mod');
-        
         return handler(request);
     }
 };
