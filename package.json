@@ -5,8 +5,7 @@
   "main": "src/index.js",
   "type": "module",
   "dependencies": {
-    "grammy": "^1.26.0",
-    "@grammyjs/storage-cloudflare": "^1.2.0"
+    "grammy": "^1.26.0"
   },
   "devDependencies": {
     "wrangler": "^3.78.0"
