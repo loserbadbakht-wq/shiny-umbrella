@@ -1,0 +1,8 @@
+name = "shiny-umbrella"
+main = "worker.py"
+compatibility_date = "2024-01-01"
+
+# Add KV binding for persistent storage
+[[kv_namespaces]]
+binding = "KV"
+id = "196c7cb2eb7f4143af678ec823322d00"  # ← Replace with your actual KV Namespace ID
