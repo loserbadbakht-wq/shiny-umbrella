@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: telegram-guardian-bot
+    runtime: python
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DB_ENCRYPTION_KEY
+        sync: false
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health  # Optional: Add a health check endpoint
