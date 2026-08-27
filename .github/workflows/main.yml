@@ -33,20 +33,24 @@ jobs:
       - name: Install Wrangler
         run: npm install -g wrangler
       
-      - name: Create .env file
+      - name: Create .env file for deployment
         run: |
           echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}" > .env
           echo "DB_ENCRYPTION_KEY=${{ secrets.DB_ENCRYPTION_KEY }}" >> .env
       
       - name: Deploy to Cloudflare Workers
-        run: wrangler deploy --env-file .env
+        run: |
+          wrangler deploy --env-file .env
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       
       - name: Set Webhook
         run: |
           WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "Setting webhook to: ${WORKER_URL}/webhook"
           curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook?url=${WORKER_URL}/webhook"
       
       - name: Verify Deployment
-        run: echo "✅ Deployment successful! Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+        run: |
+          echo "✅ Deployment successful!"
+          echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
