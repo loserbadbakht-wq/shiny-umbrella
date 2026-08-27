@@ -1,3 +1,2 @@
 python-telegram-bot
-pysqlcipher3
-python-dotenv
+cryptography
