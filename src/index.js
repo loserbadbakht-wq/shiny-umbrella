@@ -3,7 +3,7 @@ import { Bot, webhookCallback } from 'grammy';
 // ============= TEXT DICTIONARIES =============
 const TEXTS = {
     en: {
-        welcome: `🤖 **Welcome to the shiny-umbrella Bot!**
+        welcome: `🤖 **Welcome to the FilterOwner Bot!**
 
 This bot can help the owner of groups to prevent users from sending specific GIFs and sticker packs chosen by the owner, even if they are admins.
 
@@ -29,7 +29,7 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         is_admin: 'Hello {owner_mention}-sama! I will get to work now!🐒\n\nI will filter the GIFs and sticker packs you desire!\n\nIf you don\'t know how to use me, start me in PV!🙈',
         filter_added_owner: 'Master {owner_name}, this {media_type} is now in the Filter List!🐵\n**Reason:** {reason}',
         filter_added_not_owner: 'Sorry, you don\'t seem to be the owner🦍',
-        group_start: 'Hello {group_name}, I\'m shiny-umbrella Bot🦍. I help by keeping the group clean by filtering Owner\'s Desired GIFs and stickers, even if it used by admins\n\nCommands for the group owner:\n• /filterowner <reason> - Reply to a GIF/sticker to ban it (optional reason)\n• /unfilterowner <ID> - Remove a specific media from filter\n• /listfiltered - See all banned media\n• /clearfiltered - Remove ALL filters\n\nFor more info, use /start in my pv🙈',
+        group_start: 'Hello {group_name}, I\'m FilterOwner Bot🦍. I help by keeping the group clean by filtering Owner\'s Desired GIFs and stickers, even if it used by admins\n\nCommands for the group owner:\n• /filterowner <reason> - Reply to a GIF/sticker to ban it (optional reason)\n• /unfilterowner <ID> - Remove a specific media from filter\n• /listfiltered - See all banned media\n• /clearfiltered - Remove ALL filters\n\nFor more info, use /start in my pv🙈',
         already_banned: '{owner_name}-sama, this {media_type} is already in the Filter List🦍',
         removed_from_filter: '✅ This {media_type} removed from the Filter List🙈',
         invalid_id: '{search_id} is Invalid, click /listfiltered to see the right one🦍',
@@ -61,10 +61,13 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         
         // Status command
         status_ok: '✅ Bot status: **{status}**',
-        status_error: '❌ Error checking bot status: {error}'
+        status_error: '❌ Error checking bot status: {error}',
+        
+        // Language change confirmation
+        lang_changed: '✅ Your language has been changed to English!'
     },
     fa: {
-        welcome: `🤖 **به ربات shiny-umbrella خوش آمدید!**
+        welcome: `🤖 **به ربات OwnerFilter خوش آمدید!**
 
 این ربات می‌تونه به مالک کمک کنه تا ممبرهای گروه نتونن گیف و استیکر پک‌های موردنظر مالک رو بفرستن حتی اگه ادمین گروه باشن.
 
@@ -90,7 +93,7 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         is_admin: 'سلام {owner_mention}-ساما الان شروع به کار میکنم!🐒\n\nمن گیف ها و استیکر پک های موردنظرت رو فیلتر میکنم!\n\nاگه نمیدونی چجوری ازم استفاده کنی من رو تو PV استارت کن!🙈',
         filter_added_owner: 'ارباب {owner_name}، این {media_type} حالا تو لیست فیلتره!🐵\n**دلیل:** {reason}',
         filter_added_not_owner: 'ببخشیدا، ولی تو مالک بنظر نمیای🦍',
-        group_start: 'سلام {group_name}، من ربات shiny-umbrella هستم.🦍  من با فیلتر کردن گیف‌ها و استیکرهای موردنظر مالک، حتی اگه توسط ادمین‌ها استفاده بشه، به تمیز نگه داشتن گروه کمک می‌کنم.\n\nدستورات برای مالک گروه:\n• /filterowner <reason>\nپاسخ به یک گیف/استیکر برای مسدود کردن آن (دلیل اختیاری)\n• /unfilterowner <ID>\nحذف یک رسانه خاص از فیلتر\n• /listfiltered \nمشاهده همه رسانه‌های مسدود شده\n• /clearfiltered \nحذف همه فیلترها\n\nبرای اطلاعات بیشتر، من رو در pv استارت کنید🙈',
+        group_start: 'سلام {group_name}، من ربات FilterOwner هستم.🦍  من با فیلتر کردن گیف‌ها و استیکرهای موردنظر مالک، حتی اگه توسط ادمین‌ها استفاده بشه، به تمیز نگه داشتن گروه کمک می‌کنم.\n\nدستورات برای مالک گروه:\n• /filterowner <reason>\nپاسخ به یک گیف/استیکر برای مسدود کردن آن (دلیل اختیاری)\n• /unfilterowner <ID>\nحذف یک رسانه خاص از فیلتر\n• /listfiltered \nمشاهده همه رسانه‌های مسدود شده\n• /clearfiltered \nحذف همه فیلترها\n\nبرای اطلاعات بیشتر، من رو در pv استارت کنید🙈',
         already_banned: '{owner_name}-ساما، این {media_type} از قبل تو لیست فیلتر هست🦍',
         removed_from_filter: '✅ این {media_type} از لیست فیلتر خارج شد🙈',
         invalid_id: '{search_id} معتبر نیست، بزن رو /listfiltered تا درستش رو ببینی🦍',
@@ -122,7 +125,10 @@ Now the owner can sleep like a baby, because the admins will lose their teasing 
         
         // Status command
         status_ok: '✅ وضعیت ربات: **{status}**',
-        status_error: '❌ خطا در بررسی وضعیت ربات: {error}'
+        status_error: '❌ خطا در بررسی وضعیت ربات: {error}',
+        
+        // Language change confirmation
+        lang_changed: '✅ زبان شما به فارسی تغییر کرد!'
     }
 };
 
@@ -707,79 +713,9 @@ async function callbackHandler(ctx) {
     
     if (ctx.callbackQuery.data.startsWith('lang_')) {
         const langCode = ctx.callbackQuery.data.split('_')[1];
-        await saveUserLanguage(ctx.kv, userId, langCode);
         
-        // Check if we're in a group or private chat
-        const isGroup = ctx.chat?.type && ['group', 'supergroup'].includes(ctx.chat.type);
-        
-        let message;
-        let keyboard;
-        
-        if (isGroup) {
-            // In group, just show confirmation
-            message = langCode === 'fa' ? '✅ زبان شما به فارسی تغییر کرد!' : '✅ Your language has been changed to English!';
-            keyboard = null;
-        } else {
-            // In PV, go back to main menu
-            keyboard = {
-                inline_keyboard: [
-                    [
-                        { text: TEXTS[langCode].language_btn, callback_data: 'change_language' },
-                        { text: TEXTS[langCode].how_it_works_btn, callback_data: 'how_it_works' }
-                    ]
-                ]
-            };
-            message = TEXTS[langCode].welcome;
-        }
-        
-        await ctx.editMessageText(message, {
-            parse_mode: 'Markdown',
-            reply_markup: keyboard
-        });
-        await ctx.answerCallbackQuery();
-    }
-}
-
-// ============= BUILD BOT =============
-export default {
-    async fetch(request, env) {
-        const BOT_TOKEN = env.BOT_TOKEN;
-        if (!BOT_TOKEN) {
-            console.error("BOT_TOKEN is not set");
-            return new Response("Bot token missing", { status: 500 });
-        }
-
-        ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
-
-        const bot = new Bot(BOT_TOKEN);
-        const kv = env.KV;
-
-        bot.use(async (ctx, next) => {
-            ctx.kv = kv;
-            await next();
-        });
-
-        bot.command('start', async (ctx) => {
-            if (ctx.chat.type === 'private') {
-                await startHandler(ctx);
-            } else {
-                await startGroupHandler(ctx);
-            }
-        });
-
-        bot.command('language', languageCommandHandler);
-        bot.command('lang', languageCommandHandler); // Alias
-        bot.command('status', statusHandler); // Debug command
-
-        bot.command('filterowner', filterOwnerHandler);
-        bot.command('unfilterowner', unFilterOwnerHandler);
-        bot.command('listfiltered', listFilteredHandler);
-        bot.command('clearfiltered', clearFilteredHandler);
-
-        bot.on([':animation', ':sticker'], filterMediaHandler);
-        bot.on('callback_query:data', callbackHandler);
-
-        const handler = webhookCallback(bot, 'cloudflare-mod');
-        return handler(request);
-    }
-};
+        try {
+            // Save the language preference
+            await saveUserLanguage(ctx.kv, userId, langCode);
+            
+            // Check if we're in a group
