@@ -37,7 +37,7 @@ jobs:
       - name: Set Webhook
         run: |
           WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
+          curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TWO_TOKEN }}/setWebhook?url=${WORKER_URL}"
       
       - name: Verify Deployment
         run: |
