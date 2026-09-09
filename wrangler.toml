@@ -1,8 +1,3 @@
-name = "shiny-umbrella"
+name = "shiny-chatr"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
-
-# Add KV binding for persistent storage
-[[kv_namespaces]]
-binding = "KV"
-id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
+compatibility_date = "2026-01-01"
