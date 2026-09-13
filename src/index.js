@@ -106,7 +106,7 @@ async function getCachedMalLink(env, cleanTitle) {
 }
 
 async function setCachedMalLink(env, cleanTitle, link) {
-    if (!link) return; // never cache negative results
+    if (!link) return;
     const key = `mal:${cleanTitle}`;
     try {
         await env.RSS_BOT_KV.put(key, encryptData(link));
@@ -118,33 +118,49 @@ async function setCachedMalLink(env, cleanTitle, link) {
 // ============= MAL SEARCH =============
 
 /**
- * Query Jikan for one candidate. Retries once on HTTP 429.
+ * Query Jikan for one candidate. Aggressive retry on 429, UA header,
+ * and full logging of every request/response.
  */
 async function tryJikan(query, attempt = 1) {
     const url = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(query)}&limit=1`;
-    try {
-        const res = await fetch(url, { headers: { Accept: 'application/json' } });
 
-        if (res.status === 429 && attempt < 3) {
-            const wait = 1200 * attempt;
-            console.warn(`[MAL] Jikan 429 for "${query}" (attempt ${attempt}), waiting ${wait}ms...`);
+    try {
+        const res = await fetch(url, {
+            headers: {
+                Accept: 'application/json',
+                // UA header: some CF-hosted APIs reject requests without one.
+                'User-Agent': 'SubsPleaseTelegramBot/1.0 (+https://workers.dev)',
+            },
+        });
+
+        console.log(`[MAL] Jikan "${query}" → HTTP ${res.status} (attempt ${attempt})`);
+
+        if (res.status === 429 && attempt < 5) {
+            const wait = 2000 * attempt;
+            console.warn(`[MAL] Jikan 429 for "${query}", retrying in ${wait}ms...`);
             await new Promise((r) => setTimeout(r, wait));
             return tryJikan(query, attempt + 1);
         }
 
         if (!res.ok) {
-            console.warn(`[MAL] Jikan HTTP ${res.status} for "${query}"`);
+            const txt = await res.text().catch(() => '');
+            console.warn(`[MAL] Jikan non-OK for "${query}": ${txt.slice(0, 200)}`);
             return null;
         }
 
         const json = await res.json();
-        if (json.data && json.data.length > 0 && json.data[0].url) {
-            console.log(`[MAL] Jikan hit for "${query}": ${json.data[0].url}`);
-            return json.data[0].url;
+        const count = Array.isArray(json.data) ? json.data.length : 0;
+        console.log(`[MAL] Jikan "${query}" → ${count} result(s)`);
+
+        if (count > 0 && json.data[0].url) {
+            const link = json.data[0].url;
+            console.log(`[MAL] Jikan hit for "${query}": ${link}`);
+            return link;
         }
-        console.warn(`[MAL] Jikan 0 results for "${query}"`);
+
+        console.warn(`[MAL] Jikan 0 usable results for "${query}"`);
     } catch (e) {
-        console.error('[MAL] Jikan error:', e.message);
+        console.error(`[MAL] Jikan fetch error for "${query}":`, e.message);
     }
     return null;
 }
@@ -159,10 +175,9 @@ async function tryMalScrape(query) {
                 'Accept-Language': 'en-US,en;q=0.9',
             },
         });
-        if (!res.ok) {
-            console.warn(`[MAL] Scrape HTTP ${res.status} for "${query}"`);
-            return null;
-        }
+        console.log(`[MAL] Scrape "${query}" → HTTP ${res.status}`);
+        if (!res.ok) return null;
+
         const html = await res.text();
         const match = html.match(
             /href="(https?:\/\/myanimelist\.net\/anime\/\d+\/[A-Za-z0-9_!\-]+)"/
@@ -181,10 +196,7 @@ async function tryMalScrape(query) {
 
 /**
  * Resolve a MAL link for the given clean title.
- * 1. KV cache hit? return immediately.
- * 2. Try multiple candidates against Jikan (with 429 retry).
- * 3. Fall back to scraping MAL's search page.
- * 4. Cache any successful result.
+ * Tries multiple candidate queries, then falls back to scraping MAL.
  */
 async function searchMalLink(env, title) {
     if (!title) return null;
@@ -199,33 +211,40 @@ async function searchMalLink(env, title) {
     const baseQuery = buildBaseQuery(title);
     if (!baseQuery) return null;
 
-    const candidates = [baseQuery];
+    // ---- Build many candidate queries ----
+    const candidates = [];
+    const push = (q) => {
+        const v = (q || '').trim();
+        if (v.length > 2 && !candidates.includes(v)) candidates.push(v);
+    };
 
-    const firstSegment = baseQuery.split(/\s*[-–]\s*/)[0].trim();
-    if (firstSegment && firstSegment !== baseQuery && firstSegment.length > 2) {
-        candidates.push(firstSegment);
+    push(baseQuery);                                       // "Bleach - TYBW"
+    push(baseQuery.split(/\s*[-–]\s*/)[0]);                // "Bleach"
+    push(baseQuery.replace(/\s*[-–]\s*/g, ' '));           // "Bleach TYBW"
+
+    const words = baseQuery.split(/\s+/);
+    if (words.length > 2) {
+        push(words.slice(0, 2).join(' '));                 // "Bleach TYBW" again (dedup)
     }
+    push(words[0]);                                        // "Bleach" (dedup)
 
-    const spaceVersion = baseQuery
-        .replace(/\s*[-–]\s*/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    if (spaceVersion && !candidates.includes(spaceVersion)) {
-        candidates.push(spaceVersion);
-    }
+    console.log(`[MAL] Candidates for "${title}": ${JSON.stringify(candidates)}`);
 
+    // 2. Try Jikan with each candidate
     let link = null;
-
-    // 2. Jikan, one candidate at a time
     for (const query of candidates) {
         link = await tryJikan(query);
         if (link) break;
-        await new Promise((r) => setTimeout(r, 800));
+        await new Promise((r) => setTimeout(r, 600));
     }
 
-    // 3. Fallback scrape
+    // 3. Fallback: scrape MAL's search page for the base query AND the first segment
     if (!link) {
+        console.warn(`[MAL] All Jikan candidates failed for "${title}", trying scrape...`);
         link = await tryMalScrape(baseQuery);
+        if (!link && candidates.length > 1) {
+            link = await tryMalScrape(candidates[1]); // "Bleach"
+        }
     }
 
     // 4. Cache on success
@@ -248,7 +267,6 @@ function formatTitle(rawTitle, lang = 'en', malLink = null) {
         message = `${title} Aired!`;
     }
 
-    // No MAL link → still send the message, just without the link line.
     if (malLink) {
         const label = lang === 'fa' ? 'لینک MAL' : 'MAL Link';
         message += `\n\n<a href="${malLink}">${label}</a>`;
@@ -466,7 +484,6 @@ async function handleMalTest(env, chatId) {
         out += `<b>Base:</b> <code>${base}</code>\n`;
         out += `<b>Link:</b> ${link ? `<a href="${link}">${link}</a>` : '❌ none'}\n\n`;
 
-        // Give Jikan breathing room between samples.
         await new Promise((r) => setTimeout(r, 1000));
     }
 
