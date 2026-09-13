@@ -13,7 +13,7 @@ compatibility_date = "2024-11-20"
 # You must create a KV namespace in the Cloudflare dashboard or via Wrangler
 # and replace the id below with the actual namespace ID.
 [[kv_namespaces]]
-binding = "KASA_KV"
+binding = "RSS_BOT_KV"
 id = "19f2b831dd934b5a9c73713bbab81dd7"   # <-- replace with your namespace ID
 preview_id = "19f2b831dd934b5a9c73713bbab81dd7"
 
