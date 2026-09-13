@@ -117,10 +117,6 @@ async function setCachedMalLink(env, cleanTitle, link) {
 
 // ============= MAL SEARCH =============
 
-/**
- * Query Jikan for one candidate. Aggressive retry on 429, UA header,
- * and full logging of every request/response.
- */
 async function tryJikan(query, attempt = 1) {
     const url = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(query)}&limit=1`;
 
@@ -128,7 +124,6 @@ async function tryJikan(query, attempt = 1) {
         const res = await fetch(url, {
             headers: {
                 Accept: 'application/json',
-                // UA header: some CF-hosted APIs reject requests without one.
                 'User-Agent': 'SubsPleaseTelegramBot/1.0 (+https://workers.dev)',
             },
         });
@@ -194,14 +189,9 @@ async function tryMalScrape(query) {
     return null;
 }
 
-/**
- * Resolve a MAL link for the given clean title.
- * Tries multiple candidate queries, then falls back to scraping MAL.
- */
 async function searchMalLink(env, title) {
     if (!title) return null;
 
-    // 1. Cache
     const cached = await getCachedMalLink(env, title);
     if (cached) {
         console.log(`[MAL] Cache hit for "${title}": ${cached}`);
@@ -211,26 +201,24 @@ async function searchMalLink(env, title) {
     const baseQuery = buildBaseQuery(title);
     if (!baseQuery) return null;
 
-    // ---- Build many candidate queries ----
     const candidates = [];
     const push = (q) => {
         const v = (q || '').trim();
         if (v.length > 2 && !candidates.includes(v)) candidates.push(v);
     };
 
-    push(baseQuery);                                       // "Bleach - TYBW"
-    push(baseQuery.split(/\s*[-–]\s*/)[0]);                // "Bleach"
-    push(baseQuery.replace(/\s*[-–]\s*/g, ' '));           // "Bleach TYBW"
+    push(baseQuery);
+    push(baseQuery.split(/\s*[-–]\s*/)[0]);
+    push(baseQuery.replace(/\s*[-–]\s*/g, ' '));
 
     const words = baseQuery.split(/\s+/);
     if (words.length > 2) {
-        push(words.slice(0, 2).join(' '));                 // "Bleach TYBW" again (dedup)
+        push(words.slice(0, 2).join(' '));
     }
-    push(words[0]);                                        // "Bleach" (dedup)
+    push(words[0]);
 
     console.log(`[MAL] Candidates for "${title}": ${JSON.stringify(candidates)}`);
 
-    // 2. Try Jikan with each candidate
     let link = null;
     for (const query of candidates) {
         link = await tryJikan(query);
@@ -238,16 +226,14 @@ async function searchMalLink(env, title) {
         await new Promise((r) => setTimeout(r, 600));
     }
 
-    // 3. Fallback: scrape MAL's search page for the base query AND the first segment
     if (!link) {
         console.warn(`[MAL] All Jikan candidates failed for "${title}", trying scrape...`);
         link = await tryMalScrape(baseQuery);
         if (!link && candidates.length > 1) {
-            link = await tryMalScrape(candidates[1]); // "Bleach"
+            link = await tryMalScrape(candidates[1]);
         }
     }
 
-    // 4. Cache on success
     if (link) {
         await setCachedMalLink(env, title, link);
     }
@@ -433,10 +419,14 @@ async function handleUnsubInGroup(env, chatId) {
 
 async function handleDebug(env, chatId) {
     try {
-        const rawTitles = await fetchLatestTitles(10);
+        // Fetch more than 10 so we can still show 10 after removing batches.
+        const rawTitles = await fetchLatestTitles(30);
 
-        if (rawTitles.length === 0) {
-            await sendMessage(env, chatId, '🐛 <b>Debug:</b> No titles found in RSS feed.');
+        // Filter out batch releases (same rule as broadcasts).
+        const filtered = rawTitles.filter((t) => !/\bbatch\b/i.test(t)).slice(0, 10);
+
+        if (filtered.length === 0) {
+            await sendMessage(env, chatId, '🐛 <b>Debug:</b> No non-batch titles found in RSS feed.');
             return;
         }
 
@@ -445,11 +435,11 @@ async function handleDebug(env, chatId) {
         await sendMessage(
             env,
             chatId,
-            `🐛 <b>Debug:</b> sending ${rawTitles.length} latest titles...`
+            `🐛 <b>Debug:</b> sending ${filtered.length} latest titles...`
         );
 
-        for (let i = 0; i < rawTitles.length; i++) {
-            const rawTitle = rawTitles[i];
+        for (let i = 0; i < filtered.length; i++) {
+            const rawTitle = filtered[i];
             const clean = cleanTitle(rawTitle);
             const malLink = await searchMalLink(env, clean);
             const body = formatTitle(rawTitle, lang, malLink);
