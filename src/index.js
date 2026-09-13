@@ -2,7 +2,7 @@
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
 // MAL link resolution via DuckDuckGo, PV-only /unsub,
-// group /unsub hint, and /debug command.
+// group /unsub hint, and /debug command (formatted + per-message).
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -43,9 +43,6 @@ function decryptData(encryptedStr) {
 
 // ============= RSS HELPERS =============
 
-/**
- * Decode basic HTML entities commonly found in RSS titles.
- */
 function decodeHtmlEntities(str) {
     return str
         .replace(/&amp;/g, '&')
@@ -74,9 +71,6 @@ async function fetchLatestTitles(n = 10) {
     return titles;
 }
 
-/**
- * Convenience: fetch only the latest title.
- */
 async function fetchLatestTitle() {
     const titles = await fetchLatestTitles(1);
     return titles.length > 0 ? titles[0] : null;
@@ -121,13 +115,22 @@ async function searchMalLink(title) {
     }
 }
 
-function formatTitle(rawTitle, lang = 'en', malLink = null) {
+/**
+ * Clean a raw SubsPlease title (remove prefix, extension, CRC, resolution).
+ * @returns {string} the clean human-readable title
+ */
+function cleanTitle(rawTitle) {
     let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
     title = title.replace(/\.\w+$/, '');
     title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');
     title = title.replace(/\s*\(\d{3,4}p\)$/, '');
     title = title.replace(/\s*\[Batch\]\s*/i, ' ');
     title = title.replace(/\s+/g, ' ').trim();
+    return title;
+}
+
+function formatTitle(rawTitle, lang = 'en', malLink = null) {
+    const title = cleanTitle(rawTitle);
 
     let message;
     if (lang === 'fa') {
@@ -301,28 +304,44 @@ async function handleUnsubInGroup(env, chatId) {
 }
 
 /**
- * /debug — sends the 10 latest RSS titles as a numbered list.
+ * /debug — sends the 10 latest formatted titles (with MAL links),
+ * one message per title, in the chat's selected language.
  */
 async function handleDebug(env, chatId) {
     try {
-        const titles = await fetchLatestTitles(10);
+        const rawTitles = await fetchLatestTitles(10);
 
-        if (titles.length === 0) {
+        if (rawTitles.length === 0) {
             await sendMessage(env, chatId, '🐛 <b>Debug:</b> No titles found in RSS feed.');
             return;
         }
 
-        let msg = '🐛 <b>10 Latest RSS Titles</b>\n\n';
-        titles.forEach((t, i) => {
-            // Escape HTML-sensitive chars so the message doesn't break.
-            const safe = t
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-            msg += `${i + 1}. <code>${safe}</code>\n`;
-        });
+        const lang = await getLang(env, chatId);
 
-        await sendMessage(env, chatId, msg);
+        // Small header so the user knows a batch of debug messages is incoming.
+        await sendMessage(
+            env,
+            chatId,
+            `🐛 <b>Debug:</b> sending ${rawTitles.length} latest titles...`
+        );
+
+        for (let i = 0; i < rawTitles.length; i++) {
+            const rawTitle = rawTitles[i];
+            const clean = cleanTitle(rawTitle);
+
+            // Resolve MAL link for this title (may be null on failure).
+            const malLink = await searchMalLink(clean);
+
+            // Build the same style of message as a real broadcast.
+            const body = formatTitle(rawTitle, lang, malLink);
+
+            // Prefix each message with its index for easy reading.
+            const finalText = `<b>#${i + 1}</b>\n${body}`;
+
+            await sendMessage(env, chatId, finalText);
+        }
+
+        await sendMessage(env, chatId, '🐛 <b>Debug complete.</b>');
     } catch (e) {
         console.error('[ERROR] /debug failed:', e);
         await sendMessage(env, chatId, `🐛 <b>Debug error:</b> ${e.message}`);
@@ -386,8 +405,7 @@ async function broadcastLatest(env) {
         return;
     }
 
-    const cleanedTitle = formatTitle(rawTitle, 'en');
-    const searchQuery = cleanedTitle.replace(/\s*Aired!$/, '').trim();
+    const searchQuery = cleanTitle(rawTitle);
     const malLink = await searchMalLink(searchQuery);
 
     const cache = { en: null, fa: null };
