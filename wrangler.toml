@@ -1,8 +1,23 @@
-name = "shiny-umbrella"
+name = "shiny-kasa"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-11-20"
 
-# Add KV binding for persistent storage
+# ---------- Environment Variables ----------
+# These are injected by the GitHub Actions workflow via --var flags.
+# You can also set them locally in .dev.vars for testing.
+[vars]
+# BOT_TOKEN = "…"   # (set via workflow)
+# DB_ENCRYPTION_KEY = "…"  # (set via workflow)
+
+# ---------- KV Namespace ----------
+# You must create a KV namespace in the Cloudflare dashboard or via Wrangler
+# and replace the id below with the actual namespace ID.
 [[kv_namespaces]]
-binding = "KV"
-id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
+binding = "RSS_BOT_KV"
+id = "YOUR_KV_NAMESPACE_ID"   # <-- replace with your namespace ID
+preview_id = "YOUR_KV_NAMESPACE_ID"
+
+# ---------- Cron Trigger ----------
+# Runs every 10 minutes. Adjust as needed.
+[triggers]
+crons = ["*/10 * * * *"]
