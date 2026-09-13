@@ -1,7 +1,7 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
-// With encrypted KV storage (XOR + Base64), batch filter,
-// and duplicate-send prevention.
+// With encrypted KV storage, batch filter, duplicate prevention,
+// and MAL link resolution via DuckDuckGo.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -56,18 +56,91 @@ async function fetchLatestTitle() {
         .trim();
 }
 
-function formatTitle(rawTitle, lang = 'en') {
+/**
+ * Search DuckDuckGo's HTML endpoint for the anime's MAL page and
+ * return the canonical https://myanimelist.net/anime/... URL, or null.
+ *
+ * @param {string} title  Human-readable anime title (already stripped of
+ *                        [SubsPlease], resolution, CRC, etc.)
+ * @returns {Promise<string|null>}
+ */
+async function searchMalLink(title) {
+    if (!title) return null;
+
+    const query = encodeURIComponent(`site:myanimelist.net ${title}`);
+    const url = `https://html.duckduckgo.com/html/?q=${query}`;
+
+    try {
+        const res = await fetch(url, {
+            headers: {
+                // A browser-like UA helps avoid DDG bot detection.
+                'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+        });
+
+        if (!res.ok) {
+            console.error(`DDG search failed: HTTP ${res.status}`);
+            return null;
+        }
+
+        const html = await res.text();
+
+        // Match the first myanimelist.net/anime/<id>/<slug> URL in the page.
+        // DDG returns both direct links and /l/?uddg= wrapped links.
+        // The regex below handles both by looking for the raw MAL path.
+        const match = html.match(
+            /https?:\/\/myanimelist\.net\/anime\/\d+\/[A-Za-z0-9_!\-]+/
+        );
+
+        if (!match) {
+            console.warn(`No MAL link found for "${title}"`);
+            return null;
+        }
+
+        // Strip a trailing slash if present; the canonical form has none.
+        const link = match[0].replace(/\/$/, '');
+        console.log(`MAL link for "${title}": ${link}`);
+        return link;
+    } catch (e) {
+        console.error('Error searching MAL link:', e);
+        return null;
+    }
+}
+
+/**
+ * Transform a SubsPlease filename into a user-friendly message.
+ * Appends a MAL link below the aired paragraph when available.
+ *
+ * @param {string} rawTitle
+ * @param {'en'|'fa'} lang
+ * @param {string|null} malLink
+ */
+function formatTitle(rawTitle, lang = 'en', malLink = null) {
+    // ---- Strip file metadata ----
     let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
-    title = title.replace(/\.\w+$/, '');
-    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');
-    title = title.replace(/\s*\(\d{3,4}p\)$/, '');
-    title = title.replace(/\s*\[Batch\]\s*/i, ' ');
+    title = title.replace(/\.\w+$/, '');                      // .mkv
+    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');         // [1C413FA9]
+    title = title.replace(/\s*\(\d{3,4}p\)$/, '');            // (1080p)
+    title = title.replace(/\s*\[Batch\]\s*/i, ' ');           // [Batch]
     title = title.replace(/\s+/g, ' ').trim();
 
+    // ---- Build the aired message ----
+    let message;
     if (lang === 'fa') {
-        return `انیمه ${title} اومد!`;
+        message = `انیمه ${title} اومد!`;
+    } else {
+        message = `${title} Aired!`;
     }
-    return `${title} Aired!`;
+
+    // ---- Append MAL link if we found one ----
+    if (malLink) {
+        const label = lang === 'fa' ? 'لینک MAL' : 'MAL Link';
+        message += `\n\n🔗 <a href="${malLink}">${label}</a>`;
+    }
+
+    return message;
 }
 
 // ============= TELEGRAM API HELPERS =============
@@ -78,6 +151,7 @@ async function sendMessage(env, chatId, text, extra = {}) {
         chat_id: chatId,
         text: text,
         parse_mode: 'HTML',
+        disable_web_page_preview: true,
         ...extra,
     };
     const res = await fetch(url, {
@@ -261,10 +335,17 @@ async function broadcastLatest(env) {
 
     const chats = await getBroadcastChats(env);
     if (chats.length === 0) {
-        // Record the title so we don't spam once chats are added later.
         await setLastTitle(env, rawTitle);
         return;
     }
+
+    // ---- Resolve the MAL link once for this title ----
+    // We use the formatted (cleaned) English title for the search query,
+    // since MAL pages are indexed under romanized titles.
+    const cleanedTitle = formatTitle(rawTitle, 'en'); // e.g. "Azur Lane - Bisoku Zenshin! S2 - 11 Aired!"
+    // Strip the " Aired!" suffix before searching.
+    const searchQuery = cleanedTitle.replace(/\s*Aired!$/, '').trim();
+    const malLink = await searchMalLink(searchQuery);
 
     const cache = { en: null, fa: null };
 
@@ -272,7 +353,7 @@ async function broadcastLatest(env) {
         try {
             const lang = await getLang(env, chatId);
             if (!cache[lang]) {
-                cache[lang] = formatTitle(rawTitle, lang);
+                cache[lang] = formatTitle(rawTitle, lang, malLink);
             }
             const res = await sendMessage(env, chatId, cache[lang]);
 
@@ -293,7 +374,6 @@ async function broadcastLatest(env) {
         }
     }
 
-    // Record the title so the next cron tick won't re-send it.
     await setLastTitle(env, rawTitle);
 }
 
