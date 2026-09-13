@@ -1,8 +1,8 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
-// MAL link resolution via DuckDuckGo, PV-only /unsub, and
-// group /unsub hint.
+// MAL link resolution via DuckDuckGo, PV-only /unsub,
+// group /unsub hint, and /debug command.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -43,18 +43,43 @@ function decryptData(encryptedStr) {
 
 // ============= RSS HELPERS =============
 
-async function fetchLatestTitle() {
-    const res = await fetch(RSS_URL);
-    const xml = await res.text();
-    const match = xml.match(/<item>[\s\S]*?<title>(.*?)<\/title>/i);
-    if (!match) return null;
-    return match[1]
+/**
+ * Decode basic HTML entities commonly found in RSS titles.
+ */
+function decodeHtmlEntities(str) {
+    return str
         .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
         .trim();
+}
+
+/**
+ * Fetch the N latest titles from the RSS feed (newest first).
+ * @param {number} n
+ * @returns {Promise<string[]>}
+ */
+async function fetchLatestTitles(n = 10) {
+    const res = await fetch(RSS_URL);
+    const xml = await res.text();
+
+    const titles = [];
+    const itemRegex = /<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/item>/gi;
+    let match;
+    while ((match = itemRegex.exec(xml)) !== null && titles.length < n) {
+        titles.push(decodeHtmlEntities(match[1]));
+    }
+    return titles;
+}
+
+/**
+ * Convenience: fetch only the latest title.
+ */
+async function fetchLatestTitle() {
+    const titles = await fetchLatestTitles(1);
+    return titles.length > 0 ? titles[0] : null;
 }
 
 async function searchMalLink(title) {
@@ -266,10 +291,6 @@ async function handleUnsub(env, chatId) {
     await sendMessage(env, chatId, text);
 }
 
-/**
- * Called when /unsub is used in a group or channel.
- * Suggests removing the bot instead of unsubscribing the whole chat.
- */
 async function handleUnsubInGroup(env, chatId) {
     const lang = await getLang(env, chatId);
     const text =
@@ -277,6 +298,35 @@ async function handleUnsubInGroup(env, chatId) {
             ? 'ℹ️ این ربات به‌صورت گروهی مشترک می‌شود و نمی‌توانید فقط خودتان را از لیست ارسال لغو کنید.\n\nاگر نمی‌خواهید این گروه پیام دریافت کند، لطفاً ربات را از گروه حذف کنید (Kick/Remove).'
             : 'ℹ️ This bot subscribes the whole group at once, so you can\'t unsubscribe just yourself from the broadcast list.\n\nIf you don\'t want this group to receive messages, please remove the bot from the group (Kick/Remove).';
     await sendMessage(env, chatId, text);
+}
+
+/**
+ * /debug — sends the 10 latest RSS titles as a numbered list.
+ */
+async function handleDebug(env, chatId) {
+    try {
+        const titles = await fetchLatestTitles(10);
+
+        if (titles.length === 0) {
+            await sendMessage(env, chatId, '🐛 <b>Debug:</b> No titles found in RSS feed.');
+            return;
+        }
+
+        let msg = '🐛 <b>10 Latest RSS Titles</b>\n\n';
+        titles.forEach((t, i) => {
+            // Escape HTML-sensitive chars so the message doesn't break.
+            const safe = t
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            msg += `${i + 1}. <code>${safe}</code>\n`;
+        });
+
+        await sendMessage(env, chatId, msg);
+    } catch (e) {
+        console.error('[ERROR] /debug failed:', e);
+        await sendMessage(env, chatId, `🐛 <b>Debug error:</b> ${e.message}`);
+    }
 }
 
 async function handleLanguage(env, chatId) {
@@ -412,19 +462,20 @@ export default {
                         await handleUnsub(env, chatId);
                     } else if (text.startsWith('/language')) {
                         await handleLanguage(env, chatId);
+                    } else if (text.startsWith('/debug')) {
+                        await handleDebug(env, chatId);
                     }
                 }
                 // -------- Groups & channels --------
                 else {
-                    // Any activity from a group/channel auto-registers it.
                     await addChatToBroadcast(env, chatId);
 
                     if (text.startsWith('/unsub')) {
-                        // Groups can't unsubscribe individually —
-                        // suggest removing the bot instead.
                         await handleUnsubInGroup(env, chatId);
                     } else if (text.startsWith('/language')) {
                         await handleLanguage(env, chatId);
+                    } else if (text.startsWith('/debug')) {
+                        await handleDebug(env, chatId);
                     }
                 }
             }
