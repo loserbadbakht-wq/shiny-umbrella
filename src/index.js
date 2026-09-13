@@ -1,15 +1,13 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
-// With encrypted KV storage (XOR + Base64)
+// With encrypted KV storage (XOR + Base64), batch filter,
+// and duplicate-send prevention.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 
 // ============= ENCRYPTION HELPERS =============
-// Same pattern as FilterOwner bot: XOR plaintext with a padded/truncated key,
-// then Base64-encode the result. Not cryptographically strong, but hides
-// data from casual inspection of the KV namespace.
 let ENCRYPTION_KEY = 'default-key-please-change-me';
 
 function encryptData(data) {
@@ -44,9 +42,6 @@ function decryptData(encryptedStr) {
 
 // ============= RSS HELPERS =============
 
-/**
- * Fetch the latest RSS item title.
- */
 async function fetchLatestTitle() {
     const res = await fetch(RSS_URL);
     const xml = await res.text();
@@ -61,18 +56,13 @@ async function fetchLatestTitle() {
         .trim();
 }
 
-/**
- * Transform a SubsPlease filename into a user-friendly message.
- *   "[SubsPlease] Azur Lane - Bisoku Zenshin! S2 - 11 (1080p) [1C413FA9].mkv"
- *      -> "Azur Lane - Bisoku Zenshin! S2 - 11 Aired!"         (en)
- *      -> "انیمه Azur Lane - Bisoku Zenshin! S2 - 11 اومد!"    (fa)
- */
 function formatTitle(rawTitle, lang = 'en') {
     let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
-    title = title.replace(/\.\w+$/, '');                      // remove .mkv
-    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');         // remove CRC hash
-    title = title.replace(/\s*\(\d{3,4}p\)$/, '');            // remove (1080p)
-    title = title.trim();
+    title = title.replace(/\.\w+$/, '');
+    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');
+    title = title.replace(/\s*\(\d{3,4}p\)$/, '');
+    title = title.replace(/\s*\[Batch\]\s*/i, ' ');
+    title = title.replace(/\s+/g, ' ').trim();
 
     if (lang === 'fa') {
         return `انیمه ${title} اومد!`;
@@ -95,7 +85,6 @@ async function sendMessage(env, chatId, text, extra = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     });
-    // Return parsed body so callers can inspect errors.
     try {
         return await res.json();
     } catch {
@@ -134,10 +123,6 @@ async function answerCallback(env, callbackQueryId) {
 
 // ============= ENCRYPTED KV HELPERS =============
 
-/**
- * Get the language for a chat. Defaults to English ('en').
- * Values are stored encrypted via encryptData/decryptData.
- */
 async function getLang(env, chatId) {
     const key = `lang:${chatId}`;
     try {
@@ -146,7 +131,6 @@ async function getLang(env, chatId) {
         return decryptData(raw);
     } catch (e) {
         console.error(`[ERROR] Failed to decrypt lang for ${chatId}:`, e);
-        // Recover from corrupted entry by overwriting with default.
         try {
             await env.RSS_BOT_KV.put(key, encryptData('en'));
         } catch {}
@@ -159,11 +143,6 @@ async function setLang(env, chatId, lang) {
     await env.RSS_BOT_KV.put(key, encryptData(lang));
 }
 
-/**
- * Broadcast chat list is stored as an encrypted JSON array under
- * a single key. This keeps the KV small and consistent with the
- * FilterOwner bot's encrypted-per-key approach.
- */
 async function getBroadcastChats(env) {
     const raw = await env.RSS_BOT_KV.get('broadcast_chats');
     if (!raw) return [];
@@ -196,6 +175,23 @@ async function removeChatFromBroadcast(env, chatId) {
     if (filtered.length !== chats.length) {
         await saveBroadcastChats(env, filtered);
     }
+}
+
+// ============= LAST-SENT STATE =============
+
+async function getLastTitle(env) {
+    const raw = await env.RSS_BOT_KV.get('last_title');
+    if (!raw) return null;
+    try {
+        return decryptData(raw);
+    } catch (e) {
+        console.error('[ERROR] Failed to decrypt last_title:', e);
+        return null;
+    }
+}
+
+async function setLastTitle(env, title) {
+    await env.RSS_BOT_KV.put('last_title', encryptData(title));
 }
 
 // ============= COMMAND HANDLERS =============
@@ -250,10 +246,26 @@ async function broadcastLatest(env) {
         return;
     }
 
-    const chats = await getBroadcastChats(env);
-    if (chats.length === 0) return;
+    // ---- Skip batch releases ----
+    if (/\bbatch\b/i.test(rawTitle)) {
+        console.log(`Skipping batch release: ${rawTitle}`);
+        return;
+    }
 
-    // Cache per-language formatted text to avoid recomputation.
+    // ---- Skip if unchanged since last broadcast ----
+    const lastTitle = await getLastTitle(env);
+    if (lastTitle === rawTitle) {
+        console.log(`No change since last broadcast: ${rawTitle}`);
+        return;
+    }
+
+    const chats = await getBroadcastChats(env);
+    if (chats.length === 0) {
+        // Record the title so we don't spam once chats are added later.
+        await setLastTitle(env, rawTitle);
+        return;
+    }
+
     const cache = { en: null, fa: null };
 
     for (const chatId of chats) {
@@ -264,7 +276,6 @@ async function broadcastLatest(env) {
             }
             const res = await sendMessage(env, chatId, cache[lang]);
 
-            // Cleanup: remove chat if bot is blocked or kicked.
             if (res && res.ok === false) {
                 const desc = res.description || '';
                 if (
@@ -281,13 +292,15 @@ async function broadcastLatest(env) {
             console.error(`Failed to send to ${chatId}:`, err);
         }
     }
+
+    // Record the title so the next cron tick won't re-send it.
+    await setLastTitle(env, rawTitle);
 }
 
 // ============= WORKER ENTRY POINT =============
 
 export default {
     async fetch(request, env, ctx) {
-        // Initialize encryption key from env (same secret as FilterOwner bot).
         ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
         globalThis.ENCRYPTION_KEY = ENCRYPTION_KEY;
 
@@ -296,9 +309,6 @@ export default {
             return new Response('Bot token missing', { status: 500 });
         }
 
-        const url = new URL(request.url);
-
-        // Health check.
         if (request.method === 'GET') {
             return new Response('OK', { status: 200 });
         }
@@ -315,13 +325,11 @@ export default {
         }
 
         try {
-            // ----- Messages -----
             if (update.message) {
                 const msg = update.message;
                 const chatId = msg.chat.id;
                 const text = msg.text || '';
 
-                // Any chat that talks to us becomes a broadcast target.
                 await addChatToBroadcast(env, chatId);
 
                 if (text.startsWith('/start')) {
@@ -331,7 +339,6 @@ export default {
                 }
             }
 
-            // ----- Callback queries -----
             if (update.callback_query) {
                 await handleCallbackQuery(env, update.callback_query);
             }
@@ -342,9 +349,6 @@ export default {
         return new Response('OK', { status: 200 });
     },
 
-    /**
-     * Cron trigger — runs the RSS check on the schedule from wrangler.toml.
-     */
     async scheduled(event, env, ctx) {
         ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
         ctx.waitUntil(broadcastLatest(env));
