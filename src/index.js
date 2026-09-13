@@ -1,7 +1,8 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
-// and MAL link resolution via DuckDuckGo.
+// MAL link resolution via DuckDuckGo, PV-only /unsub, and
+// group /unsub hint.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -56,14 +57,6 @@ async function fetchLatestTitle() {
         .trim();
 }
 
-/**
- * Search DuckDuckGo's HTML endpoint for the anime's MAL page and
- * return the canonical https://myanimelist.net/anime/... URL, or null.
- *
- * @param {string} title  Human-readable anime title (already stripped of
- *                        [SubsPlease], resolution, CRC, etc.)
- * @returns {Promise<string|null>}
- */
 async function searchMalLink(title) {
     if (!title) return null;
 
@@ -73,7 +66,6 @@ async function searchMalLink(title) {
     try {
         const res = await fetch(url, {
             headers: {
-                // A browser-like UA helps avoid DDG bot detection.
                 'User-Agent':
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
@@ -86,10 +78,6 @@ async function searchMalLink(title) {
         }
 
         const html = await res.text();
-
-        // Match the first myanimelist.net/anime/<id>/<slug> URL in the page.
-        // DDG returns both direct links and /l/?uddg= wrapped links.
-        // The regex below handles both by looking for the raw MAL path.
         const match = html.match(
             /https?:\/\/myanimelist\.net\/anime\/\d+\/[A-Za-z0-9_!\-]+/
         );
@@ -99,7 +87,6 @@ async function searchMalLink(title) {
             return null;
         }
 
-        // Strip a trailing slash if present; the canonical form has none.
         const link = match[0].replace(/\/$/, '');
         console.log(`MAL link for "${title}": ${link}`);
         return link;
@@ -109,24 +96,14 @@ async function searchMalLink(title) {
     }
 }
 
-/**
- * Transform a SubsPlease filename into a user-friendly message.
- * Appends a MAL link below the aired paragraph when available.
- *
- * @param {string} rawTitle
- * @param {'en'|'fa'} lang
- * @param {string|null} malLink
- */
 function formatTitle(rawTitle, lang = 'en', malLink = null) {
-    // ---- Strip file metadata ----
     let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
-    title = title.replace(/\.\w+$/, '');                      // .mkv
-    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');         // [1C413FA9]
-    title = title.replace(/\s*\(\d{3,4}p\)$/, '');            // (1080p)
-    title = title.replace(/\s*\[Batch\]\s*/i, ' ');           // [Batch]
+    title = title.replace(/\.\w+$/, '');
+    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');
+    title = title.replace(/\s*\(\d{3,4}p\)$/, '');
+    title = title.replace(/\s*\[Batch\]\s*/i, ' ');
     title = title.replace(/\s+/g, ' ').trim();
 
-    // ---- Build the aired message ----
     let message;
     if (lang === 'fa') {
         message = `انیمه ${title} اومد!`;
@@ -134,7 +111,6 @@ function formatTitle(rawTitle, lang = 'en', malLink = null) {
         message = `${title} Aired!`;
     }
 
-    // ---- Append MAL link if we found one ----
     if (malLink) {
         const label = lang === 'fa' ? 'لینک MAL' : 'MAL Link';
         message += `\n\n🔗 <a href="${malLink}">${label}</a>`;
@@ -274,10 +250,33 @@ async function handleStart(env, chatId) {
     const lang = await getLang(env, chatId);
     const text =
         lang === 'fa'
-            ? 'سلام! من ربات اطلاع‌رسانی انیمه هستم.\nبرای تغییر زبان از /language استفاده کنید.'
-            : 'Hi! I am an anime release notification bot.\nUse /language to change the language.';
+            ? 'سلام! من ربات اطلاع‌رسانی انیمه هستم.\n✅ شما مشترک شدید.\nبرای تغییر زبان از /language استفاده کنید.\nبرای لغو اشتراک از /unsub استفاده کنید.'
+            : 'Hi! I am an anime release notification bot.\n✅ You are now subscribed.\nUse /language to change the language.\nUse /unsub to unsubscribe.';
     await sendMessage(env, chatId, text);
     await addChatToBroadcast(env, chatId);
+}
+
+async function handleUnsub(env, chatId) {
+    const lang = await getLang(env, chatId);
+    await removeChatFromBroadcast(env, chatId);
+    const text =
+        lang === 'fa'
+            ? '❌ اشتراک شما لغو شد.\nبرای فعال‌سازی مجدد از /start استفاده کنید.'
+            : '❌ You have been unsubscribed.\nUse /start to subscribe again.';
+    await sendMessage(env, chatId, text);
+}
+
+/**
+ * Called when /unsub is used in a group or channel.
+ * Suggests removing the bot instead of unsubscribing the whole chat.
+ */
+async function handleUnsubInGroup(env, chatId) {
+    const lang = await getLang(env, chatId);
+    const text =
+        lang === 'fa'
+            ? 'ℹ️ این ربات به‌صورت گروهی مشترک می‌شود و نمی‌توانید فقط خودتان را از لیست ارسال لغو کنید.\n\nاگر نمی‌خواهید این گروه پیام دریافت کند، لطفاً ربات را از گروه حذف کنید (Kick/Remove).'
+            : 'ℹ️ This bot subscribes the whole group at once, so you can\'t unsubscribe just yourself from the broadcast list.\n\nIf you don\'t want this group to receive messages, please remove the bot from the group (Kick/Remove).';
+    await sendMessage(env, chatId, text);
 }
 
 async function handleLanguage(env, chatId) {
@@ -320,13 +319,11 @@ async function broadcastLatest(env) {
         return;
     }
 
-    // ---- Skip batch releases ----
     if (/\bbatch\b/i.test(rawTitle)) {
         console.log(`Skipping batch release: ${rawTitle}`);
         return;
     }
 
-    // ---- Skip if unchanged since last broadcast ----
     const lastTitle = await getLastTitle(env);
     if (lastTitle === rawTitle) {
         console.log(`No change since last broadcast: ${rawTitle}`);
@@ -339,11 +336,7 @@ async function broadcastLatest(env) {
         return;
     }
 
-    // ---- Resolve the MAL link once for this title ----
-    // We use the formatted (cleaned) English title for the search query,
-    // since MAL pages are indexed under romanized titles.
-    const cleanedTitle = formatTitle(rawTitle, 'en'); // e.g. "Azur Lane - Bisoku Zenshin! S2 - 11 Aired!"
-    // Strip the " Aired!" suffix before searching.
+    const cleanedTitle = formatTitle(rawTitle, 'en');
     const searchQuery = cleanedTitle.replace(/\s*Aired!$/, '').trim();
     const malLink = await searchMalLink(searchQuery);
 
@@ -409,13 +402,30 @@ export default {
                 const msg = update.message;
                 const chatId = msg.chat.id;
                 const text = msg.text || '';
+                const chatType = msg.chat.type;
 
-                await addChatToBroadcast(env, chatId);
+                // -------- Private chats --------
+                if (chatType === 'private') {
+                    if (text.startsWith('/start')) {
+                        await handleStart(env, chatId);
+                    } else if (text.startsWith('/unsub')) {
+                        await handleUnsub(env, chatId);
+                    } else if (text.startsWith('/language')) {
+                        await handleLanguage(env, chatId);
+                    }
+                }
+                // -------- Groups & channels --------
+                else {
+                    // Any activity from a group/channel auto-registers it.
+                    await addChatToBroadcast(env, chatId);
 
-                if (text.startsWith('/start')) {
-                    await handleStart(env, chatId);
-                } else if (text.startsWith('/language')) {
-                    await handleLanguage(env, chatId);
+                    if (text.startsWith('/unsub')) {
+                        // Groups can't unsubscribe individually —
+                        // suggest removing the bot instead.
+                        await handleUnsubInGroup(env, chatId);
+                    } else if (text.startsWith('/language')) {
+                        await handleLanguage(env, chatId);
+                    }
                 }
             }
 
