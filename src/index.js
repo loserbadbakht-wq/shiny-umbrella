@@ -1,12 +1,15 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
-// Encrypted KV · defensive error handling
+// With encrypted KV storage (XOR + Base64)
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 
-// ============= ENCRYPTION =============
+// ============= ENCRYPTION HELPERS =============
+// Same pattern as FilterOwner bot: XOR plaintext with a padded/truncated key,
+// then Base64-encode the result. Not cryptographically strong, but hides
+// data from casual inspection of the KV namespace.
 let ENCRYPTION_KEY = 'default-key-please-change-me';
 
 function encryptData(data) {
@@ -16,6 +19,7 @@ function encryptData(data) {
     const keyBytes = encoder.encode(
         ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32)
     );
+
     const encrypted = new Uint8Array(plaintext.length);
     for (let i = 0; i < plaintext.length; i++) {
         encrypted[i] = plaintext[i] ^ keyBytes[i % keyBytes.length];
@@ -30,6 +34,7 @@ function decryptData(encryptedStr) {
     const keyBytes = new TextEncoder().encode(
         ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32)
     );
+
     const decrypted = new Uint8Array(encrypted.length);
     for (let i = 0; i < encrypted.length; i++) {
         decrypted[i] = encrypted[i] ^ keyBytes[i % keyBytes.length];
@@ -38,6 +43,10 @@ function decryptData(encryptedStr) {
 }
 
 // ============= RSS HELPERS =============
+
+/**
+ * Fetch the latest RSS item title.
+ */
 async function fetchLatestTitle() {
     const res = await fetch(RSS_URL);
     const xml = await res.text();
@@ -52,122 +61,125 @@ async function fetchLatestTitle() {
         .trim();
 }
 
+/**
+ * Transform a SubsPlease filename into a user-friendly message.
+ *   "[SubsPlease] Azur Lane - Bisoku Zenshin! S2 - 11 (1080p) [1C413FA9].mkv"
+ *      -> "Azur Lane - Bisoku Zenshin! S2 - 11 Aired!"         (en)
+ *      -> "انیمه Azur Lane - Bisoku Zenshin! S2 - 11 اومد!"    (fa)
+ */
 function formatTitle(rawTitle, lang = 'en') {
     let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
-    title = title.replace(/\.\w+$/, '');
-    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');
-    title = title.replace(/\s*\(\d{3,4}p\)$/, '');
+    title = title.replace(/\.\w+$/, '');                      // remove .mkv
+    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');         // remove CRC hash
+    title = title.replace(/\s*\(\d{3,4}p\)$/, '');            // remove (1080p)
     title = title.trim();
-    if (lang === 'fa') return `انیمه ${title} اومد!`;
+
+    if (lang === 'fa') {
+        return `انیمه ${title} اومد!`;
+    }
     return `${title} Aired!`;
 }
 
-// ============= TELEGRAM API =============
+// ============= TELEGRAM API HELPERS =============
+
 async function sendMessage(env, chatId, text, extra = {}) {
-    if (!env.BOT_TOKEN) {
-        console.error('[ERROR] BOT_TOKEN missing – cannot send message');
-        return { ok: false, description: 'BOT_TOKEN missing' };
-    }
     const url = `${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`;
-    const payload = { chat_id: chatId, text, parse_mode: 'HTML', ...extra };
+    const payload = {
+        chat_id: chatId,
+        text: text,
+        parse_mode: 'HTML',
+        ...extra,
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    // Return parsed body so callers can inspect errors.
     try {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!data.ok) {
-            console.error('[sendMessage] Telegram error:', JSON.stringify(data));
-        }
-        return data;
-    } catch (e) {
-        console.error('[sendMessage] fetch failed:', e);
-        return { ok: false, description: String(e) };
+        return await res.json();
+    } catch {
+        return { ok: res.ok };
     }
 }
 
 async function editMessage(env, chatId, messageId, text, extra = {}) {
-    if (!env.BOT_TOKEN) return { ok: false };
     const url = `${TELEGRAM_API}${env.BOT_TOKEN}/editMessageText`;
-    const payload = { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...extra };
+    const payload = {
+        chat_id: chatId,
+        message_id: messageId,
+        text: text,
+        parse_mode: 'HTML',
+        ...extra,
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
     try {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
         return await res.json();
-    } catch (e) {
-        return { ok: false, description: String(e) };
+    } catch {
+        return { ok: res.ok };
     }
 }
 
 async function answerCallback(env, callbackQueryId) {
-    if (!env.BOT_TOKEN) return;
-    try {
-        await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/answerCallbackQuery`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ callback_query_id: callbackQueryId }),
-        });
-    } catch (e) {
-        console.error('[answerCallback] failed:', e);
-    }
+    return fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callbackQueryId }),
+    });
 }
 
-// ============= SAFE ENCRYPTED KV HELPERS =============
-// Every function returns a safe fallback if KV is unbound or decryption
-// fails. They NEVER throw.
+// ============= ENCRYPTED KV HELPERS =============
 
-function kvReady(env) {
-    return env && env.RSS_BOT_KV && typeof env.RSS_BOT_KV.get === 'function';
-}
-
+/**
+ * Get the language for a chat. Defaults to English ('en').
+ * Values are stored encrypted via encryptData/decryptData.
+ */
 async function getLang(env, chatId) {
-    if (!kvReady(env)) return 'en';
+    const key = `lang:${chatId}`;
     try {
-        const raw = await env.RSS_BOT_KV.get(`lang:${chatId}`);
+        const raw = await env.RSS_BOT_KV.get(key);
         if (!raw) return 'en';
         return decryptData(raw);
     } catch (e) {
-        console.error(`[getLang] failed for ${chatId}:`, e);
+        console.error(`[ERROR] Failed to decrypt lang for ${chatId}:`, e);
+        // Recover from corrupted entry by overwriting with default.
+        try {
+            await env.RSS_BOT_KV.put(key, encryptData('en'));
+        } catch {}
         return 'en';
     }
 }
 
 async function setLang(env, chatId, lang) {
-    if (!kvReady(env)) return false;
-    try {
-        await env.RSS_BOT_KV.put(`lang:${chatId}`, encryptData(lang));
-        return true;
-    } catch (e) {
-        console.error('[setLang] failed:', e);
-        return false;
-    }
+    const key = `lang:${chatId}`;
+    await env.RSS_BOT_KV.put(key, encryptData(lang));
 }
 
+/**
+ * Broadcast chat list is stored as an encrypted JSON array under
+ * a single key. This keeps the KV small and consistent with the
+ * FilterOwner bot's encrypted-per-key approach.
+ */
 async function getBroadcastChats(env) {
-    if (!kvReady(env)) return [];
+    const raw = await env.RSS_BOT_KV.get('broadcast_chats');
+    if (!raw) return [];
     try {
-        const raw = await env.RSS_BOT_KV.get('broadcast_chats');
-        if (!raw) return [];
         return decryptData(raw);
     } catch (e) {
-        console.error('[getBroadcastChats] failed:', e);
+        console.error('[ERROR] Failed to decrypt broadcast_chats:', e);
+        try {
+            await env.RSS_BOT_KV.put('broadcast_chats', encryptData([]));
+        } catch {}
         return [];
     }
 }
 
 async function saveBroadcastChats(env, chats) {
-    if (!kvReady(env)) return false;
-    try {
-        await env.RSS_BOT_KV.put('broadcast_chats', encryptData(chats));
-        return true;
-    } catch (e) {
-        console.error('[saveBroadcastChats] failed:', e);
-        return false;
-    }
+    await env.RSS_BOT_KV.put('broadcast_chats', encryptData(chats));
 }
 
 async function addChatToBroadcast(env, chatId) {
@@ -189,13 +201,13 @@ async function removeChatFromBroadcast(env, chatId) {
 // ============= COMMAND HANDLERS =============
 
 async function handleStart(env, chatId) {
-    const lang = await getLang(env, chatId); // safe
+    const lang = await getLang(env, chatId);
     const text =
         lang === 'fa'
             ? 'سلام! من ربات اطلاع‌رسانی انیمه هستم.\nبرای تغییر زبان از /language استفاده کنید.'
             : 'Hi! I am an anime release notification bot.\nUse /language to change the language.';
-    await sendMessage(env, chatId, text);   // reply FIRST
-    await addChatToBroadcast(env, chatId);  // register after — failure is harmless
+    await sendMessage(env, chatId, text);
+    await addChatToBroadcast(env, chatId);
 }
 
 async function handleLanguage(env, chatId) {
@@ -210,70 +222,27 @@ async function handleLanguage(env, chatId) {
     await sendMessage(env, chatId, '🌐 Choose your language:', {
         reply_markup: keyboard,
     });
-    await addChatToBroadcast(env, chatId);
-}
-
-// ---- Debug command ----
-async function handleDebug(env, chatId) {
-    const hasToken = !!env.BOT_TOKEN;
-    const tokenPreview = hasToken
-        ? `${env.BOT_TOKEN.slice(0, 8)}…${env.BOT_TOKEN.slice(-4)}`
-        : 'MISSING';
-
-    const hasKV = kvReady(env);
-    let kvStatus = 'not bound';
-    let storedChats = 0;
-    if (hasKV) {
-        try {
-            const chats = await getBroadcastChats(env);
-            storedChats = chats.length;
-            kvStatus = 'OK';
-        } catch (e) {
-            kvStatus = `error: ${e.message}`;
-        }
-    }
-
-    const encKeyLen = (env.DB_ENCRYPTION_KEY || '').length;
-
-    // Also test an actual send so we know the API token works.
-    const apiTest = await sendMessage(env, chatId, '🩺 API test OK');
-
-    const lines = [
-        `🩺 <b>Debug</b>`,
-        ``,
-        `BOT_TOKEN: ${hasToken ? '✅ ' + tokenPreview : '❌ MISSING'}`,
-        `RSS_BOT_KV binding: ${hasKV ? '✅ present' : '❌ UNDEFINED'}`,
-        `KV read test: ${kvStatus}`,
-        `Broadcast chats stored: ${storedChats}`,
-        `DB_ENCRYPTION_KEY length: ${encKeyLen}`,
-        `sendMessage test: ${apiTest.ok ? '✅ OK' : '❌ ' + (apiTest.description || 'unknown')}`,
-    ];
-    await sendMessage(env, chatId, lines.join('\n'));
 }
 
 async function handleCallbackQuery(env, callbackQuery) {
-    const { id, data, message } = callbackQuery || {};
-    if (!message) {
-        await answerCallback(env, id);
-        return;
-    }
+    const { id, data, message } = callbackQuery;
     const chatId = message.chat.id;
     const messageId = message.message_id;
 
     if (data && data.startsWith('lang:')) {
         const lang = data.split(':')[1];
-        const ok = await setLang(env, chatId, lang);
-        const confirmText = ok
-            ? lang === 'fa'
+        await setLang(env, chatId, lang);
+        const confirmText =
+            lang === 'fa'
                 ? '✅ زبان به فارسی تغییر کرد.'
-                : '✅ Language changed to English.'
-            : '⚠️ Could not save language (KV not available).';
+                : '✅ Language changed to English.';
         await editMessage(env, chatId, messageId, confirmText);
         await answerCallback(env, id);
     }
 }
 
 // ============= RSS BROADCAST =============
+
 async function broadcastLatest(env) {
     const rawTitle = await fetchLatestTitle();
     if (!rawTitle) {
@@ -284,13 +253,18 @@ async function broadcastLatest(env) {
     const chats = await getBroadcastChats(env);
     if (chats.length === 0) return;
 
+    // Cache per-language formatted text to avoid recomputation.
     const cache = { en: null, fa: null };
 
     for (const chatId of chats) {
         try {
             const lang = await getLang(env, chatId);
-            if (!cache[lang]) cache[lang] = formatTitle(rawTitle, lang);
+            if (!cache[lang]) {
+                cache[lang] = formatTitle(rawTitle, lang);
+            }
             const res = await sendMessage(env, chatId, cache[lang]);
+
+            // Cleanup: remove chat if bot is blocked or kicked.
             if (res && res.ok === false) {
                 const desc = res.description || '';
                 if (
@@ -299,7 +273,7 @@ async function broadcastLatest(env) {
                     desc.includes('kicked') ||
                     desc.includes('user is deactivated')
                 ) {
-                    console.warn(`Removing ${chatId}: ${desc}`);
+                    console.warn(`Removing ${chatId} from broadcast list: ${desc}`);
                     await removeChatFromBroadcast(env, chatId);
                 }
             }
@@ -309,61 +283,68 @@ async function broadcastLatest(env) {
     }
 }
 
-// ============= WORKER ENTRY =============
+// ============= WORKER ENTRY POINT =============
+
 export default {
     async fetch(request, env, ctx) {
-        // Init key for this invocation (module scope isn't always shared).
+        // Initialize encryption key from env (same secret as FilterOwner bot).
         ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
+        globalThis.ENCRYPTION_KEY = ENCRYPTION_KEY;
+
+        if (!env.BOT_TOKEN) {
+            console.error('BOT_TOKEN is not set');
+            return new Response('Bot token missing', { status: 500 });
+        }
 
         const url = new URL(request.url);
 
+        // Health check.
         if (request.method === 'GET') {
             return new Response('OK', { status: 200 });
         }
+
         if (request.method !== 'POST') {
             return new Response('Method Not Allowed', { status: 405 });
         }
 
-        // Log every incoming update – visible in `wrangler tail`.
         let update;
         try {
             update = await request.json();
         } catch {
             return new Response('Bad Request', { status: 400 });
         }
-        console.log('[UPDATE]', JSON.stringify(update).slice(0, 500));
 
-        // ---- Messages ----
-        if (update.message) {
-            const msg = update.message;
-            const chatId = msg.chat.id;
-            const text = msg.text || '';
+        try {
+            // ----- Messages -----
+            if (update.message) {
+                const msg = update.message;
+                const chatId = msg.chat.id;
+                const text = msg.text || '';
 
-            // Reply to commands FIRST, then register the chat.
-            if (text.startsWith('/start')) {
-                await handleStart(env, chatId);
-            } else if (text.startsWith('/language')) {
-                await handleLanguage(env, chatId);
-            } else if (text.startsWith('/debug')) {
-                await handleDebug(env, chatId);
-            } else {
-                // Any other message also registers the chat.
+                // Any chat that talks to us becomes a broadcast target.
                 await addChatToBroadcast(env, chatId);
-            }
-        }
 
-        // ---- Callback queries ----
-        if (update.callback_query) {
-            try {
-                await handleCallbackQuery(env, update.callback_query);
-            } catch (e) {
-                console.error('[callback] failed:', e);
+                if (text.startsWith('/start')) {
+                    await handleStart(env, chatId);
+                } else if (text.startsWith('/language')) {
+                    await handleLanguage(env, chatId);
+                }
             }
+
+            // ----- Callback queries -----
+            if (update.callback_query) {
+                await handleCallbackQuery(env, update.callback_query);
+            }
+        } catch (e) {
+            console.error('[ERROR] Update handling failed:', e);
         }
 
         return new Response('OK', { status: 200 });
     },
 
+    /**
+     * Cron trigger — runs the RSS check on the schedule from wrangler.toml.
+     */
     async scheduled(event, env, ctx) {
         ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
         ctx.waitUntil(broadcastLatest(env));
