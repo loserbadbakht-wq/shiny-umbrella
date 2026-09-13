@@ -1,7 +1,7 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
-// MAL link resolution via Jikan API + multi-candidate fallback,
+// MAL link resolution (Jikan + fallback + cache),
 // PV-only /unsub, group /unsub hint, /debug, and /maltest.
 // ============================================================
 
@@ -92,13 +92,51 @@ function buildBaseQuery(title) {
         .trim();
 }
 
+// ============= MAL CACHE (KV, encrypted) =============
+
+async function getCachedMalLink(env, cleanTitle) {
+    const key = `mal:${cleanTitle}`;
+    try {
+        const raw = await env.RSS_BOT_KV.get(key);
+        if (!raw) return null;
+        return decryptData(raw);
+    } catch (e) {
+        return null;
+    }
+}
+
+async function setCachedMalLink(env, cleanTitle, link) {
+    if (!link) return; // never cache negative results
+    const key = `mal:${cleanTitle}`;
+    try {
+        await env.RSS_BOT_KV.put(key, encryptData(link));
+    } catch (e) {
+        console.error('[MAL] Cache set failed:', e.message);
+    }
+}
+
 // ============= MAL SEARCH =============
 
-async function tryJikan(query) {
+/**
+ * Query Jikan for one candidate. Retries once on HTTP 429.
+ */
+async function tryJikan(query, attempt = 1) {
     const url = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(query)}&limit=1`;
     try {
         const res = await fetch(url, { headers: { Accept: 'application/json' } });
-        if (!res.ok) return null;
+
+        if (res.status === 429 && attempt < 3) {
+            const wait = 1200 * attempt;
+            console.warn(`[MAL] Jikan 429 for "${query}" (attempt ${attempt}), waiting ${wait}ms...`);
+            await new Promise((r) => setTimeout(r, wait));
+            return tryJikan(query, attempt + 1);
+        }
+
+        if (!res.ok) {
+            console.warn(`[MAL] Jikan HTTP ${res.status} for "${query}"`);
+            return null;
+        }
+
         const json = await res.json();
         if (json.data && json.data.length > 0 && json.data[0].url) {
             console.log(`[MAL] Jikan hit for "${query}": ${json.data[0].url}`);
@@ -141,8 +179,22 @@ async function tryMalScrape(query) {
     return null;
 }
 
-async function searchMalLink(title) {
+/**
+ * Resolve a MAL link for the given clean title.
+ * 1. KV cache hit? return immediately.
+ * 2. Try multiple candidates against Jikan (with 429 retry).
+ * 3. Fall back to scraping MAL's search page.
+ * 4. Cache any successful result.
+ */
+async function searchMalLink(env, title) {
     if (!title) return null;
+
+    // 1. Cache
+    const cached = await getCachedMalLink(env, title);
+    if (cached) {
+        console.log(`[MAL] Cache hit for "${title}": ${cached}`);
+        return cached;
+    }
 
     const baseQuery = buildBaseQuery(title);
     if (!baseQuery) return null;
@@ -162,13 +214,26 @@ async function searchMalLink(title) {
         candidates.push(spaceVersion);
     }
 
+    let link = null;
+
+    // 2. Jikan, one candidate at a time
     for (const query of candidates) {
-        const link = await tryJikan(query);
-        if (link) return link;
-        await new Promise((r) => setTimeout(r, 350));
+        link = await tryJikan(query);
+        if (link) break;
+        await new Promise((r) => setTimeout(r, 800));
     }
 
-    return await tryMalScrape(baseQuery);
+    // 3. Fallback scrape
+    if (!link) {
+        link = await tryMalScrape(baseQuery);
+    }
+
+    // 4. Cache on success
+    if (link) {
+        await setCachedMalLink(env, title, link);
+    }
+
+    return link;
 }
 
 // ============= FORMATTING =============
@@ -183,7 +248,7 @@ function formatTitle(rawTitle, lang = 'en', malLink = null) {
         message = `${title} Aired!`;
     }
 
-    // If no MAL link was found, we still send the message — just without the link line.
+    // No MAL link → still send the message, just without the link line.
     if (malLink) {
         const label = lang === 'fa' ? 'لینک MAL' : 'MAL Link';
         message += `\n\n<a href="${malLink}">${label}</a>`;
@@ -368,7 +433,7 @@ async function handleDebug(env, chatId) {
         for (let i = 0; i < rawTitles.length; i++) {
             const rawTitle = rawTitles[i];
             const clean = cleanTitle(rawTitle);
-            const malLink = await searchMalLink(clean);
+            const malLink = await searchMalLink(env, clean);
             const body = formatTitle(rawTitle, lang, malLink);
             const finalText = `<b>#${i + 1}</b>\n${body}`;
 
@@ -395,13 +460,14 @@ async function handleMalTest(env, chatId) {
 
     for (const s of samples) {
         const base = buildBaseQuery(s);
-        const link = await searchMalLink(s);
+        const link = await searchMalLink(env, s);
 
         out += `<b>Input:</b> <code>${s}</code>\n`;
         out += `<b>Base:</b> <code>${base}</code>\n`;
         out += `<b>Link:</b> ${link ? `<a href="${link}">${link}</a>` : '❌ none'}\n\n`;
 
-        await new Promise((r) => setTimeout(r, 400));
+        // Give Jikan breathing room between samples.
+        await new Promise((r) => setTimeout(r, 1000));
     }
 
     await sendMessage(env, chatId, out);
@@ -465,7 +531,7 @@ async function broadcastLatest(env) {
     }
 
     const searchQuery = cleanTitle(rawTitle);
-    const malLink = await searchMalLink(searchQuery);
+    const malLink = await searchMalLink(env, searchQuery);
 
     const cache = { en: null, fa: null };
 
