@@ -1,8 +1,9 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
-// MAL link resolution via Jikan API, PV-only /unsub,
-// group /unsub hint, and /debug command (formatted + per-message).
+// MAL link resolution via Jikan API + MAL fallback scrape,
+// PV-only /unsub, group /unsub hint, /debug (formatted, per-message),
+// and /maltest diagnostic command.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -72,47 +73,99 @@ async function fetchLatestTitle() {
 }
 
 /**
- * Search the Jikan API for the anime's MAL page.
+ * Clean a raw SubsPlease title (remove prefix, extension, CRC, resolution).
+ */
+function cleanTitle(rawTitle) {
+    let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
+    title = title.replace(/\.\w+$/, '');                       // .mkv
+    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');          // [1C413FA9]
+    title = title.replace(/\s*\(\d{3,4}p\)$/, '');             // (1080p)
+    title = title.replace(/\s*\[Batch\]\s*/i, ' ');            // [Batch]
+    title = title.replace(/\s+/g, ' ').trim();
+    return title;
+}
+
+/**
+ * Reduce a clean title to a broad search query.
+ * e.g. "Azur Lane - Bisoku Zenshin! S2 - 11"  ->  "Azur Lane Bisoku Zenshin"
+ *      "One Piece - 1122"                     ->  "One Piece"
+ *      "Bleach - TYBW - 38"                   ->  "Bleach TYBW"
+ */
+function buildBaseQuery(title) {
+    return title
+        .replace(/\s*[-–]\s*S\d+\s*[-–]\s*\d+.*$/i, '') // "- S2 - 11 ..."
+        .replace(/\s*S\d+\s*[-–]\s*\d+.*$/i, '')         // " S2 - 11 ..."
+        .replace(/\s*[-–]\s*\d+.*$/i, '')                // "- 11 ..."
+        .replace(/\s*\(\d{4}\)$/i, '')                   // "(2024)"
+        .replace(/[!?:.]+$/g, '')                        // trailing punctuation
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Search for the anime's MAL page.
+ * 1. Try Jikan API with a cleaned-up base title.
+ * 2. Fallback: scrape MAL's own search page.
  */
 async function searchMalLink(title) {
     if (!title) return null;
 
-    const url = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(title)}&limit=1`;
+    const baseQuery = buildBaseQuery(title);
+    if (!baseQuery) return null;
+
+    // ---- 1. Jikan API ----
+    const jikanUrl = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(baseQuery)}&limit=1`;
 
     try {
-        const res = await fetch(url, {
-            headers: { 'Accept': 'application/json' },
+        const res = await fetch(jikanUrl, {
+            headers: { Accept: 'application/json' },
         });
 
-        if (!res.ok) {
-            console.error(`Jikan search failed: HTTP ${res.status}`);
-            return null;
+        if (res.ok) {
+            const json = await res.json();
+            if (json.data && json.data.length > 0 && json.data[0].url) {
+                const malUrl = json.data[0].url;
+                console.log(`[MAL] Jikan hit for "${baseQuery}": ${malUrl}`);
+                return malUrl;
+            }
+            console.warn(`[MAL] Jikan returned 0 results for "${baseQuery}"`);
+        } else {
+            console.warn(`[MAL] Jikan HTTP ${res.status} for "${baseQuery}"`);
         }
-
-        const json = await res.json();
-
-        if (!json.data || json.data.length === 0) {
-            console.warn(`No MAL entry found for "${title}"`);
-            return null;
-        }
-
-        const malUrl = json.data[0].url;
-        console.log(`MAL link for "${title}": ${malUrl}`);
-        return malUrl;
     } catch (e) {
-        console.error('Error searching MAL link:', e);
-        return null;
+        console.error('[MAL] Jikan error:', e.message);
     }
-}
 
-function cleanTitle(rawTitle) {
-    let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
-    title = title.replace(/\.\w+$/, '');
-    title = title.replace(/\s*\[[A-F0-9]{8}\]$/, '');
-    title = title.replace(/\s*\(\d{3,4}p\)$/, '');
-    title = title.replace(/\s*\[Batch\]\s*/i, ' ');
-    title = title.replace(/\s+/g, ' ').trim();
-    return title;
+    // ---- 2. Fallback: scrape MAL search page ----
+    try {
+        const malSearchUrl = `https://myanimelist.net/anime.php?q=${encodeURIComponent(baseQuery)}&cat=anime`;
+        const res = await fetch(malSearchUrl, {
+            headers: {
+                'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+        });
+
+        if (res.ok) {
+            const html = await res.text();
+            const match = html.match(
+                /href="(https?:\/\/myanimelist\.net\/anime\/\d+\/[A-Za-z0-9_!\-]+)"/
+            );
+            if (match) {
+                const malUrl = match[1].replace(/\/$/, '');
+                console.log(`[MAL] Fallback hit for "${baseQuery}": ${malUrl}`);
+                return malUrl;
+            }
+            console.warn(`[MAL] Fallback found no link for "${baseQuery}"`);
+        } else {
+            console.warn(`[MAL] Fallback HTTP ${res.status}`);
+        }
+    } catch (e) {
+        console.error('[MAL] Fallback error:', e.message);
+    }
+
+    return null;
 }
 
 function formatTitle(rawTitle, lang = 'en', malLink = null) {
@@ -315,7 +368,7 @@ async function handleDebug(env, chatId) {
 
             await sendMessage(env, chatId, finalText);
 
-            // Respect Jikan's 3 req/sec rate limit during /debug loops.
+            // Respect Jikan's 3 req/sec rate limit.
             await new Promise((r) => setTimeout(r, 400));
         }
 
@@ -324,6 +377,34 @@ async function handleDebug(env, chatId) {
         console.error('[ERROR] /debug failed:', e);
         await sendMessage(env, chatId, `🐛 <b>Debug error:</b> ${e.message}`);
     }
+}
+
+/**
+ * /maltest — diagnostic command: runs the MAL resolver against a few
+ * hardcoded sample titles and reports the base query + resolved link.
+ */
+async function handleMalTest(env, chatId) {
+    const samples = [
+        'Azur Lane - Bisoku Zenshin! S2 - 11',
+        'One Piece - 1122',
+        'Bleach - TYBW - 38',
+    ];
+
+    let out = '🧪 <b>MAL Search Test</b>\n\n';
+
+    for (const s of samples) {
+        const base = buildBaseQuery(s);
+        const link = await searchMalLink(s);
+
+        out += `<b>Input:</b> <code>${s}</code>\n`;
+        out += `<b>Base:</b> <code>${base}</code>\n`;
+        out += `<b>Link:</b> ${link ? `<a href="${link}">${link}</a>` : '❌ none'}\n\n`;
+
+        // Respect Jikan's 3 req/sec rate limit.
+        await new Promise((r) => setTimeout(r, 400));
+    }
+
+    await sendMessage(env, chatId, out);
 }
 
 async function handleLanguage(env, chatId) {
@@ -450,6 +531,7 @@ export default {
                 const text = msg.text || '';
                 const chatType = msg.chat.type;
 
+                // -------- Private chats --------
                 if (chatType === 'private') {
                     if (text.startsWith('/start')) {
                         await handleStart(env, chatId);
@@ -459,8 +541,12 @@ export default {
                         await handleLanguage(env, chatId);
                     } else if (text.startsWith('/debug')) {
                         await handleDebug(env, chatId);
+                    } else if (text.startsWith('/maltest')) {
+                        await handleMalTest(env, chatId);
                     }
-                } else {
+                }
+                // -------- Groups & channels --------
+                else {
                     await addChatToBroadcast(env, chatId);
 
                     if (text.startsWith('/unsub')) {
@@ -469,6 +555,8 @@ export default {
                         await handleLanguage(env, chatId);
                     } else if (text.startsWith('/debug')) {
                         await handleDebug(env, chatId);
+                    } else if (text.startsWith('/maltest')) {
+                        await handleMalTest(env, chatId);
                     }
                 }
             }
