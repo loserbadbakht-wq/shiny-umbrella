@@ -1,7 +1,7 @@
 // ============================================================
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
-// MAL link resolution via DuckDuckGo, PV-only /unsub,
+// MAL link resolution via Jikan API, PV-only /unsub,
 // group /unsub hint, and /debug command (formatted + per-message).
 // ============================================================
 
@@ -53,11 +53,6 @@ function decodeHtmlEntities(str) {
         .trim();
 }
 
-/**
- * Fetch the N latest titles from the RSS feed (newest first).
- * @param {number} n
- * @returns {Promise<string[]>}
- */
 async function fetchLatestTitles(n = 10) {
     const res = await fetch(RSS_URL);
     const xml = await res.text();
@@ -76,49 +71,40 @@ async function fetchLatestTitle() {
     return titles.length > 0 ? titles[0] : null;
 }
 
+/**
+ * Search the Jikan API for the anime's MAL page.
+ */
 async function searchMalLink(title) {
     if (!title) return null;
 
-    const query = encodeURIComponent(`site:myanimelist.net ${title}`);
-    const url = `https://html.duckduckgo.com/html/?q=${query}`;
+    const url = `https://api.jikan.moe/v4/anime?q=${encodeURIComponent(title)}&limit=1`;
 
     try {
         const res = await fetch(url, {
-            headers: {
-                'User-Agent':
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-            },
+            headers: { 'Accept': 'application/json' },
         });
 
         if (!res.ok) {
-            console.error(`DDG search failed: HTTP ${res.status}`);
+            console.error(`Jikan search failed: HTTP ${res.status}`);
             return null;
         }
 
-        const html = await res.text();
-        const match = html.match(
-            /https?:\/\/myanimelist\.net\/anime\/\d+\/[A-Za-z0-9_!\-]+/
-        );
+        const json = await res.json();
 
-        if (!match) {
-            console.warn(`No MAL link found for "${title}"`);
+        if (!json.data || json.data.length === 0) {
+            console.warn(`No MAL entry found for "${title}"`);
             return null;
         }
 
-        const link = match[0].replace(/\/$/, '');
-        console.log(`MAL link for "${title}": ${link}`);
-        return link;
+        const malUrl = json.data[0].url;
+        console.log(`MAL link for "${title}": ${malUrl}`);
+        return malUrl;
     } catch (e) {
         console.error('Error searching MAL link:', e);
         return null;
     }
 }
 
-/**
- * Clean a raw SubsPlease title (remove prefix, extension, CRC, resolution).
- * @returns {string} the clean human-readable title
- */
 function cleanTitle(rawTitle) {
     let title = rawTitle.replace(/^\[SubsPlease\]\s*/i, '');
     title = title.replace(/\.\w+$/, '');
@@ -303,10 +289,6 @@ async function handleUnsubInGroup(env, chatId) {
     await sendMessage(env, chatId, text);
 }
 
-/**
- * /debug — sends the 10 latest formatted titles (with MAL links),
- * one message per title, in the chat's selected language.
- */
 async function handleDebug(env, chatId) {
     try {
         const rawTitles = await fetchLatestTitles(10);
@@ -318,7 +300,6 @@ async function handleDebug(env, chatId) {
 
         const lang = await getLang(env, chatId);
 
-        // Small header so the user knows a batch of debug messages is incoming.
         await sendMessage(
             env,
             chatId,
@@ -328,17 +309,14 @@ async function handleDebug(env, chatId) {
         for (let i = 0; i < rawTitles.length; i++) {
             const rawTitle = rawTitles[i];
             const clean = cleanTitle(rawTitle);
-
-            // Resolve MAL link for this title (may be null on failure).
             const malLink = await searchMalLink(clean);
-
-            // Build the same style of message as a real broadcast.
             const body = formatTitle(rawTitle, lang, malLink);
-
-            // Prefix each message with its index for easy reading.
             const finalText = `<b>#${i + 1}</b>\n${body}`;
 
             await sendMessage(env, chatId, finalText);
+
+            // Respect Jikan's 3 req/sec rate limit during /debug loops.
+            await new Promise((r) => setTimeout(r, 400));
         }
 
         await sendMessage(env, chatId, '🐛 <b>Debug complete.</b>');
@@ -472,7 +450,6 @@ export default {
                 const text = msg.text || '';
                 const chatType = msg.chat.type;
 
-                // -------- Private chats --------
                 if (chatType === 'private') {
                     if (text.startsWith('/start')) {
                         await handleStart(env, chatId);
@@ -483,9 +460,7 @@ export default {
                     } else if (text.startsWith('/debug')) {
                         await handleDebug(env, chatId);
                     }
-                }
-                // -------- Groups & channels --------
-                else {
+                } else {
                     await addChatToBroadcast(env, chatId);
 
                     if (text.startsWith('/unsub')) {
