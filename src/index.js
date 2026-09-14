@@ -1,5 +1,6 @@
 // src/index.js
-// Telegram "Shiny Link" bot — turns direct links into native Telegram media.
+// Telegram "DL Link to Telegram Bot" — turns direct links into native Telegram media.
+// Works in private chats and groups.
 
 const VIDEO_TYPES = new Set([
   'video/mp4',
@@ -34,33 +35,20 @@ const AUDIO_TYPES = new Set([
 ]);
 
 const EXT_MAP = {
-  mp4: 'video/mp4',
-  webm: 'video/webm',
-  mkv: 'video/x-matroska',
-  mov: 'video/quicktime',
-  avi: 'video/x-msvideo',
-  mpeg: 'video/mpeg',
-  mpg: 'video/mpeg',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  png: 'image/png',
-  webp: 'image/webp',
-  gif: 'image/gif',
-  mp3: 'audio/mpeg',
-  flac: 'audio/flac',
-  ogg: 'audio/ogg',
-  opus: 'audio/opus',
-  m4a: 'audio/mp4',
-  aac: 'audio/aac',
-  wav: 'audio/wav',
+  mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska',
+  mov: 'video/quicktime', avi: 'video/x-msvideo', mpeg: 'video/mpeg', mpg: 'video/mpeg',
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif',
+  mp3: 'audio/mpeg', flac: 'audio/flac', ogg: 'audio/ogg', opus: 'audio/opus',
+  m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav',
 };
+
+const URL_RE = /https?:\/\/[^\s<>"']+/i;
 
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'GET') {
-      return new Response('🪄 Shiny Link bot is alive.', { status: 200 });
+      return new Response('🪄 DL Link to Telegram Bot is alive.', { status: 200 });
     }
-
     if (request.method !== 'POST') {
       return new Response('Method not allowed', { status: 405 });
     }
@@ -68,11 +56,10 @@ export default {
     let update;
     try {
       update = await request.json();
-    } catch (err) {
+    } catch {
       return new Response('Bad request', { status: 400 });
     }
 
-    // Always ACK Telegram fast; process in background.
     ctx.waitUntil(handleUpdate(update, env).catch((e) => console.error('handler error:', e)));
     return new Response('OK', { status: 200 });
   },
@@ -83,6 +70,7 @@ async function handleUpdate(update, env) {
   if (!msg || typeof msg.text !== 'string') return;
 
   const chatId = msg.chat.id;
+  const messageId = msg.message_id;
   const text = msg.text.trim();
   const token = env.BOT_TOKEN;
 
@@ -91,50 +79,101 @@ async function handleUpdate(update, env) {
     return;
   }
 
-  if (text.startsWith('/start') || text.startsWith('/help')) {
+  // -------- Command parsing --------
+  // Supported forms:
+  //   /dl <url>
+  //   /dl doc <url>
+  //   /dl            (as reply to a message containing a URL)
+  //   /dl doc        (as reply to a message containing a URL → send as document)
+  //   /start | /help
+  const parts = text.split(/\s+/);
+  const rawCmd = parts[0] || '';
+  const cmd = rawCmd.toLowerCase().replace(/@[A-Za-z0-9_]+$/, ''); // strip @BotName
+
+  if (cmd === '/start' || cmd === '/help') {
     await sendMessage(
       token,
       chatId,
       [
-        '🪄 *Shiny Link Bot*',
+        '🪄 *DL Link to Telegram Bot*',
         '',
-        'Send me a *direct* link to a file and I will deliver it as native Telegram media:',
+        'Convert direct links to native Telegram media:',
         '• 🎬 Video → playable video',
         '• 🖼️ Image → photo',
         '• 🎵 Audio → music',
         '• 📎 Anything else → document',
+        '',
+        '*Commands:*',
+        '`/dl <url>` — send link as media',
+        '`/dl doc <url>` — force send as document',
+        'Reply `/dl` to any message containing a link',
+        'Reply `/dl doc` to send that link as document',
       ].join('\n'),
       'Markdown'
     );
     return;
   }
 
-  const urlMatch = text.match(/https?:\/\/[^\s]+/i);
-  if (!urlMatch) {
-    await sendMessage(token, chatId, '⚠️ Please send a direct file URL.');
+  if (cmd !== '/dl') return; // ignore anything else
+
+  // -------- Extract URL + doc flag --------
+  let idx = 1;
+  let forceDoc = false;
+  if ((parts[idx] || '').toLowerCase() === 'doc') {
+    forceDoc = true;
+    idx++;
+  }
+
+  let url = null;
+  for (let i = idx; i < parts.length; i++) {
+    const m = parts[i].match(URL_RE);
+    if (m) { url = m[0]; break; }
+  }
+
+  // Fall back to the replied-to message's text or caption
+  if (!url && msg.reply_to_message) {
+    const reply = msg.reply_to_message;
+    const source = reply.text || reply.caption || '';
+    const m = source.match(URL_RE);
+    if (m) url = m[0];
+  }
+
+  if (!url) {
+    await sendMessage(
+      token,
+      chatId,
+      '⚠️ No link found. Use `/dl <url>` or reply `/dl` to a message containing a link.',
+      'Markdown',
+      messageId
+    );
     return;
   }
 
-  const url = urlMatch[0].replace(/[)\].,>]+$/, ''); // strip trailing punctuation
+  // Strip trailing punctuation
+  url = url.replace(/[)\].,>]+$/, '');
 
   try {
     let contentType = await getContentType(url);
     if (!contentType || contentType === 'application/octet-stream' || contentType === 'binary/octet-stream') {
       contentType = detectByExtension(url) || contentType || 'application/octet-stream';
     }
-
     const filename = getFilename(url, contentType);
-    await sendMedia(token, chatId, url, contentType, filename);
+    await sendMedia(token, chatId, url, contentType, filename, forceDoc, messageId);
   } catch (err) {
     console.error(err);
-    await sendMessage(token, chatId, `❌ ${escapeMd(err.message || 'Unknown error')}`, 'Markdown');
+    await sendMessage(
+      token,
+      chatId,
+      `❌ ${escapeMd(err.message || 'Unknown error')}`,
+      'Markdown',
+      messageId
+    );
   }
 }
 
 /* ---------------- Content type detection ---------------- */
 
 async function getContentType(url) {
-  // Try HEAD first (cheap).
   try {
     const head = await fetch(url, { method: 'HEAD', redirect: 'follow' });
     if (head.ok) {
@@ -143,7 +182,6 @@ async function getContentType(url) {
     }
   } catch (_) {}
 
-  // Fallback: GET a tiny range to read headers.
   try {
     const resp = await fetch(url, {
       method: 'GET',
@@ -159,7 +197,6 @@ async function getContentType(url) {
   } catch (e) {
     throw new Error(e.message || 'Failed to inspect URL');
   }
-
   return null;
 }
 
@@ -185,9 +222,10 @@ function getFilename(url, contentType) {
 
 /* ---------------- Telegram helpers ---------------- */
 
-async function sendMessage(token, chatId, text, parseMode) {
+async function sendMessage(token, chatId, text, parseMode, replyTo) {
   const payload = { chat_id: chatId, text };
   if (parseMode) payload.parse_mode = parseMode;
+  if (replyTo) payload.reply_to_message_id = replyTo;
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -195,11 +233,14 @@ async function sendMessage(token, chatId, text, parseMode) {
   });
 }
 
-async function sendMedia(token, chatId, url, contentType, filename) {
+async function sendMedia(token, chatId, url, contentType, filename, forceDoc, replyTo) {
   let method;
   let field;
 
-  if (VIDEO_TYPES.has(contentType)) {
+  if (forceDoc) {
+    method = 'sendDocument';
+    field = 'document';
+  } else if (VIDEO_TYPES.has(contentType)) {
     method = 'sendVideo';
     field = 'video';
   } else if (IMAGE_TYPES.has(contentType)) {
@@ -214,19 +255,15 @@ async function sendMedia(token, chatId, url, contentType, filename) {
   }
 
   const payload = { chat_id: chatId };
+  if (replyTo) payload.reply_to_message_id = replyTo;
 
   if (method === 'sendDocument') {
-    // give Telegram the filename so it shows a proper name
     payload[field] = url;
     payload.caption = filename;
   } else {
     payload[field] = url;
-    if (method === 'sendVideo') {
-      payload.supports_streaming = true;
-    }
-    if (method === 'sendAudio') {
-      payload.title = filename;
-    }
+    if (method === 'sendVideo') payload.supports_streaming = true;
+    if (method === 'sendAudio') payload.title = filename;
   }
 
   const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -239,8 +276,6 @@ async function sendMedia(token, chatId, url, contentType, filename) {
 
   if (!data.ok) {
     const desc = data.description || `Telegram ${method} failed`;
-
-    // Friendly notes for the classic limits of URL-based uploads.
     if (/file is too big|too big/i.test(desc)) {
       throw new Error(
         'Telegram refuses the URL because the file is too big for URL-based uploads (20 MB for videos/audio/documents, 5 MB for photos).'
@@ -255,4 +290,4 @@ async function sendMedia(token, chatId, url, contentType, filename) {
 
 function escapeMd(s) {
   return String(s).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-    }
+  }
