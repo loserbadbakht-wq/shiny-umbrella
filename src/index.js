@@ -2,11 +2,13 @@
 // Telegram RSS Bot for SubsPlease – Cloudflare Worker
 // With encrypted KV storage, batch filter, duplicate prevention,
 // MAL link resolution (Jikan + fallback + cache),
-// PV-only /unsub, group /unsub hint, /debug, and /maltest.
+// PV-only /unsub, group /unsub hint, /debug, /maltest,
+// and /schedule with interactive day buttons.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
 const TELEGRAM_API = 'https://api.telegram.org/bot';
+const SCHEDULE_API = 'https://subsplease.org/api/?f=schedule&tz=UTC';
 
 // ============= ENCRYPTION HELPERS =============
 let ENCRYPTION_KEY = 'default-key-please-change-me';
@@ -261,6 +263,37 @@ function formatTitle(rawTitle, lang = 'en', malLink = null) {
     return message;
 }
 
+// ============= MESSAGE SPLITTER =============
+
+function splitMessage(text, maxLength = 4000) {
+    const lines = text.split('\n');
+    const chunks = [];
+    let current = '';
+
+    for (const line of lines) {
+        const candidate = current ? current + '\n' + line : line;
+        if (candidate.length > maxLength) {
+            if (current) chunks.push(current);
+            current = line;
+        } else {
+            current = candidate;
+        }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+}
+
+/**
+ * Trim a message down to fit Telegram's editMessageText limit (4096).
+ */
+function truncateForEdit(text, maxLength = 4000) {
+    if (text.length <= maxLength) return text;
+    return (
+        text.slice(0, maxLength - 40).replace(/\n[^\n]*$/, '') +
+        '\n\n<i>… (truncated)</i>'
+    );
+}
+
 // ============= TELEGRAM API HELPERS =============
 
 async function sendMessage(env, chatId, text, extra = {}) {
@@ -291,6 +324,7 @@ async function editMessage(env, chatId, messageId, text, extra = {}) {
         message_id: messageId,
         text: text,
         parse_mode: 'HTML',
+        disable_web_page_preview: true,
         ...extra,
     };
     const res = await fetch(url, {
@@ -386,6 +420,78 @@ async function setLastTitle(env, title) {
     await env.RSS_BOT_KV.put('last_title', encryptData(title));
 }
 
+// ============= SCHEDULE HELPERS =============
+
+const DAYS = [
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+    'Sunday',
+];
+
+const DAY_LABELS = {
+    Monday: 'Mon',
+    Tuesday: 'Tue',
+    Wednesday: 'Wed',
+    Thursday: 'Thu',
+    Friday: 'Fri',
+    Saturday: 'Sat',
+    Sunday: 'Sun',
+};
+
+function getCurrentDayUTC() {
+    const idx = new Date().getUTCDay(); // 0 = Sunday
+    return DAYS[(idx + 6) % 7]; // map so Monday=0 → "Monday"
+}
+
+async function fetchSchedule() {
+    const res = await fetch(SCHEDULE_API, {
+        headers: {
+            'User-Agent': 'SubsPleaseTelegramBot/1.0 (+https://workers.dev)',
+            Accept: 'application/json',
+        },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json.schedule) throw new Error('No schedule data returned');
+    return json.schedule;
+}
+
+function formatDaySchedule(day, entries) {
+    let msg = `📅 <b>${day}</b> (UTC)\n\n`;
+    if (!entries || entries.length === 0) {
+        msg += '<i>No releases scheduled.</i>';
+        return msg;
+    }
+    for (const entry of entries) {
+        const safeTitle = String(entry.title || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+        msg += `<code>${entry.time}</code>  ${safeTitle}\n`;
+    }
+    return msg;
+}
+
+function buildDayKeyboard(activeDay) {
+    const rows = [];
+    // Row 1: Mon–Thu, Row 2: Fri–Sun
+    const row1 = DAYS.slice(0, 4).map((d) => ({
+        text: d === activeDay ? `⭐ ${DAY_LABELS[d]}` : DAY_LABELS[d],
+        callback_data: `sched:${d}`,
+    }));
+    const row2 = DAYS.slice(4).map((d) => ({
+        text: d === activeDay ? `⭐ ${DAY_LABELS[d]}` : DAY_LABELS[d],
+        callback_data: `sched:${d}`,
+    }));
+    rows.push(row1);
+    rows.push(row2);
+    return { inline_keyboard: rows };
+}
+
 // ============= COMMAND HANDLERS =============
 
 async function handleStart(env, chatId) {
@@ -419,10 +525,7 @@ async function handleUnsubInGroup(env, chatId) {
 
 async function handleDebug(env, chatId) {
     try {
-        // Fetch more than 10 so we can still show 10 after removing batches.
         const rawTitles = await fetchLatestTitles(30);
-
-        // Filter out batch releases (same rule as broadcasts).
         const filtered = rawTitles.filter((t) => !/\bbatch\b/i.test(t)).slice(0, 10);
 
         if (filtered.length === 0) {
@@ -480,6 +583,25 @@ async function handleMalTest(env, chatId) {
     await sendMessage(env, chatId, out);
 }
 
+/**
+ * /schedule — sends ONE message showing the current day's schedule,
+ * with all 7 days as inline buttons underneath.
+ */
+async function handleSchedule(env, chatId) {
+    try {
+        const schedule = await fetchSchedule();
+        const today = getCurrentDayUTC();
+
+        const text = truncateForEdit(formatDaySchedule(today, schedule[today]));
+        const keyboard = buildDayKeyboard(today);
+
+        await sendMessage(env, chatId, text, { reply_markup: keyboard });
+    } catch (e) {
+        console.error('[ERROR] /schedule failed:', e);
+        await sendMessage(env, chatId, `📅 <b>Schedule error:</b> ${e.message}`);
+    }
+}
+
 async function handleLanguage(env, chatId) {
     const keyboard = {
         inline_keyboard: [
@@ -499,6 +621,7 @@ async function handleCallbackQuery(env, callbackQuery) {
     const chatId = message.chat.id;
     const messageId = message.message_id;
 
+    // ----- Language buttons -----
     if (data && data.startsWith('lang:')) {
         const lang = data.split(':')[1];
         await setLang(env, chatId, lang);
@@ -508,6 +631,31 @@ async function handleCallbackQuery(env, callbackQuery) {
                 : '✅ Language changed to English.';
         await editMessage(env, chatId, messageId, confirmText);
         await answerCallback(env, id);
+        return;
+    }
+
+    // ----- Schedule day buttons -----
+    if (data && data.startsWith('sched:')) {
+        const day = data.slice('sched:'.length);
+        if (!DAYS.includes(day)) {
+            await answerCallback(env, id);
+            return;
+        }
+
+        try {
+            const schedule = await fetchSchedule();
+            const text = truncateForEdit(formatDaySchedule(day, schedule[day]));
+            const keyboard = buildDayKeyboard(day);
+            await editMessage(env, chatId, messageId, text, {
+                reply_markup: keyboard,
+            });
+            await answerCallback(env, id);
+        } catch (e) {
+            console.error('[ERROR] sched callback failed:', e);
+            await answerCallback(env, id);
+            await sendMessage(env, chatId, `📅 <b>Schedule error:</b> ${e.message}`);
+        }
+        return;
     }
 }
 
@@ -615,6 +763,8 @@ export default {
                         await handleDebug(env, chatId);
                     } else if (text.startsWith('/maltest')) {
                         await handleMalTest(env, chatId);
+                    } else if (text.startsWith('/schedule')) {
+                        await handleSchedule(env, chatId);
                     }
                 } else {
                     await addChatToBroadcast(env, chatId);
@@ -627,6 +777,8 @@ export default {
                         await handleDebug(env, chatId);
                     } else if (text.startsWith('/maltest')) {
                         await handleMalTest(env, chatId);
+                    } else if (text.startsWith('/schedule')) {
+                        await handleSchedule(env, chatId);
                     }
                 }
             }
