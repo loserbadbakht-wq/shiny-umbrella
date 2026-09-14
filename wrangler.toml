@@ -1,8 +1,7 @@
-name = "shiny-umbrella"
+name = "shiny-link"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-10-01"
+compatibility_flags = ["nodejs_compat"]
 
-# Add KV binding for persistent storage
-[[kv_namespaces]]
-binding = "KV"
-id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
+# Vars are injected by the GitHub Actions workflow via --var
+# BOT_TOKEN and DB_ENCRYPTION_KEY
