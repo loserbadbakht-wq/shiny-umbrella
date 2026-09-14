@@ -3,7 +3,7 @@
 // With encrypted KV storage, batch filter, duplicate prevention,
 // MAL link resolution (Jikan + fallback + cache),
 // PV-only /unsub, group /unsub hint, /debug, /maltest,
-// and /schedule with interactive day buttons.
+// and /schedule with interactive day buttons (bilingual).
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -283,9 +283,6 @@ function splitMessage(text, maxLength = 4000) {
     return chunks;
 }
 
-/**
- * Trim a message down to fit Telegram's editMessageText limit (4096).
- */
 function truncateForEdit(text, maxLength = 4000) {
     if (text.length <= maxLength) return text;
     return (
@@ -422,6 +419,7 @@ async function setLastTitle(env, title) {
 
 // ============= SCHEDULE HELPERS =============
 
+// Canonical English day names — used as API keys and callback data.
 const DAYS = [
     'Monday',
     'Tuesday',
@@ -432,7 +430,8 @@ const DAYS = [
     'Sunday',
 ];
 
-const DAY_LABELS = {
+// English button labels (short).
+const DAY_LABELS_EN = {
     Monday: 'Mon',
     Tuesday: 'Tue',
     Wednesday: 'Wed',
@@ -442,9 +441,42 @@ const DAY_LABELS = {
     Sunday: 'Sun',
 };
 
+// Persian button labels.
+const DAY_LABELS_FA = {
+    Monday: 'دوشنبه',
+    Tuesday: 'سه‌شنبه',
+    Wednesday: 'چهارشنبه',
+    Thursday: 'پنجشنبه',
+    Friday: 'جمعه',
+    Saturday: 'شنبه',
+    Sunday: 'یکشنبه',
+};
+
+// Persian full day names (for the message header).
+const DAY_FULL_FA = {
+    Monday: 'دوشنبه',
+    Tuesday: 'سه‌شنبه',
+    Wednesday: 'چهارشنبه',
+    Thursday: 'پنجشنبه',
+    Friday: 'جمعه',
+    Saturday: 'شنبه',
+    Sunday: 'یکشنبه',
+};
+
+// Iranian week order (Saturday first) — used when the chat is in Persian.
+const DAYS_FA_ORDER = [
+    'Saturday',
+    'Sunday',
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+];
+
 function getCurrentDayUTC() {
     const idx = new Date().getUTCDay(); // 0 = Sunday
-    return DAYS[(idx + 6) % 7]; // map so Monday=0 → "Monday"
+    return DAYS[(idx + 6) % 7]; // Monday=0
 }
 
 async function fetchSchedule() {
@@ -460,12 +492,23 @@ async function fetchSchedule() {
     return json.schedule;
 }
 
-function formatDaySchedule(day, entries) {
-    let msg = `📅 <b>${day}</b> (UTC)\n\n`;
+function formatDaySchedule(day, entries, lang) {
+    const isFa = lang === 'fa';
+    const dayName = isFa ? DAY_FULL_FA[day] : day;
+
+    const header = isFa
+        ? `📅 <b>${dayName}</b> (به وقت UTC)\n\n`
+        : `📅 <b>${dayName}</b> (UTC)\n\n`;
+
+    let msg = header;
+
     if (!entries || entries.length === 0) {
-        msg += '<i>No releases scheduled.</i>';
+        msg += isFa
+            ? '<i>هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.</i>'
+            : '<i>No releases scheduled.</i>';
         return msg;
     }
+
     for (const entry of entries) {
         const safeTitle = String(entry.title || '')
             .replace(/&/g, '&amp;')
@@ -476,19 +519,21 @@ function formatDaySchedule(day, entries) {
     return msg;
 }
 
-function buildDayKeyboard(activeDay) {
-    const rows = [];
-    // Row 1: Mon–Thu, Row 2: Fri–Sun
-    const row1 = DAYS.slice(0, 4).map((d) => ({
-        text: d === activeDay ? `⭐ ${DAY_LABELS[d]}` : DAY_LABELS[d],
-        callback_data: `sched:${d}`,
+function buildDayKeyboard(activeDay, lang) {
+    const isFa = lang === 'fa';
+    const order = isFa ? DAYS_FA_ORDER : DAYS;
+    const labels = isFa ? DAY_LABELS_FA : DAY_LABELS_EN;
+
+    const buttons = order.map((d) => ({
+        text: d === activeDay ? `⭐ ${labels[d]}` : labels[d],
+        callback_data: `sched:${d}`, // always English — API key.
     }));
-    const row2 = DAYS.slice(4).map((d) => ({
-        text: d === activeDay ? `⭐ ${DAY_LABELS[d]}` : DAY_LABELS[d],
-        callback_data: `sched:${d}`,
-    }));
-    rows.push(row1);
-    rows.push(row2);
+
+    // 4 buttons on the top row, 3 on the bottom row.
+    const row1 = buttons.slice(0, 4);
+    const row2 = buttons.slice(4);
+    const rows = [row1, row2].filter((r) => r.length > 0);
+
     return { inline_keyboard: rows };
 }
 
@@ -583,17 +628,14 @@ async function handleMalTest(env, chatId) {
     await sendMessage(env, chatId, out);
 }
 
-/**
- * /schedule — sends ONE message showing the current day's schedule,
- * with all 7 days as inline buttons underneath.
- */
 async function handleSchedule(env, chatId) {
     try {
+        const lang = await getLang(env, chatId);
         const schedule = await fetchSchedule();
         const today = getCurrentDayUTC();
 
-        const text = truncateForEdit(formatDaySchedule(today, schedule[today]));
-        const keyboard = buildDayKeyboard(today);
+        const text = truncateForEdit(formatDaySchedule(today, schedule[today], lang));
+        const keyboard = buildDayKeyboard(today, lang);
 
         await sendMessage(env, chatId, text, { reply_markup: keyboard });
     } catch (e) {
@@ -643,9 +685,10 @@ async function handleCallbackQuery(env, callbackQuery) {
         }
 
         try {
+            const lang = await getLang(env, chatId);
             const schedule = await fetchSchedule();
-            const text = truncateForEdit(formatDaySchedule(day, schedule[day]));
-            const keyboard = buildDayKeyboard(day);
+            const text = truncateForEdit(formatDaySchedule(day, schedule[day], lang));
+            const keyboard = buildDayKeyboard(day, lang);
             await editMessage(env, chatId, messageId, text, {
                 reply_markup: keyboard,
             });
