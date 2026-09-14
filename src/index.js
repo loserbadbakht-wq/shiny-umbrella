@@ -260,6 +260,10 @@ async function sendMedia(token, chatId, url, contentType, filename, forceDoc, re
   if (method === 'sendDocument') {
     payload[field] = url;
     payload.caption = filename;
+    // 👇 Forces Telegram to show it as a plain file, not inline media.
+    // (Only reliably honored by a self-hosted local Bot API server;
+    //  the public api.telegram.org may ignore it — see note below.)
+    payload.disable_content_type_detection = true;
   } else {
     payload[field] = url;
     if (method === 'sendVideo') payload.supports_streaming = true;
@@ -276,6 +280,7 @@ async function sendMedia(token, chatId, url, contentType, filename, forceDoc, re
 
   if (!data.ok) {
     const desc = data.description || `Telegram ${method} failed`;
+
     if (/file is too big|too big/i.test(desc)) {
       throw new Error(
         'Telegram refuses the URL because the file is too big for URL-based uploads (20 MB for videos/audio/documents, 5 MB for photos).'
