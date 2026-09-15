@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mensch ärgere Dich nicht – modern boards</title>
+<style>
+  :root {
+    --bg: #e2e8f0;
+    --card: #ffffff;
+    --text: #0f172a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  h1 {
+    text-align: center;
+    padding: 1.5rem 1rem 0.5rem;
+    font-size: clamp(1.4rem, 2.5vw, 2rem);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1.5rem;
+    padding: 1.5rem;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+  .card {
+    background: var(--card);
+    border-radius: 1rem;
+    padding: 1rem;
+    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.08);
+  }
+  .card h2 {
+    margin: 0 0 0.75rem;
+    font-size: 1.1rem;
+    text-align: center;
+    font-weight: 600;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 0.75rem;
+  }
+</style>
+</head>
+<body>
+<h1>Mensch ärgere Dich nicht – modern boards</h1>
+<div class="grid" id="grid"></div>
+
+<script>
+function createBoard(N) {
+  const size = 1000;
+  const cx = size / 2;
+  const cy = size / 2;
+
+  const R_yard = 430;        // start yard radius
+  const R_track = 330;       // track ring radius
+  const R_home_inner = 80;   // inner end of home column
+  const L = N * 10;          // track cells: 10 per player
+
+  const cellW = Math.min(30, (2 * Math.PI * R_track / L) * 0.85);
+  const cellH = Math.min(28, cellW * 1.5);
+
+  const yardR = Math.max(28, 70 - N * 1.5);
+  const pieceR = yardR * 0.28;
+  const d = yardR * 0.45;
+
+  let svg = `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">`;
+
+  // soft board background
+  svg += `<rect width="${size}" height="${size}" rx="40" fill="#f8fafc"/>`;
+
+  // shadow filter for pieces
+  svg += `
+    <defs>
+      <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+        <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.2"/>
+      </filter>
+    </defs>
+  `;
+
+  // center home (empty)
+  svg += `<circle cx="${cx}" cy="${cy}" r="70" fill="#f1f5f9" stroke="#94a3b8" stroke-width="3"/>`;
+  svg += `<circle cx="${cx}" cy="${cy}" r="28" fill="#e2e8f0" stroke="#cbd5e1" stroke-width="2"/>`;
+
+  // track cells (empty course)
+  for (let k = 0; k < L; k++) {
+    const angle = (k / L) * 2 * Math.PI - Math.PI / 2;
+    const x = cx + R_track * Math.cos(angle);
+    const y = cy + R_track * Math.sin(angle);
+    const rot = angle * 180 / Math.PI + 90;
+
+    svg += `<rect
+      x="${x - cellW / 2}"
+      y="${y - cellH / 2}"
+      width="${cellW}"
+      height="${cellH}"
+      rx="${cellH * 0.3}"
+      fill="#ffffff"
+      stroke="#cbd5e1"
+      stroke-width="1"
+      transform="rotate(${rot} ${x} ${y})"
+    />`;
+  }
+
+  // players
+  for (let i = 0; i < N; i++) {
+    const angle = (i / N) * 2 * Math.PI - Math.PI / 2;
+    const hue = (i * 360 / N + 15) % 360;
+
+    const pieceColor = `hsl(${hue}, 65%, 55%)`;
+    const lightColor = `hsl(${hue}, 70%, 92%)`;
+    const strokeColor = `hsl(${hue}, 60%, 65%)`;
+
+    // home column (empty)
+    const segCount = 4;
+    const rStart = R_track - cellH * 1.5;
+    const rEnd = R_home_inner;
+    const segLen = (rStart - rEnd) / segCount;
+
+    for (let j = 0; j < segCount; j++) {
+      const r = rStart - (j + 0.5) * segLen;
+      const hx = cx + r * Math.cos(angle);
+      const hy = cy + r * Math.sin(angle);
+      const hRot = angle * 180 / Math.PI - 90;
+      const hW = Math.max(12, cellW * 0.8);
+
+      svg += `<rect
+        x="${hx - hW / 2}"
+        y="${hy - segLen * 0.4}"
+        width="${hW}"
+        height="${segLen * 0.8}"
+        rx="${hW * 0.25}"
+        fill="${lightColor}"
+        stroke="${strokeColor}"
+        stroke-width="1.5"
+        transform="rotate(${hRot} ${hx} ${hy})"
+      />`;
+    }
+
+    // start yard with 4 pieces
+    const yx = cx + R_yard * Math.cos(angle);
+    const yy = cy + R_yard * Math.sin(angle);
+
+    svg += `<circle
+      cx="${yx}"
+      cy="${yy}"
+      r="${yardR}"
+      fill="${lightColor}"
+      stroke="${strokeColor}"
+      stroke-width="3"
+    />`;
+
+    const positions = [
+      [-d, -d],
+      [ d, -d],
+      [-d,  d],
+      [ d,  d]
+    ];
+
+    for (const [px, py] of positions) {
+      svg += `<circle
+        cx="${yx + px}"
+        cy="${yy + py}"
+        r="${pieceR}"
+        fill="${pieceColor}"
+        stroke="#ffffff"
+        stroke-width="2"
+        filter="url(#shadow)"
+      />`;
+    }
+  }
+
+  svg += `</svg>`;
+  return svg;
+}
+
+const grid = document.getElementById('grid');
+[4, 6, 8, 10, 12, 14, 16, 18, 20].forEach(N => {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `<h2>${N} players</h2>` + createBoard(N);
+  grid.appendChild(card);
+});
+</script>
+</body>
+  </html>
