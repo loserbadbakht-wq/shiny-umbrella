@@ -1,10 +1,7 @@
 name = "shiny-dice"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
-
-# Secrets are supplied at deploy time by the GitHub Actions workflow
-# via `wrangler deploy --var FIVE_BOT_TOKEN:... --var DB_ENCRYPTION_KEY:...`
-# You can also use `wrangler secret put` for local dev.
+compatibility_flags = ["nodejs_compat"]
 
 [observability]
 enabled = true
@@ -16,3 +13,8 @@ class_name = "GameRoom"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["GameRoom"]
+
+# Import .wasm files as WebAssembly.Module bindings
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
