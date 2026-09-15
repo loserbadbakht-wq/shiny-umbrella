@@ -1,8 +1,18 @@
-name = "shiny-umbrella"
+name = "shiny-dice"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-11-01"
 
-# Add KV binding for persistent storage
-[[kv_namespaces]]
-binding = "KV"
-id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
+# Secrets are supplied at deploy time by the GitHub Actions workflow
+# via `wrangler deploy --var FIVE_BOT_TOKEN:... --var DB_ENCRYPTION_KEY:...`
+# You can also use `wrangler secret put` for local dev.
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "GAME_ROOM"
+class_name = "GameRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameRoom"]
