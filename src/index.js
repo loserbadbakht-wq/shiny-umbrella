@@ -97,7 +97,7 @@ export default {
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
-        `روز شمار در این ${where} فعال شد، شاید این جمعه بیایید`,
+        `روز شمار در این ${where} فعال شد، شاید این جمعه بیاید`,
         threadId
       );
 
