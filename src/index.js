@@ -1,4 +1,4 @@
-// ============= CONFIG =============
+                                                      // ============= CONFIG =============
 const MSG_LINE_1 = 'روز شمار سرور آقا سگه، روز';
 const MSG_LINE_2 =
   'امروز هم سرور ماینکرفت آقا سگه نیومد، فعلا میهن کرفت نصب کن دا';
@@ -60,6 +60,57 @@ async function logEvent(env, event) {
   }
 }
 
+// ============= TARGETS HELPERS =============
+// Targets are stored as an encrypted JSON array:
+//   [ { chatId, threadId: number|null, counter: number }, ... ]
+// Key: "targets"
+//
+// The "last_start" pointer is a plain JSON blob with short TTL, used by
+// /end to defeat KV eventual consistency.
+
+async function readTargets(env) {
+  const raw = await env.BOT_KV.get('targets', { cacheTtl: KV_CACHE_TTL });
+  if (!raw) {
+    // Migrate from the old single-target key if present
+    const legacy = await env.BOT_KV.get('target', { cacheTtl: KV_CACHE_TTL });
+    if (legacy) {
+      try {
+        const one = decryptData(legacy, env.DB_ENCRYPTION_KEY);
+        const migrated = [
+          {
+            chatId: one.chatId,
+            threadId: one.threadId ?? null,
+            counter: one.counter || 0,
+          },
+        ];
+        await writeTargets(env, migrated);
+        await env.BOT_KV.delete('target');
+        return migrated;
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  }
+  try {
+    return decryptData(raw, env.DB_ENCRYPTION_KEY);
+  } catch (e) {
+    console.error('readTargets decrypt failed:', e.message);
+    return [];
+  }
+}
+
+async function writeTargets(env, targets) {
+  await env.BOT_KV.put(
+    'targets',
+    encryptData(targets, env.DB_ENCRYPTION_KEY)
+  );
+}
+
+function sameTarget(a, chatId, threadId) {
+  return a.chatId === chatId && (a.threadId ?? null) === (threadId ?? null);
+}
+
 // ============= WORKER =============
 export default {
   async fetch(request, env) {
@@ -115,70 +166,62 @@ export default {
       return;
     }
 
-    const encrypted = await env.BOT_KV.get('target', {
-      cacheTtl: KV_CACHE_TTL,
-    });
-    if (!encrypted) {
-      console.log('⚠️ No target chat set yet.');
-      await logEvent(env, { ev: 'cron_skip', reason: 'no target' });
+    const targets = await readTargets(env);
+    if (!targets.length) {
+      console.log('⚠️ No targets set yet.');
+      await logEvent(env, { ev: 'cron_skip', reason: 'no targets' });
       return;
     }
 
-    let target;
-    try {
-      target = decryptData(encrypted, env.DB_ENCRYPTION_KEY);
-    } catch (err) {
-      console.error('❌ Failed to decrypt target:', err.message);
-      await logEvent(env, { ev: 'cron_error', msg: 'decrypt: ' + err.message });
+    const isMidnight = event.cron === CRON_MIDNIGHT;
+    const isEvening = event.cron === CRON_EVENING;
+
+    if (!isMidnight && !isEvening) {
+      console.log(`⚠️ Unknown cron fired: ${event.cron}`);
       return;
     }
 
-    const threadId = target.threadId ?? undefined;
+    let sent = 0;
+    let failed = 0;
 
-    if (event.cron === CRON_EVENING) {
+    for (const t of targets) {
+      const threadId = t.threadId ?? undefined;
+
       try {
-        await sendMessage(env.BOT_TOKEN, target.chatId, MSG_EVENING, threadId);
-        console.log('✅ Evening message sent.');
-        await logEvent(env, { ev: 'evening_sent' });
+        if (isEvening) {
+          await sendMessage(env.BOT_TOKEN, t.chatId, MSG_EVENING, threadId);
+        } else {
+          const counter = (t.counter || 0) + 1;
+          const text = `${MSG_LINE_1} ${counter}\n${MSG_LINE_2}`;
+          await sendMessage(env.BOT_TOKEN, t.chatId, text, threadId);
+          t.counter = counter;
+        }
+        sent++;
       } catch (err) {
-        console.error('❌ Evening send failed:', err.message);
-        await logEvent(env, {
-          ev: 'cron_error',
-          msg: 'evening: ' + err.message,
-        });
-      }
-      return;
-    }
-
-    if (event.cron === CRON_MIDNIGHT) {
-      const counter = (target.counter || 0) + 1;
-      const text = `${MSG_LINE_1} ${counter}\n${MSG_LINE_2}`;
-      try {
-        await sendMessage(env.BOT_TOKEN, target.chatId, text, threadId);
-        await env.BOT_KV.put(
-          'target',
-          encryptData(
-            {
-              chatId: target.chatId,
-              threadId: target.threadId ?? null,
-              counter,
-            },
-            env.DB_ENCRYPTION_KEY
-          )
+        failed++;
+        console.error(
+          `❌ Send failed to ${t.chatId}/${t.threadId ?? 'main'}: ${err.message}`
         );
-        console.log(`✅ Midnight message sent. Counter = ${counter}`);
-        await logEvent(env, { ev: 'midnight_sent', counter });
-      } catch (err) {
-        console.error('❌ Midnight send failed:', err.message);
         await logEvent(env, {
-          ev: 'cron_error',
-          msg: 'midnight: ' + err.message,
+          ev: 'send_error',
+          chatId: t.chatId,
+          threadId: t.threadId ?? null,
+          msg: err.message,
         });
       }
-      return;
     }
 
-    console.log(`⚠️ Unknown cron fired: ${event.cron}`);
+    // Persist counter updates (only matters for the midnight cron)
+    if (isMidnight) {
+      try {
+        await writeTargets(env, targets);
+      } catch (e) {
+        console.error('❌ Failed to persist counters:', e.message);
+      }
+    }
+
+    console.log(`✅ Cron done: sent=${sent} failed=${failed}`);
+    await logEvent(env, { ev: 'cron_done', sent, failed });
   },
 };
 
@@ -205,32 +248,26 @@ async function handleUpdate(update, env) {
   switch (cmd) {
     // ─── /start ───
     case '/start': {
-      let counter = 0;
-      const existing = await env.BOT_KV.get('target', {
-        cacheTtl: KV_CACHE_TTL,
-      });
-      if (existing) {
-        try {
-          counter =
-            decryptData(existing, env.DB_ENCRYPTION_KEY).counter || 0;
-        } catch {
-          counter = 0;
-        }
-      }
-
-      const payload = { chatId: msg.chat.id, threadId, counter };
-      await env.BOT_KV.put(
-        'target',
-        encryptData(payload, env.DB_ENCRYPTION_KEY)
+      const targets = await readTargets(env);
+      const existing = targets.find((t) =>
+        sameTarget(t, msg.chat.id, threadId)
       );
 
-      // ⭐ Pointer key with short TTL — lets /end see this immediately
-      // even if "target" is still stale in this colo's cache.
+      let counter = 0;
+      if (existing) {
+        counter = existing.counter || 0;
+      } else {
+        targets.push({ chatId: msg.chat.id, threadId, counter: 0 });
+      }
+
+      await writeTargets(env, targets);
+
+      // Short-lived pointer to defeat KV eventual consistency for /end
       await env.BOT_KV.put(
         'last_start',
         JSON.stringify({
           chatId: msg.chat.id,
-          threadId: threadId ?? null,
+          threadId,
           at: Date.now(),
         }),
         { expirationTtl: 120 }
@@ -241,6 +278,7 @@ async function handleUpdate(update, env) {
         chatId: msg.chat.id,
         threadId,
         counter,
+        total: targets.length,
       });
 
       await sendMessage(
@@ -254,97 +292,56 @@ async function handleUpdate(update, env) {
 
     // ─── /end ───
     case '/end': {
-      // 1) Read target with min cache TTL
-      let encrypted = await env.BOT_KV.get('target', {
-        cacheTtl: KV_CACHE_TTL,
-      });
+      const targets = await readTargets(env);
+      const idx = targets.findIndex((t) =>
+        sameTarget(t, msg.chat.id, threadId)
+      );
 
-      // 2) If target looks missing/stale, consult the short-lived pointer
-      let pointer = null;
-      try {
-        const rawPtr = await env.BOT_KV.get('last_start', {
-          cacheTtl: KV_CACHE_TTL,
-        });
-        if (rawPtr) pointer = JSON.parse(rawPtr);
-      } catch { /* ignore */ }
+      if (idx === -1) {
+        // Pointer fallback: /start might have just happened here but KV
+        // cache is still stale for "targets"
+        let viaPointer = false;
+        try {
+          const rawPtr = await env.BOT_KV.get('last_start', {
+            cacheTtl: KV_CACHE_TTL,
+          });
+          if (rawPtr) {
+            const p = JSON.parse(rawPtr);
+            if (p.chatId === msg.chat.id && (p.threadId ?? null) === threadId) {
+              viaPointer = true;
+            }
+          }
+        } catch { /* ignore */ }
 
-      // If pointer matches this chat and is fresh, we know /start happened
-      // here recently — treat it as authoritative.
-      if (
-        pointer &&
-        pointer.chatId === msg.chat.id &&
-        (pointer.threadId ?? null) === threadId
-      ) {
-        await env.BOT_KV.delete('target');
-        await env.BOT_KV.delete('last_start');
-        await logEvent(env, {
-          ev: 'end_ok_via_pointer',
-          chatId: msg.chat.id,
-          threadId,
-        });
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          `روز شمار در این ${where} پایان یافت، سرور اومد، مبارک خیلیا`,
-          threadId ?? undefined
-        );
-        return;
+        if (!viaPointer) {
+          await logEvent(env, {
+            ev: 'end_mismatch',
+            chatId: msg.chat.id,
+            threadId,
+          });
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            '⚠️ روز شمار از اینجا فعال نشده، نمیتوانی از اینجا هم متوقفش کنی.',
+            threadId ?? undefined
+          );
+          return;
+        }
+        // Pointer says /start was just here — nothing to remove from list,
+        // but still confirm to the user
+      } else {
+        targets.splice(idx, 1);
+        await writeTargets(env, targets);
       }
 
-      if (!encrypted) {
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          '⚠️ هیچ روز شماری فعال نیست.',
-          threadId ?? undefined
-        );
-        return;
-      }
-
-      let target;
-      try {
-        target = decryptData(encrypted, env.DB_ENCRYPTION_KEY);
-      } catch (e) {
-        console.error('❌ /end decrypt failed:', e.message);
-        await env.BOT_KV.delete('target');
-        await env.BOT_KV.delete('last_start');
-        await logEvent(env, { ev: 'end_decrypt_fail', msg: e.message });
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          `⚠️ اطلاعات قدیمی پاک شد. لطفاً دوباره /start بزنید.`,
-          threadId ?? undefined
-        );
-        return;
-      }
-
-      const sameChat = target.chatId === msg.chat.id;
-      const sameTopic = (target.threadId ?? null) === threadId;
-
-      if (!sameChat || !sameTopic) {
-        await logEvent(env, {
-          ev: 'end_mismatch',
-          storedChat: target.chatId,
-          storedTopic: target.threadId ?? null,
-          currentChat: msg.chat.id,
-          currentTopic: threadId,
-        });
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          '⚠️ روز شمار از اینجا فعال نشده، نمیتوانی از اینجا هم متوقفش کنی.\n\n' +
-            `🔎 چت فعلی: \`${msg.chat.id}\`\n` +
-            `🔎 چت ذخیرهشده: \`${target.chatId}\`\n` +
-            `🔎 تاپیک فعلی: \`${threadId ?? '—'}\`\n` +
-            `🔎 تاپیک ذخیرهشده: \`${target.threadId ?? '—'}\``,
-          threadId ?? undefined
-        );
-        return;
-      }
-
-      await env.BOT_KV.delete('target');
       await env.BOT_KV.delete('last_start');
-      await logEvent(env, { ev: 'end_ok', chatId: msg.chat.id, threadId });
+
+      await logEvent(env, {
+        ev: 'end_ok',
+        chatId: msg.chat.id,
+        threadId,
+        remaining: targets.length,
+      });
 
       await sendMessage(
         env.BOT_TOKEN,
@@ -357,13 +354,45 @@ async function handleUpdate(update, env) {
 
     // ─── /force-end ───
     case '/force-end': {
-      await env.BOT_KV.delete('target');
+      await env.BOT_KV.delete('targets');
+      await env.BOT_KV.delete('target'); // legacy
       await env.BOT_KV.delete('last_start');
       await logEvent(env, { ev: 'force_end', chatId: msg.chat.id, threadId });
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
-        '🛑 روز شمار به زور متوقف شد.',
+        '🛑 همه روز شمارها پاک شدند.',
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    // ─── /list ───
+    case '/list': {
+      const targets = await readTargets(env);
+      if (!targets.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 هیچ مقصدی ثبت نشده.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const lines = ['📋 *مقصدهای فعال:*', ''];
+      for (const t of targets) {
+        const mark =
+          t.chatId === msg.chat.id && (t.threadId ?? null) === threadId
+            ? ' ← (اینجا)'
+            : '';
+        lines.push(
+          `• chat \`${t.chatId}\` / topic \`${t.threadId ?? '—'}\` / counter ${t.counter}${mark}`
+        );
+      }
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        lines.join('\n'),
         threadId ?? undefined
       );
       return;
@@ -371,10 +400,9 @@ async function handleUpdate(update, env) {
 
     // ─── /test ───
     case '/test': {
-      const encrypted = await env.BOT_KV.get('target', {
-        cacheTtl: KV_CACHE_TTL,
-      });
-      if (!encrypted) {
+      const targets = await readTargets(env);
+      const t = targets.find((x) => sameTarget(x, msg.chat.id, threadId));
+      if (!t) {
         await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
@@ -383,34 +411,21 @@ async function handleUpdate(update, env) {
         );
         return;
       }
-      let target;
-      try {
-        target = decryptData(encrypted, env.DB_ENCRYPTION_KEY);
-      } catch (e) {
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          `⚠️ decrypt failed: ${e.message}`,
-          threadId ?? undefined
-        );
-        return;
-      }
 
-      const tId = target.threadId ?? undefined;
-
+      const tId = t.threadId ?? undefined;
       await sendMessage(
         env.BOT_TOKEN,
-        target.chatId,
+        t.chatId,
         `🧪 (test) ${MSG_EVENING}`,
         tId
       );
       await sendMessage(
         env.BOT_TOKEN,
-        target.chatId,
-        `🧪 (test) ${MSG_LINE_1} ${(target.counter || 0) + 1}\n${MSG_LINE_2}`,
+        t.chatId,
+        `🧪 (test) ${MSG_LINE_1} ${(t.counter || 0) + 1}\n${MSG_LINE_2}`,
         tId
       );
-      await logEvent(env, { ev: 'test_sent', chatId: target.chatId });
+      await logEvent(env, { ev: 'test_sent', chatId: t.chatId });
       return;
     }
 
@@ -447,38 +462,29 @@ async function handleUpdate(update, env) {
       lines.push('');
 
       if (env.BOT_KV) {
-        lines.push(`💾 KV["target"] (cacheTtl=${KV_CACHE_TTL})`);
+        lines.push('🎯 Targets');
         try {
-          const raw = await env.BOT_KV.get('target', {
-            cacheTtl: KV_CACHE_TTL,
-          });
-          if (!raw) {
-            lines.push('  (empty — no /start yet)');
+          const targets = await readTargets(env);
+          if (!targets.length) {
+            lines.push('  (none)');
           } else {
-            try {
-              const dec = decryptData(raw, env.DB_ENCRYPTION_KEY);
-              lines.push(`  chatId: ${dec.chatId}`);
-              lines.push(`  threadId: ${dec.threadId ?? 'null'}`);
-              lines.push(`  counter: ${dec.counter}`);
+            for (const t of targets) {
+              const mark =
+                t.chatId === msg.chat.id &&
+                (t.threadId ?? null) === threadId
+                  ? ' ← (this chat)'
+                  : '';
               lines.push(
-                `  matches current chat? ${
-                  dec.chatId === msg.chat.id &&
-                  (dec.threadId ?? null) === threadId
-                    ? '✅ yes'
-                    : '❌ no'
-                }`
+                `  chat=${t.chatId} topic=${t.threadId ?? '—'} counter=${t.counter}${mark}`
               );
-            } catch (e) {
-              lines.push(`  ⚠️ decrypt failed: ${e.message}`);
-              lines.push(`  raw length: ${raw.length}`);
             }
           }
         } catch (e) {
-          lines.push(`  ⚠️ KV read error: ${e.message}`);
+          lines.push(`  ⚠️ read failed: ${e.message}`);
         }
         lines.push('');
 
-        lines.push('💾 KV["last_start"] (pointer)');
+        lines.push('💾 Pointer ["last_start"]');
         try {
           const rawPtr = await env.BOT_KV.get('last_start', {
             cacheTtl: KV_CACHE_TTL,
@@ -560,7 +566,7 @@ async function handleUpdate(update, env) {
       lines.push('');
 
       lines.push('ℹ️ Commands');
-      lines.push('  /start /end /force-end /test /ping /debug');
+      lines.push('  /start /end /force-end /list /test /ping /debug');
 
       await sendMessage(
         env.BOT_TOKEN,
@@ -616,4 +622,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-                                                            }
+                                 }
