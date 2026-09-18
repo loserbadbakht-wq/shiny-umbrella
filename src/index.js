@@ -1,4 +1,4 @@
-                                                      // ============= CONFIG =============
+// ============= CONFIG =============
 const MSG_LINE_1 = 'روز شمار سرور آقا سگه، روز';
 const MSG_LINE_2 =
   'امروز هم سرور ماینکرفت آقا سگه نیومد، فعلا میهن کرفت نصب کن دا';
@@ -50,28 +50,29 @@ async function logEvent(env, event) {
     const raw = await env.BOT_KV.get('telemetry', { cacheTtl: KV_CACHE_TTL });
     let log = [];
     if (raw) {
-      try { log = JSON.parse(raw); } catch { log = []; }
+      try {
+        log = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(log)) log = [];
+      } catch {
+        log = [];
+      }
     }
     log.unshift({ t: new Date().toISOString(), ...event });
     log = log.slice(0, 30);
-    await env.BOT_KV.put('telemetry', JSON.stringify(log));
+    await env.BOT_KV.put(
+      'telemetry',
+      encryptData(log, env.DB_ENCRYPTION_KEY)
+    );
   } catch (e) {
     console.error('telemetry write failed:', e.message);
   }
 }
 
 // ============= TARGETS HELPERS =============
-// Targets are stored as an encrypted JSON array:
-//   [ { chatId, threadId: number|null, counter: number }, ... ]
-// Key: "targets"
-//
-// The "last_start" pointer is a plain JSON blob with short TTL, used by
-// /end to defeat KV eventual consistency.
-
 async function readTargets(env) {
   const raw = await env.BOT_KV.get('targets', { cacheTtl: KV_CACHE_TTL });
   if (!raw) {
-    // Migrate from the old single-target key if present
+    // Migrate from old single-target key
     const legacy = await env.BOT_KV.get('target', { cacheTtl: KV_CACHE_TTL });
     if (legacy) {
       try {
@@ -93,7 +94,8 @@ async function readTargets(env) {
     return [];
   }
   try {
-    return decryptData(raw, env.DB_ENCRYPTION_KEY);
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
   } catch (e) {
     console.error('readTargets decrypt failed:', e.message);
     return [];
@@ -109,6 +111,23 @@ async function writeTargets(env, targets) {
 
 function sameTarget(a, chatId, threadId) {
   return a.chatId === chatId && (a.threadId ?? null) === (threadId ?? null);
+}
+
+// ============= ANONYMIZATION (for /debug) =============
+// Returns a mapping function: (chatId, threadId) => "chat N" | "you" | "unknown"
+function makeAnonymizer(targets, currentChatId, currentThreadId) {
+  const nameOf = new Map();
+  targets.forEach((t, i) => {
+    const key = `${t.chatId}:${t.threadId ?? 'main'}`;
+    nameOf.set(key, `chat ${i + 1}`);
+  });
+  const currentKey = `${currentChatId}:${currentThreadId ?? 'main'}`;
+
+  return function label(chatId, threadId) {
+    const key = `${chatId}:${threadId ?? 'main'}`;
+    if (key === currentKey) return 'you';
+    return nameOf.get(key) || 'unknown';
+  };
 }
 
 // ============= WORKER =============
@@ -199,19 +218,14 @@ export default {
         sent++;
       } catch (err) {
         failed++;
-        console.error(
-          `❌ Send failed to ${t.chatId}/${t.threadId ?? 'main'}: ${err.message}`
-        );
+        console.error(`❌ Send failed: ${err.message}`);
         await logEvent(env, {
           ev: 'send_error',
-          chatId: t.chatId,
-          threadId: t.threadId ?? null,
           msg: err.message,
         });
       }
     }
 
-    // Persist counter updates (only matters for the midnight cron)
     if (isMidnight) {
       try {
         await writeTargets(env, targets);
@@ -262,22 +276,18 @@ async function handleUpdate(update, env) {
 
       await writeTargets(env, targets);
 
-      // Short-lived pointer to defeat KV eventual consistency for /end
+      // Encrypted short-lived pointer
       await env.BOT_KV.put(
         'last_start',
-        JSON.stringify({
-          chatId: msg.chat.id,
-          threadId,
-          at: Date.now(),
-        }),
+        encryptData(
+          { chatId: msg.chat.id, threadId, at: Date.now() },
+          env.DB_ENCRYPTION_KEY
+        ),
         { expirationTtl: 120 }
       );
 
       await logEvent(env, {
         ev: 'start',
-        chatId: msg.chat.id,
-        threadId,
-        counter,
         total: targets.length,
       });
 
@@ -298,27 +308,25 @@ async function handleUpdate(update, env) {
       );
 
       if (idx === -1) {
-        // Pointer fallback: /start might have just happened here but KV
-        // cache is still stale for "targets"
+        // Pointer fallback
         let viaPointer = false;
         try {
           const rawPtr = await env.BOT_KV.get('last_start', {
             cacheTtl: KV_CACHE_TTL,
           });
           if (rawPtr) {
-            const p = JSON.parse(rawPtr);
-            if (p.chatId === msg.chat.id && (p.threadId ?? null) === threadId) {
+            const p = decryptData(rawPtr, env.DB_ENCRYPTION_KEY);
+            if (
+              p.chatId === msg.chat.id &&
+              (p.threadId ?? null) === threadId
+            ) {
               viaPointer = true;
             }
           }
         } catch { /* ignore */ }
 
         if (!viaPointer) {
-          await logEvent(env, {
-            ev: 'end_mismatch',
-            chatId: msg.chat.id,
-            threadId,
-          });
+          await logEvent(env, { ev: 'end_mismatch' });
           await sendMessage(
             env.BOT_TOKEN,
             msg.chat.id,
@@ -327,8 +335,6 @@ async function handleUpdate(update, env) {
           );
           return;
         }
-        // Pointer says /start was just here — nothing to remove from list,
-        // but still confirm to the user
       } else {
         targets.splice(idx, 1);
         await writeTargets(env, targets);
@@ -338,8 +344,6 @@ async function handleUpdate(update, env) {
 
       await logEvent(env, {
         ev: 'end_ok',
-        chatId: msg.chat.id,
-        threadId,
         remaining: targets.length,
       });
 
@@ -355,9 +359,9 @@ async function handleUpdate(update, env) {
     // ─── /force-end ───
     case '/force-end': {
       await env.BOT_KV.delete('targets');
-      await env.BOT_KV.delete('target'); // legacy
+      await env.BOT_KV.delete('target');
       await env.BOT_KV.delete('last_start');
-      await logEvent(env, { ev: 'force_end', chatId: msg.chat.id, threadId });
+      await logEvent(env, { ev: 'force_end' });
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
@@ -379,16 +383,12 @@ async function handleUpdate(update, env) {
         );
         return;
       }
+      const label = makeAnonymizer(targets, msg.chat.id, threadId);
       const lines = ['📋 *مقصدهای فعال:*', ''];
-      for (const t of targets) {
-        const mark =
-          t.chatId === msg.chat.id && (t.threadId ?? null) === threadId
-            ? ' ← (اینجا)'
-            : '';
-        lines.push(
-          `• chat \`${t.chatId}\` / topic \`${t.threadId ?? '—'}\` / counter ${t.counter}${mark}`
-        );
-      }
+      targets.forEach((t, i) => {
+        const mark = label(t.chatId, t.threadId) === 'you' ? ' ← (اینجا)' : '';
+        lines.push(`• chat ${i + 1} / counter ${t.counter}${mark}`);
+      });
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
@@ -425,7 +425,7 @@ async function handleUpdate(update, env) {
         `🧪 (test) ${MSG_LINE_1} ${(t.counter || 0) + 1}\n${MSG_LINE_2}`,
         tId
       );
-      await logEvent(env, { ev: 'test_sent', chatId: t.chatId });
+      await logEvent(env, { ev: 'test_sent' });
       return;
     }
 
@@ -446,11 +446,9 @@ async function handleUpdate(update, env) {
       lines.push('🔍 *Debug*');
       lines.push('');
       lines.push('📍 Chat');
-      lines.push(`  id: ${msg.chat.id}`);
       lines.push(`  type: ${msg.chat.type}`);
       lines.push(`  is_topic_message: ${msg.is_topic_message ?? false}`);
-      lines.push(`  message_thread_id: ${msg.message_thread_id ?? '—'}`);
-      lines.push(`  topicOf(): ${topicOf(msg) ?? '—'}`);
+      lines.push(`  thread: ${threadId ?? '—'}`);
       lines.push('');
 
       lines.push('⚙️ Env');
@@ -462,25 +460,21 @@ async function handleUpdate(update, env) {
       lines.push('');
 
       if (env.BOT_KV) {
-        lines.push('🎯 Targets');
-        try {
-          const targets = await readTargets(env);
-          if (!targets.length) {
-            lines.push('  (none)');
-          } else {
-            for (const t of targets) {
-              const mark =
-                t.chatId === msg.chat.id &&
-                (t.threadId ?? null) === threadId
-                  ? ' ← (this chat)'
-                  : '';
-              lines.push(
-                `  chat=${t.chatId} topic=${t.threadId ?? '—'} counter=${t.counter}${mark}`
-              );
-            }
-          }
-        } catch (e) {
-          lines.push(`  ⚠️ read failed: ${e.message}`);
+        const targets = await readTargets(env);
+        const label = makeAnonymizer(targets, msg.chat.id, threadId);
+
+        lines.push(`🎯 Targets (${targets.length})`);
+        if (!targets.length) {
+          lines.push('  (none)');
+        } else {
+          targets.forEach((t, i) => {
+            const mark = label(t.chatId, t.threadId) === 'you'
+              ? ' ← (this chat)'
+              : '';
+            lines.push(
+              `  chat ${i + 1} · counter=${t.counter}${mark}`
+            );
+          });
         }
         lines.push('');
 
@@ -492,9 +486,8 @@ async function handleUpdate(update, env) {
           if (!rawPtr) {
             lines.push('  (empty)');
           } else {
-            const p = JSON.parse(rawPtr);
-            lines.push(`  chatId: ${p.chatId}`);
-            lines.push(`  threadId: ${p.threadId ?? 'null'}`);
+            const p = decryptData(rawPtr, env.DB_ENCRYPTION_KEY);
+            lines.push(`  chat: ${label(p.chatId, p.threadId)}`);
             lines.push(
               `  age: ${Math.round((Date.now() - p.at) / 1000)}s ago`
             );
@@ -508,7 +501,7 @@ async function handleUpdate(update, env) {
       lines.push('🤖 Bot');
       try {
         const me = await telegram(env.BOT_TOKEN, 'getMe');
-        lines.push(`  @${me.result.username} (id ${me.result.id})`);
+        lines.push(`  @${me.result.username}`);
       } catch (e) {
         lines.push(`  ⚠️ getMe failed: ${e.message}`);
       }
@@ -518,7 +511,7 @@ async function handleUpdate(update, env) {
       try {
         const info = await telegram(env.BOT_TOKEN, 'getWebhookInfo');
         const r = info.result || {};
-        lines.push(`  url: ${r.url || '(none)'}`);
+        lines.push(`  url: ${r.url ? '✅ set' : '❌ (none)'}`);
         lines.push(`  pending: ${r.pending_update_count ?? 0}`);
         if (r.last_error_message) {
           lines.push(`  ⚠️ last_error: ${r.last_error_message}`);
@@ -547,17 +540,32 @@ async function handleUpdate(update, env) {
         const raw = await env.BOT_KV.get('telemetry', {
           cacheTtl: KV_CACHE_TTL,
         });
-        const log = raw ? JSON.parse(raw) : [];
+        let log = [];
+        if (raw) {
+          try {
+            log = decryptData(raw, env.DB_ENCRYPTION_KEY);
+            if (!Array.isArray(log)) log = [];
+          } catch { log = []; }
+        }
+
         if (log.length === 0) {
           lines.push('  (none)');
         } else {
           for (const e of log.slice(0, 10)) {
             const ts = e.t.replace('T', ' ').slice(0, 19);
-            const extra = Object.entries(e)
-              .filter(([k]) => k !== 't' && k !== 'ev')
-              .map(([k, v]) => `${k}=${v}`)
-              .join(' ');
-            lines.push(`  ${ts} ${e.ev}${extra ? ' ' + extra : ''}`);
+            const parts = [ts, e.ev];
+
+            // Show cmd if present, but never chat IDs
+            if (e.cmd) parts.push(`cmd=${e.cmd}`);
+            if (e.cron) parts.push(`cron=${e.cron}`);
+            if (e.counter != null) parts.push(`counter=${e.counter}`);
+            if (e.total != null) parts.push(`total=${e.total}`);
+            if (e.sent != null) parts.push(`sent=${e.sent}`);
+            if (e.failed != null) parts.push(`failed=${e.failed}`);
+            if (e.reason) parts.push(`reason=${e.reason}`);
+            if (e.msg) parts.push(`msg=${e.msg}`);
+
+            lines.push(`  ${parts.join(' ')}`);
           }
         }
       } catch (e) {
@@ -622,4 +630,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-                                 }
+  }
