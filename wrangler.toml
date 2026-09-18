@@ -9,4 +9,4 @@ crons = ["30 20 * * *"]
 # KV namespace to remember which topic to send to
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "d97a738c46a74230bc7bbb597956bee5"
