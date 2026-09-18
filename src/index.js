@@ -57,6 +57,7 @@ export default {
     const msg = update.message;
     if (!msg || !msg.text) return new Response('OK');
 
+    // ─── /start: enable the daily messages ───
     if (msg.text === '/start' || msg.text.startsWith('/start@')) {
       // threadId is:
       //   - a number  → inside a forum topic
@@ -88,18 +89,83 @@ export default {
       await env.BOT_KV.put('target', encrypted);
 
       const where = threadId
-        ? 'این تاپیک'
+        ? 'تاپیک'
         : msg.chat.type === 'private'
-        ? 'این چت خصوصی'
-        : 'این چت';
+        ? 'چت خصوصی'
+        : 'چت';
 
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
-        `✅ تنظیم شد! پیامها هر روز ساعت ۰۰:۰۰ و ۲۰:۳۰ به وقت ایران در ${where} ارسال میشوند.\n` +
-          `📅 شمارنده فعلی: ${counter}`,
+        `روز شمار در این ${where} فعال شد، شاید این جمعه بیایید`,
         threadId
       );
+
+      return new Response('OK');
+    }
+
+    // ─── /end: stop the daily messages ───
+    if (msg.text === '/end' || msg.text.startsWith('/end@')) {
+      const threadId =
+        msg.is_topic_message && msg.message_thread_id
+          ? msg.message_thread_id
+          : null;
+
+      const encrypted = await env.BOT_KV.get('target');
+      if (!encrypted) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ هیچ روز شماری فعال نیست.',
+          threadId ?? undefined
+        );
+        return new Response('OK');
+      }
+
+      let target;
+      try {
+        target = decryptData(encrypted, env.DB_ENCRYPTION_KEY);
+      } catch {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ خطا در خواندن اطلاعات. لطفاً دوباره /start بزنید.',
+          threadId ?? undefined
+        );
+        return new Response('OK');
+      }
+
+      // Only allow stopping from the exact chat + topic that was configured
+      const sameChat = target.chatId === msg.chat.id;
+      const sameTopic = (target.threadId ?? null) === threadId;
+
+      if (!sameChat || !sameTopic) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ روز شمار از اینجا فعال نشده، نمیتوانی از اینجا هم متوقفش کنی.',
+          threadId ?? undefined
+        );
+        return new Response('OK');
+      }
+
+      // Delete the target
+      await env.BOT_KV.delete('target');
+
+      const where = threadId
+        ? 'تاپیک'
+        : msg.chat.type === 'private'
+        ? 'چت خصوصی'
+        : 'چت';
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `روز شمار در این ${where} پایان یافت، سرور اومد، مبارک خیلیا`,
+        threadId ?? undefined
+      );
+
+      return new Response('OK');
     }
 
     return new Response('OK');
@@ -188,4 +254,4 @@ async function sendMessage(token, chatId, text, threadId) {
     throw new Error(`Telegram API error ${res.status}: ${err}`);
   }
   return res.json();
-      }
+  }
