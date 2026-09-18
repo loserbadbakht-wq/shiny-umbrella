@@ -58,41 +58,48 @@ export default {
     if (!msg || !msg.text) return new Response('OK');
 
     if (msg.text === '/start' || msg.text.startsWith('/start@')) {
-      const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
+      // threadId is:
+      //   - a number  → inside a forum topic
+      //   - undefined → General topic, regular group, or private chat
+      const threadId =
+        msg.is_topic_message && msg.message_thread_id
+          ? msg.message_thread_id
+          : undefined;
 
-      if (!threadId) {
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          '⚠️ لطفاً این دستور را داخل یک تاپیک (Topic) ارسال کنید، نه در چت اصلی.\n' +
-            'Please send /start inside a specific topic, not the main chat.'
-        );
-      } else {
-        // Preserve existing counter if re-configuring
-        let counter = 0;
-        const existing = await env.BOT_KV.get('target');
-        if (existing) {
-          try {
-            counter = decryptData(existing, env.DB_ENCRYPTION_KEY).counter || 0;
-          } catch {
-            counter = 0;
-          }
+      // Preserve existing counter if re-configuring
+      let counter = 0;
+      const existing = await env.BOT_KV.get('target');
+      if (existing) {
+        try {
+          counter = decryptData(existing, env.DB_ENCRYPTION_KEY).counter || 0;
+        } catch {
+          counter = 0;
         }
-
-        const encrypted = encryptData(
-          { chatId: msg.chat.id, threadId, counter },
-          env.DB_ENCRYPTION_KEY
-        );
-        await env.BOT_KV.put('target', encrypted);
-
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          `✅ تنظیم شد! پیامها هر روز ساعت ۰۰:۰۰ و ۲۰:۳۰ به وقت ایران در این تاپیک ارسال میشوند.\n` +
-            `📅 شمارنده فعلی: ${counter}`,
-          threadId
-        );
       }
+
+      const encrypted = encryptData(
+        {
+          chatId: msg.chat.id,
+          threadId: threadId ?? null, // JSON can't store undefined
+          counter,
+        },
+        env.DB_ENCRYPTION_KEY
+      );
+      await env.BOT_KV.put('target', encrypted);
+
+      const where = threadId
+        ? 'این تاپیک'
+        : msg.chat.type === 'private'
+        ? 'این چت خصوصی'
+        : 'این چت';
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ تنظیم شد! پیامها هر روز ساعت ۰۰:۰۰ و ۲۰:۳۰ به وقت ایران در ${where} ارسال میشوند.\n` +
+          `📅 شمارنده فعلی: ${counter}`,
+        threadId
+      );
     }
 
     return new Response('OK');
@@ -102,7 +109,7 @@ export default {
   async scheduled(event, env) {
     const encrypted = await env.BOT_KV.get('target');
     if (!encrypted) {
-      console.log('⚠️ No target topic set yet. Send /start in a topic first.');
+      console.log('⚠️ No target chat set yet. Send /start first.');
       return;
     }
 
@@ -114,6 +121,9 @@ export default {
       return;
     }
 
+    // null → undefined so sendMessage omits message_thread_id
+    const threadId = target.threadId ?? undefined;
+
     // ── 20:30 Iran → evening reminder (no counter) ──
     if (event.cron === CRON_EVENING) {
       try {
@@ -121,7 +131,7 @@ export default {
           env.BOT_TOKEN,
           target.chatId,
           MSG_EVENING,
-          target.threadId
+          threadId
         );
         console.log('✅ Evening message sent (20:30 Iran).');
       } catch (err) {
@@ -136,18 +146,17 @@ export default {
       const text = `${MSG_LINE_1} ${counter}\n${MSG_LINE_2}`;
 
       try {
-        await sendMessage(
-          env.BOT_TOKEN,
-          target.chatId,
-          text,
-          target.threadId
-        );
+        await sendMessage(env.BOT_TOKEN, target.chatId, text, threadId);
 
         // Persist updated counter (encrypted)
         await env.BOT_KV.put(
           'target',
           encryptData(
-            { chatId: target.chatId, threadId: target.threadId, counter },
+            {
+              chatId: target.chatId,
+              threadId: target.threadId ?? null,
+              counter,
+            },
             env.DB_ENCRYPTION_KEY
           )
         );
@@ -179,4 +188,4 @@ async function sendMessage(token, chatId, text, threadId) {
     throw new Error(`Telegram API error ${res.status}: ${err}`);
   }
   return res.json();
-    }
+      }
