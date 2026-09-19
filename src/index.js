@@ -9,7 +9,7 @@ const CRON_EVENING  = '0 17 * * *';  // 20:30 Iran
 
 const KV_CACHE_TTL = 30; // Cloudflare minimum
 
-// Admin user ID allowed to use /roozshomarmessage
+// Admin user ID allowed to use /roozshomarmessage and /setcounter*
 const ADMIN_ID = 302287170;
 
 // ============= ENCRYPTION HELPERS =============
@@ -437,7 +437,6 @@ async function handleUpdate(update, env) {
         return;
       }
 
-      // Extract everything after the command (handles "/roozshomarmessage@Bot hi")
       const raw = msg.text
         .replace(/^\/roozshomarmessage(@\w+)?\s*/i, '')
         .trim();
@@ -492,6 +491,153 @@ async function handleUpdate(update, env) {
         env.BOT_TOKEN,
         msg.chat.id,
         `📢 ارسال شد به ${sent} مقصد${failed ? ` (${failed} ناموفق)` : ''}.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    // ─── /setcounter chat <N> <counter> — set one target's counter ───
+    case '/setcounter': {
+      if (msg.from?.id !== ADMIN_ID) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⛔ فقط ادمین میتواند شمارنده را تغییر دهد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const parts = msg.text.trim().split(/\s+/);
+      // parts[0] = /setcounter   (or /setcounter@Bot)
+      // parts[1] = "chat"
+      // parts[2] = target index (1-based, as shown in /list and /debug)
+      // parts[3] = new counter value
+
+      if (parts.length < 4 || parts[1].toLowerCase() !== 'chat') {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده: `/setcounter chat <N> <counter>`\n' +
+            'مثال: `/setcounter chat 2 15`\n' +
+            'برای دیدن شمارهها: `/list`',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const targetNum = parseInt(parts[2], 10);
+      const newCounter = parseInt(parts[3], 10);
+
+      if (
+        !Number.isFinite(targetNum) ||
+        targetNum < 1 ||
+        !Number.isFinite(newCounter) ||
+        newCounter < 0
+      ) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ شماره چت باید ≥ 1 و شمارنده باید ≥ 0 باشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const targets = await readTargets(env);
+      if (targetNum > targets.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ فقط ${targets.length} مقصد وجود دارد. از /list استفاده کن.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const t = targets[targetNum - 1];
+      const oldCounter = t.counter || 0;
+      t.counter = newCounter;
+      await writeTargets(env, targets);
+
+      await logEvent(env, {
+        ev: 'setcounter',
+        chatN: targetNum,
+        from: oldCounter,
+        to: newCounter,
+      });
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ شمارنده chat ${targetNum} از ${oldCounter} به ${newCounter} تغییر کرد.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    // ─── /setcounterall <counter> — set all counters ───
+    case '/setcounterall': {
+      if (msg.from?.id !== ADMIN_ID) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⛔ فقط ادمین میتواند شمارنده را تغییر دهد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const parts = msg.text.trim().split(/\s+/);
+
+      if (parts.length < 2) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده: `/setcounterall <counter>`\n' +
+            'مثال: `/setcounterall 10`',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const newCounter = parseInt(parts[1], 10);
+      if (!Number.isFinite(newCounter) || newCounter < 0) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ شمارنده باید عدد ≥ 0 باشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const targets = await readTargets(env);
+      if (!targets.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 هیچ مقصدی ثبت نشده.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      for (const t of targets) {
+        t.counter = newCounter;
+      }
+      await writeTargets(env, targets);
+
+      await logEvent(env, {
+        ev: 'setcounterall',
+        count: targets.length,
+        to: newCounter,
+      });
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ شمارنده ${targets.length} مقصد روی ${newCounter} تنظیم شد.`,
         threadId ?? undefined
       );
       return;
@@ -630,6 +776,10 @@ async function handleUpdate(update, env) {
             if (e.reason) parts.push(`reason=${e.reason}`);
             if (e.msg) parts.push(`msg=${e.msg}`);
             if (e.len != null) parts.push(`len=${e.len}`);
+            if (e.chatN != null) parts.push(`chatN=${e.chatN}`);
+            if (e.from != null) parts.push(`from=${e.from}`);
+            if (e.to != null) parts.push(`to=${e.to}`);
+            if (e.count != null) parts.push(`count=${e.count}`);
 
             lines.push(`  ${parts.join(' ')}`);
           }
@@ -642,6 +792,8 @@ async function handleUpdate(update, env) {
       lines.push('ℹ️ Commands');
       lines.push('  /start /end /force-end /list /test /ping /debug');
       lines.push('  /roozshomarmessage <text>  (admin)');
+      lines.push('  /setcounter chat <N> <counter>  (admin)');
+      lines.push('  /setcounterall <counter>  (admin)');
 
       await sendMessage(
         env.BOT_TOKEN,
