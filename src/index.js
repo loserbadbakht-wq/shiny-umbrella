@@ -9,6 +9,9 @@ const CRON_EVENING  = '0 17 * * *';  // 20:30 Iran
 
 const KV_CACHE_TTL = 30; // Cloudflare minimum
 
+// Admin user ID allowed to use /roozshomarmessage
+const ADMIN_ID = 302287170;
+
 // ============= ENCRYPTION HELPERS =============
 function encryptData(data, key) {
   const jsonStr = JSON.stringify(data);
@@ -422,6 +425,78 @@ async function handleUpdate(update, env) {
       return;
     }
 
+    // ─── /roozshomarmessage <text> — broadcast to all targets ───
+    case '/roozshomarmessage': {
+      if (msg.from?.id !== ADMIN_ID) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⛔ فقط ادمین میتواند پیام همگانی بفرستد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      // Extract everything after the command (handles "/roozshomarmessage@Bot hi")
+      const raw = msg.text
+        .replace(/^\/roozshomarmessage(@\w+)?\s*/i, '')
+        .trim();
+
+      if (!raw) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده: `/roozshomarmessage متن پیام`',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const targets = await readTargets(env);
+      if (!targets.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 هیچ مقصدی ثبت نشده.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      let sent = 0;
+      let failed = 0;
+
+      for (const t of targets) {
+        try {
+          await sendMessage(
+            env.BOT_TOKEN,
+            t.chatId,
+            raw,
+            t.threadId ?? undefined
+          );
+          sent++;
+        } catch (err) {
+          failed++;
+          console.error(`❌ Broadcast failed: ${err.message}`);
+        }
+      }
+
+      await logEvent(env, {
+        ev: 'broadcast',
+        sent,
+        failed,
+        len: raw.length,
+      });
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `📢 ارسال شد به ${sent} مقصد${failed ? ` (${failed} ناموفق)` : ''}.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
     // ─── /ping ───
     case '/ping': {
       await sendMessage(
@@ -554,6 +629,7 @@ async function handleUpdate(update, env) {
             if (e.failed != null) parts.push(`failed=${e.failed}`);
             if (e.reason) parts.push(`reason=${e.reason}`);
             if (e.msg) parts.push(`msg=${e.msg}`);
+            if (e.len != null) parts.push(`len=${e.len}`);
 
             lines.push(`  ${parts.join(' ')}`);
           }
@@ -565,6 +641,7 @@ async function handleUpdate(update, env) {
 
       lines.push('ℹ️ Commands');
       lines.push('  /start /end /force-end /list /test /ping /debug');
+      lines.push('  /roozshomarmessage <text>  (admin)');
 
       await sendMessage(
         env.BOT_TOKEN,
@@ -620,4 +697,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-  }
+}
