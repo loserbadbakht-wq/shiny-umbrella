@@ -113,8 +113,7 @@ function sameTarget(a, chatId, threadId) {
   return a.chatId === chatId && (a.threadId ?? null) === (threadId ?? null);
 }
 
-// ============= ANONYMIZATION (for /debug) =============
-// Returns a mapping function: (chatId, threadId) => "chat N" | "you" | "unknown"
+// ============= ANONYMIZATION (for /debug, /list) =============
 function makeAnonymizer(targets, currentChatId, currentThreadId) {
   const nameOf = new Map();
   targets.forEach((t, i) => {
@@ -149,9 +148,6 @@ export default {
       await logEvent(env, {
         ev: 'update',
         cmd: parseCommand(msg.text),
-        chatId: msg.chat.id,
-        threadId: msg.message_thread_id ?? null,
-        from: msg.from?.id,
       });
     }
 
@@ -267,16 +263,7 @@ async function handleUpdate(update, env) {
         sameTarget(t, msg.chat.id, threadId)
       );
 
-      let counter = 0;
-      if (existing) {
-        counter = existing.counter || 0;
-      } else {
-        targets.push({ chatId: msg.chat.id, threadId, counter: 0 });
-      }
-
-      await writeTargets(env, targets);
-
-      // Encrypted short-lived pointer
+      // Refresh the pointer on every /start (so /end works right after)
       await env.BOT_KV.put(
         'last_start',
         encryptData(
@@ -286,10 +273,16 @@ async function handleUpdate(update, env) {
         { expirationTtl: 120 }
       );
 
-      await logEvent(env, {
-        ev: 'start',
-        total: targets.length,
-      });
+      // Already subscribed → stay silent
+      if (existing) {
+        await logEvent(env, { ev: 'start_silent', total: targets.length });
+        return;
+      }
+
+      // New target → add and confirm
+      targets.push({ chatId: msg.chat.id, threadId, counter: 0 });
+      await writeTargets(env, targets);
+      await logEvent(env, { ev: 'start', total: targets.length });
 
       await sendMessage(
         env.BOT_TOKEN,
@@ -471,9 +464,7 @@ async function handleUpdate(update, env) {
             const mark = label(t.chatId, t.threadId) === 'you'
               ? ' ← (this chat)'
               : '';
-            lines.push(
-              `  chat ${i + 1} · counter=${t.counter}${mark}`
-            );
+            lines.push(`  chat ${i + 1} · counter=${t.counter}${mark}`);
           });
         }
         lines.push('');
@@ -555,7 +546,6 @@ async function handleUpdate(update, env) {
             const ts = e.t.replace('T', ' ').slice(0, 19);
             const parts = [ts, e.ev];
 
-            // Show cmd if present, but never chat IDs
             if (e.cmd) parts.push(`cmd=${e.cmd}`);
             if (e.cron) parts.push(`cron=${e.cron}`);
             if (e.counter != null) parts.push(`counter=${e.counter}`);
