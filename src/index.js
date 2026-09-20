@@ -4,11 +4,7 @@
 // All Persian values are \u-escaped to prevent Cyrillic lookalike corruption.
 
 // ---------- Cyrillic → Persian letter map ----------
-// Persian codepoints: ا=0627 آ=0622 ب=0628 پ=067E ت=062A ث=062B ج=062C
-// چ=0686 ح=062D خ=062E د=062F ذ=0630 ر=0631 ز=0632 ژ=0698 س=0633 ش=0634
-// ص=0635 ض=0636 ط=0637 ظ=0638 ع=0639 غ=063A ف=0641 ق=0642 ک=06A9 گ=06AF
-// ل=0644 م=0645 ن=0646 و=0648 ه=0647 ی=06CC ء=0621
-// (а and о are handled positionally in code below)
+// (а, и, о are handled positionally in code below)
 
 const cyrillicToPersian = {
   // Vowels
@@ -16,7 +12,6 @@ const cyrillicToPersian = {
   'Ӯ': '\u0648', 'ӯ': '\u0648',              // و
   'Е': '\u06CC', 'е': '\u06CC',              // ی
   'Э': '\u06CC', 'э': '\u06CC',              // ی
-  'И': '\u06CC', 'и': '\u06CC',              // ی
   'Ӣ': '\u06CC', 'ӣ': '\u06CC',              // ی
   'Ё': '\u06CC\u0627', 'ё': '\u06CC\u0627',  // یا
   'Ю': '\u06CC\u0648', 'ю': '\u06CC\u0648',  // یو
@@ -118,8 +113,8 @@ function cyrillicToPersianText(text) {
     const atStart = !isLetter(prev);
     const atEnd = !isLetter(next);
 
-    if (ch === 'а' || ch === 'А') {
-      // Short /a/: ا at word start, ه at word end, dropped in the middle
+    if (ch === 'а' || ch === 'А' || ch === 'и' || ch === 'И') {
+      // Short /a/ and /i/: ا at start, ه at end, dropped medially
       out += atStart ? '\u0627' : atEnd ? '\u0647' : '';
     } else if (ch === 'о' || ch === 'О') {
       // /ɔ/: آ at word start, ا otherwise
@@ -138,13 +133,11 @@ function persianToCyrillicText(text) {
   let out = '';
   let atWordStart = true;
   for (const ch of text) {
-    // Persian punctuation → Latin punctuation
     if (persianToLatinPunct[ch]) {
       out += persianToLatinPunct[ch];
       atWordStart = true;
       continue;
     }
-    // Whitespace / other punctuation / symbols reset word boundary
     if (/[\s\p{P}\p{S}]/u.test(ch)) {
       out += ch;
       atWordStart = true;
