@@ -35,9 +35,18 @@ jobs:
       
       - name: Set Webhook
         run: |
-          WORKER_URL="https://shiny-cyrillic.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          curl -X POST "https://api.telegram.org/bot${{ secrets.SEVEN_BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
-      
+          WORKER_URL="https://shiny-cyrillic.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev/webhook"
+          echo "Setting webhook to: $WORKER_URL"
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${{ secrets.SEVEN_BOT_TOKEN }}/setWebhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"url\": \"${WORKER_URL}\",
+              \"allowed_updates\": [\"message\", \"edited_message\", \"guest_message\"]
+            }" | tee webhook.json
+           
+          grep -q '"ok":true' webhook.json || (echo "Webhook set failed" && exit 1)
+  
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
