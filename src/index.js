@@ -3,53 +3,53 @@
 // Update: guest_message. Reply: answerGuestQuery.
 // All Persian values are \u-escaped to prevent Cyrillic lookalike corruption.
 
-// ---------- Cyrillic → Persian ----------
-// Values below are the lowercase Cyrillic form; we uppercase at word start.
+// ---------- Cyrillic → Persian letter map ----------
 // Persian codepoints: ا=0627 آ=0622 ب=0628 پ=067E ت=062A ث=062B ج=062C
 // چ=0686 ح=062D خ=062E د=062F ذ=0630 ر=0631 ز=0632 ژ=0698 س=0633 ش=0634
 // ص=0635 ض=0636 ط=0637 ظ=0638 ع=0639 غ=063A ف=0641 ق=0642 ک=06A9 گ=06AF
 // ل=0644 م=0645 ن=0646 و=0648 ه=0647 ی=06CC ء=0621
+// (а and о are handled positionally in code below)
 
 const cyrillicToPersian = {
-  // Vowels (а/о handled positionally in code below)
-  'У': '\u0648', 'у': '\u0648',          // و
-  'Ӯ': '\u0648', 'ӯ': '\u0648',          // و
-  'Е': '\u06CC', 'е': '\u06CC',          // ی
-  'Э': '\u06CC', 'э': '\u06CC',          // ی
-  'И': '\u06CC', 'и': '\u06CC',          // ی (Tajik и ≈ Persian ی)
-  'Ӣ': '\u06CC', 'ӣ': '\u06CC',          // ی
-  'Ё': '\u06CC\u0627', 'ё': '\u06CC\u0627', // یا
-  'Ю': '\u06CC\u0648', 'ю': '\u06CC\u0648', // یو
-  'Я': '\u06CC\u0627', 'я': '\u06CC\u0627', // یا
+  // Vowels
+  'У': '\u0648', 'у': '\u0648',              // و
+  'Ӯ': '\u0648', 'ӯ': '\u0648',              // و
+  'Е': '\u06CC', 'е': '\u06CC',              // ی
+  'Э': '\u06CC', 'э': '\u06CC',              // ی
+  'И': '\u06CC', 'и': '\u06CC',              // ی
+  'Ӣ': '\u06CC', 'ӣ': '\u06CC',              // ی
+  'Ё': '\u06CC\u0627', 'ё': '\u06CC\u0627',  // یا
+  'Ю': '\u06CC\u0648', 'ю': '\u06CC\u0648',  // یو
+  'Я': '\u06CC\u0627', 'я': '\u06CC\u0627',  // یا
 
   // Consonants
-  'Б': '\u0628', 'б': '\u0628',          // ب
-  'В': '\u0648', 'в': '\u0648',          // و
-  'Г': '\u06AF', 'г': '\u06AF',          // گ
-  'Ғ': '\u063A', 'ғ': '\u063A',          // غ
-  'Д': '\u062F', 'д': '\u062F',          // د
-  'Ж': '\u0698', 'ж': '\u0698',          // ژ
-  'З': '\u0632', 'з': '\u0632',          // ز
-  'Й': '\u06CC', 'й': '\u06CC',          // ی
-  'К': '\u06A9', 'к': '\u06A9',          // ک
-  'Қ': '\u0642', 'қ': '\u0642',          // ق
-  'Л': '\u0644', 'л': '\u0644',          // ل   ← was broken, now explicit 0644
-  'М': '\u0645', 'м': '\u0645',          // م
-  'Н': '\u0646', 'н': '\u0646',          // ن
-  'П': '\u067E', 'п': '\u067E',          // پ
-  'Р': '\u0631', 'р': '\u0631',          // ر
-  'С': '\u0633', 'с': '\u0633',          // س
-  'Т': '\u062A', 'т': '\u062A',          // ت
-  'Ф': '\u0641', 'ф': '\u0641',          // ف
-  'Х': '\u062E', 'х': '\u062E',          // خ
-  'Ҳ': '\u062D', 'ҳ': '\u062D',          // ح
-  'Ч': '\u0686', 'ч': '\u0686',          // چ
-  'Ҷ': '\u062C', 'ҷ': '\u062C',          // ج
-  'Ш': '\u0634', 'ш': '\u0634',          // ش
-  'Ъ': '\u0639', 'ъ': '\u0639',          // ع
+  'Б': '\u0628', 'б': '\u0628',              // ب
+  'В': '\u0648', 'в': '\u0648',              // و
+  'Г': '\u06AF', 'г': '\u06AF',              // گ
+  'Ғ': '\u063A', 'ғ': '\u063A',              // غ
+  'Д': '\u062F', 'д': '\u062F',              // د
+  'Ж': '\u0698', 'ж': '\u0698',              // ژ
+  'З': '\u0632', 'з': '\u0632',              // ز
+  'Й': '\u06CC', 'й': '\u06CC',              // ی
+  'К': '\u06A9', 'к': '\u06A9',              // ک
+  'Қ': '\u0642', 'қ': '\u0642',              // ق
+  'Л': '\u0644', 'л': '\u0644',              // ل
+  'М': '\u0645', 'м': '\u0645',              // م
+  'Н': '\u0646', 'н': '\u0646',              // ن
+  'П': '\u067E', 'п': '\u067E',              // پ
+  'Р': '\u0631', 'р': '\u0631',              // ر
+  'С': '\u0633', 'с': '\u0633',              // س
+  'Т': '\u062A', 'т': '\u062A',              // ت
+  'Ф': '\u0641', 'ф': '\u0641',              // ف
+  'Х': '\u062E', 'х': '\u062E',              // خ
+  'Ҳ': '\u062D', 'ҳ': '\u062D',              // ح
+  'Ч': '\u0686', 'ч': '\u0686',              // چ
+  'Ҷ': '\u062C', 'ҷ': '\u062C',              // ج
+  'Ш': '\u0634', 'ш': '\u0634',              // ش
+  'Ъ': '\u0639', 'ъ': '\u0639',              // ع
 };
 
-// ---------- Persian → Cyrillic (values are lowercase Cyrillic) ----------
+// ---------- Persian → Cyrillic letter map ----------
 const persianToCyrillic = {
   '\u0627': 'а',  // ا
   '\u0622': 'о',  // آ
@@ -92,6 +92,19 @@ const persianToCyrillic = {
   '\u0629': 'ҳ',  // ة
 };
 
+// ---------- Punctuation maps ----------
+const latinToPersianPunct = {
+  ',': '\u060C',  // ،
+  ';': '\u061B',  // ؛
+  '?': '\u061F',  // ؟
+};
+
+const persianToLatinPunct = {
+  '\u060C': ',',  // ،
+  '\u061B': ';',  // ؛
+  '\u061F': '?',  // ؟
+};
+
 // ---------- Position-aware Cyrillic → Persian ----------
 function cyrillicToPersianText(text) {
   const chars = Array.from(text);
@@ -111,6 +124,8 @@ function cyrillicToPersianText(text) {
     } else if (ch === 'о' || ch === 'О') {
       // /ɔ/: آ at word start, ا otherwise
       out += atStart ? '\u0622' : '\u0627';
+    } else if (latinToPersianPunct[ch]) {
+      out += latinToPersianPunct[ch];
     } else {
       out += cyrillicToPersian[ch] ?? ch;
     }
@@ -123,6 +138,13 @@ function persianToCyrillicText(text) {
   let out = '';
   let atWordStart = true;
   for (const ch of text) {
+    // Persian punctuation → Latin punctuation
+    if (persianToLatinPunct[ch]) {
+      out += persianToLatinPunct[ch];
+      atWordStart = true;
+      continue;
+    }
+    // Whitespace / other punctuation / symbols reset word boundary
     if (/[\s\p{P}\p{S}]/u.test(ch)) {
       out += ch;
       atWordStart = true;
