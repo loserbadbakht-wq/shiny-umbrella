@@ -1,5 +1,6 @@
 // src/index.js
 // Telegram GUEST BOT: Persian ↔ Tajik Cyrillic transliteration
+// Correct update type: guest_message (Bot API), NOT updateBotGuestChatQuery (MTProto)
 
 // ---------- Mapping tables (from fa.wikipedia.org/wiki/الفبای_تاجیکی) ----------
 
@@ -18,10 +19,8 @@ const cyrillicToPersian = {
   'Л':'ل','л':'л','М':'م','м':'м','Н':'ن','н':'н','О':'آ','о':'آ','П':'پ','п':'پ',
   'Р':'ر','р':'р','С':'س','с':'с','Т':'ت','т':'ت','У':'اُ','у':'اُ','Ӯ':'و','ӯ':'و',
   'Ф':'ف','ф':'ф','Х':'خ','х':'х','Ҳ':'ح','ҳ':'ح','Ч':'چ','ч':'ч','Ҷ':'ج','ҷ':'ج',
-  'Ш':'ش','ш':'ш','ъ':'ع','Э':'ای','э':'ای','Ю':'یو','ю':'یو','Я':'یا','я':'یا',
+  'Ш':'ш','ш':'ш','ъ':'ع','Э':'ای','э':'ای','Ю':'یو','ю':'یو','Я':'یا','я':'یا',
 };
-
-// ---------- Transliteration helpers ----------
 
 function detectScript(text) {
   const fa = (text.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g) || []).length;
@@ -56,77 +55,70 @@ async function tg(env, method, payload) {
   try { return JSON.parse(txt); } catch { return { ok: false, raw: txt }; }
 }
 
-// ---------- Guest query handler ----------
+// ---------- Guest message handler ----------
+// The update arrives as: { update_id: N, guest_message: { ...Message..., guest_query_id: "..." } }
 
-async function handleGuestQuery(update, env) {
-  const query = update.bot_guest_chat_query || update.guest_chat_query;
-  if (!query) return;
+async function handleGuestMessage(update, env) {
+  const msg = update.guest_message;
+  if (!msg) return;
 
-  const queryId = query.query_id;
-  const triggeringMsg = query.message;
-  const refs = query.reference_messages || [];
-
-  // 1. Identify the text to convert.
-  //    Prefer the replied-to message (reference_messages[0]); fall back to the
-  //    triggering message's own text (minus the @mention).
-  let sourceText = '';
-  if (refs.length > 0) {
-    sourceText = refs[0].text || refs[0].caption || '';
-  } else {
-    // Strip @mentions from the triggering message
-    sourceText = (triggeringMsg.text || triggeringMsg.caption || '')
-      .replace(/@\w+/g, '').trim();
+  const guestQueryId = msg.guest_query_id;
+  if (!guestQueryId) {
+    console.error('guest_message without guest_query_id:', JSON.stringify(msg));
+    return;
   }
+
+  console.log('GUEST QUERY ID:', guestQueryId);
+
+  // The triggering message text (the message where the user @mentioned the bot)
+  const triggeringText = msg.text || msg.caption || '';
+
+  // The replied-to message (if any). In the Bot API, this is msg.reply_to_message.
+  const replied = msg.reply_to_message;
+  const sourceText = replied
+    ? (replied.text || replied.caption || '')
+    : triggeringText.replace(/@\w+/g, '').trim();
 
   if (!sourceText) {
-    // Nothing to convert — send a gentle hint as the guest reply
-    await answerGuest(env, queryId, {
-      type: 'article',
-      id: 'no-text',
-      title: 'Guest Bot',
-      input_message_content: {
-        message_text: '⚠️ Reply to a message containing Persian or Tajik Cyrillic text, then @mention me.',
-      },
-    });
+    await answerGuest(env, guestQueryId, '⚠️ Reply to a message containing Persian or Tajik Cyrillic text, then @mention me.');
     return;
   }
 
-  // 2. Convert
   const result = convert(sourceText);
   if (!result) {
-    await answerGuest(env, queryId, {
-      type: 'article',
-      id: 'no-script',
-      title: 'Guest Bot',
-      input_message_content: {
-        message_text: '⚠️ Could not detect Persian or Tajik Cyrillic in the referenced message.',
-      },
-    });
+    await answerGuest(env, guestQueryId, '⚠️ Could not detect Persian or Tajik Cyrillic in the referenced message.');
     return;
   }
 
-  // 3. Send the converted result as a guest message
-  await answerGuest(env, queryId, {
-    type: 'article',
-    id: `convert-${Date.now()}`,
-    title: result.direction,
-    input_message_content: {
-      message_text: `*${result.direction}*\n\n${result.converted}`,
-      parse_mode: 'Markdown',
-    },
-  });
+  await answerGuest(
+    env,
+    guestQueryId,
+    `*${result.direction}*\n\n${result.converted}`,
+    'Markdown'
+  );
 }
 
 // ---------- Guest reply wrapper ----------
+// answerGuestQuery takes: guest_query_id (String) and result (InlineQueryResult)
 
-async function answerGuest(env, guestQueryId, inlineResult) {
-  // The Bot API method is "answerGuestQuery" and takes:
-  //   guest_query_id  (String, required)
-  //   result          (InlineQueryResult, required)
-  return tg(env, 'answerGuestQuery', {
+async function answerGuest(env, guestQueryId, messageText, parseMode) {
+  const inlineResult = {
+    type: 'article',
+    id: `guest-${Date.now()}`,
+    title: 'Transliteration result',
+    input_message_content: {
+      message_text: messageText,
+      ...(parseMode ? { parse_mode: parseMode } : {}),
+    },
+  };
+
+  const res = await tg(env, 'answerGuestQuery', {
     guest_query_id: String(guestQueryId),
     result: inlineResult,
   });
+
+  console.log('answerGuestQuery response:', JSON.stringify(res));
+  return res;
 }
 
 // ---------- Worker entrypoint ----------
@@ -152,12 +144,13 @@ export default {
       try { update = await request.json(); }
       catch { return new Response('Bad JSON', { status: 400 }); }
 
-      console.log('UPDATE:', JSON.stringify(update));
+      // Log EVERY incoming update so we can see what Telegram actually sends
+      console.log('RAW UPDATE:', JSON.stringify(update));
 
       try {
-        await handleGuestQuery(update, env);
+        await handleGuestMessage(update, env);
       } catch (e) {
-        console.error('handleGuestQuery error:', e && e.stack || e);
+        console.error('handleGuestMessage error:', e && e.stack || e);
       }
       return new Response('OK', { status: 200 });
     }
