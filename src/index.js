@@ -113,9 +113,21 @@ function cyrillicToPersianText(text) {
     const atStart = !isLetter(prev);
     const atEnd = !isLetter(next);
 
-    if (ch === 'а' || ch === 'А' || ch === 'и' || ch === 'И') {
-      // Short /a/ and /i/: ا at start, ه at end, dropped medially
+    if (ch === 'а' || ch === 'А') {
+      // Short /a/: ا at word start, ه at word end, dropped medially
       out += atStart ? '\u0627' : atEnd ? '\u0647' : '';
+    } else if (ch === 'и' || ch === 'И') {
+      // Tajik и can be either Persian short kasra (unwritten) or long ی.
+      // Heuristic: и before к → ی (Тоҷик → تاجیک, Тоҷикистон → تاجیکستان).
+      // Word-initial → ا; word-final → ی; otherwise dropped.
+      if (next === 'к' || next === 'К') {
+        out += '\u06CC';                 // ی
+      } else if (atStart) {
+        out += '\u0627';                 // ا
+      } else if (atEnd) {
+        out += '\u06CC';                 // ی
+      }
+      // else: dropped
     } else if (ch === 'о' || ch === 'О') {
       // /ɔ/: آ at word start, ا otherwise
       out += atStart ? '\u0622' : '\u0627';
