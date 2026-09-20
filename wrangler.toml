@@ -1,8 +1,5 @@
-name = "shiny-umbrella"
+name = "shiny-cyrillic"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-09-23"
 
-# Add KV binding for persistent storage
-[[kv_namespaces]]
-binding = "KV"
-id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
+# BOT_TOKEN and DB_ENCRYPTION_KEY are injected by the workflow via --var
