@@ -1,11 +1,12 @@
 // src/index.js
-// Telegram GUEST BOT — formats "title \n\n body" into a stylized post
+// Telegram GUEST BOT — replies with a button; the button opens inline mode
+// prefilled with the source text, and the USER sends the formatted post.
 
 // ---------- Config ----------
-const LINK_TEXT = 'Thing';                 // <-- text of the footer link
-const LINK_URL  = 'https://t.me/thing';    // <-- target of the footer link
+const LINK_TEXT = 'Thing';
+const LINK_URL  = 'https://t.me/thing';
 
-// ---------- HTML escape (so user input can't break parse_mode) ----------
+// ---------- HTML escape ----------
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -16,7 +17,7 @@ function escapeHtml(s) {
 // ---------- Format: "title\n\nbody" -> HTML post ----------
 function formatPost(sourceText) {
   const blocks = sourceText
-    .split(/\n\s*\n/)          // split on blank lines
+    .split(/\n\s*\n/)
     .map(b => b.trim())
     .filter(Boolean);
 
@@ -44,7 +45,16 @@ async function tg(env, method, payload) {
   try { return JSON.parse(txt); } catch { return { ok: false, raw: txt }; }
 }
 
-// ---------- Guest handler ----------
+// ---------- Extract source text from a guest_message ----------
+function extractSource(msg) {
+  const triggeringText = msg.text || msg.caption || '';
+  const replied = msg.reply_to_message;
+  return replied
+    ? (replied.text || replied.caption || '')
+    : triggeringText.replace(/@\w+/g, '').trim();
+}
+
+// ---------- Guest handler: just show a button ----------
 async function handleGuestMessage(update, env) {
   const msg = update.guest_message;
   if (!msg) return;
@@ -55,37 +65,67 @@ async function handleGuestMessage(update, env) {
     return;
   }
 
-  const triggeringText = msg.text || msg.caption || '';
-  const replied = msg.reply_to_message;
-  const sourceText = replied
-    ? (replied.text || replied.caption || '')
-    : triggeringText.replace(/@\w+/g, '').trim();
-
+  const sourceText = extractSource(msg);
   if (!sourceText) {
-    return answerGuest(
-      env, guestQueryId,
-      '⚠️ Reply to a message containing a title and body (or send them with the @mention).'
-    );
+    return answerGuest(env, guestQueryId, {
+      message_text: '⚠️ Reply to a message with a title and a body, then @mention me.',
+    });
   }
 
-  const formatted = formatPost(sourceText);
-  if (!formatted) {
-    return answerGuest(env, guestQueryId, '⚠️ Nothing to format.');
+  // The card the user will send: a short prompt with a button attached.
+  // Pressing the button opens inline mode in this chat, prefilled with sourceText.
+  return answerGuest(env, guestQueryId, {
+    message_text: '📝 Tap the button below to compose the formatted post.',
+    reply_markup: {
+      inline_keyboard: [[
+        {
+          text: '✍️ Send formatted message',
+          switch_inline_query_current_chat: sourceText,
+        },
+      ]],
+    },
+  });
+}
+
+// ---------- Inline handler: produce the formatted post for the user to send ----------
+async function handleInlineQuery(update, env) {
+  const q = update.inline_query;
+  if (!q) return;
+
+  const sourceText = (q.query || '').trim();
+
+  const results = [];
+  if (sourceText) {
+    const formatted = formatPost(sourceText);
+    if (formatted) {
+      results.push({
+        type: 'article',
+        id: `post-${Date.now()}`,
+        title: 'Formatted post',
+        description: sourceText.slice(0, 80),
+        input_message_content: {
+          message_text: formatted,
+          parse_mode: 'HTML',
+        },
+      });
+    }
   }
 
-  return answerGuest(env, guestQueryId, formatted, 'HTML');
+  return tg(env, 'answerInlineQuery', {
+    inline_query_id: q.id,
+    results,
+    cache_time: 0,
+    is_personal: true,
+  });
 }
 
 // ---------- Guest reply wrapper ----------
-async function answerGuest(env, guestQueryId, messageText, parseMode) {
+async function answerGuest(env, guestQueryId, input_message_content) {
   const inlineResult = {
     type: 'article',
     id: `guest-${Date.now()}`,
-    title: 'Formatted post',
-    input_message_content: {
-      message_text: messageText,
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-    },
+    title: 'Compose formatted post',
+    input_message_content,
   };
   return tg(env, 'answerGuestQuery', {
     guest_query_id: String(guestQueryId),
@@ -106,8 +146,15 @@ export default {
       try { update = await request.json(); }
       catch { return new Response('Bad JSON', { status: 400 }); }
 
-      try { await handleGuestMessage(update, env); }
-      catch (e) { console.error('handleGuestMessage error:', e && e.stack || e); }
+      try {
+        if (update.guest_message) {
+          await handleGuestMessage(update, env);
+        } else if (update.inline_query) {
+          await handleInlineQuery(update, env);
+        }
+      } catch (e) {
+        console.error('handler error:', e && e.stack || e);
+      }
       return new Response('OK', { status: 200 });
     }
     return new Response('Not Found', { status: 404 });
