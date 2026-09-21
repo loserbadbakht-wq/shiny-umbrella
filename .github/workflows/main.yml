@@ -3,7 +3,7 @@ name: Deploy to Cloudflare Workers
 on:
   push:
     branches:
-      - TI
+      - PM
   workflow_dispatch:
 
 jobs:
@@ -28,17 +28,17 @@ jobs:
       - name: Deploy to Cloudflare Workers
         run: |
           wrangler deploy \
-            --var BOT_TOKEN:${{ secrets.SEVEN_BOT_TOKEN }} \
+            --var BOT_TOKEN:${{ secrets.EIGHT_BOT_TOKEN }} \
             --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       
       - name: Set Webhook
         run: |
-          WORKER_URL="https://shiny-cyrillic.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev/webhook"
+          WORKER_URL="https://shiny-tm.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev/webhook"
           echo "Setting webhook to: $WORKER_URL"
           curl -sS -X POST \
-            "https://api.telegram.org/bot${{ secrets.SEVEN_BOT_TOKEN }}/setWebhook" \
+            "https://api.telegram.org/bot${{ secrets.EIGHT_BOT_TOKEN }}/setWebhook" \
             -H "Content-Type: application/json" \
             -d "{
               \"url\": \"${WORKER_URL}\",
@@ -50,4 +50,4 @@ jobs:
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-cyrillic.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "🔗 Worker URL: https://shiny-tm.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
