@@ -1,3 +1,7 @@
 name = "shiny-tm"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
+
+[[kv_namespaces]]
+binding = "POSTS"
+id = "04ddf62f6b6943708591dcff545efc13"
