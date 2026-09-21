@@ -1,32 +1,25 @@
 // src/index.js
-// Regular Telegram bot (chat member). Replies with a button; the button
-// opens inline mode prefilled with a short id. The user sends the final post.
+// Regular Telegram bot using a REPLY KEYBOARD button.
+// User taps the button -> user sends a hidden token -> bot posts the
+// formatted message itself. No "via @bot" tag (that only applies to inline mode).
 
-// ---------- Config ----------
-const LINK_TEXT = 'Thing';
-const LINK_URL  = 'https://t.me/thing';
-const ID_RE     = /^[0-9a-f]{12}$/;
+const LINK_TEXT   = 'Thing';
+const LINK_URL    = 'https://t.me/thing';
+const ID_RE       = /^[0-9a-f]{12}$/;
+const SEND_PREFIX = '✅ send ';
 
 let botUsernameCache = null;
 
 // ---------- Helpers ----------
 function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function formatPost(sourceText) {
-  const blocks = sourceText
-    .split(/\n\s*\n/)
-    .map(b => b.trim())
-    .filter(Boolean);
+  const blocks = sourceText.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
   if (!blocks.length) return null;
-
   const title = blocks[0];
   const body  = blocks.slice(1).join('\n\n');
-
   const parts = [`🟦<b>${escapeHtml(title)}</b>`];
   if (body) parts.push(escapeHtml(body));
   parts.push(`🔹<a href="${LINK_URL}">${escapeHtml(LINK_TEXT)}</a>`);
@@ -57,14 +50,6 @@ async function getBotUsername(env) {
   return botUsernameCache;
 }
 
-// ---------- Source extraction ----------
-function extractSource(msg) {
-  if (msg.reply_to_message) {
-    return msg.reply_to_message.text || msg.reply_to_message.caption || '';
-  }
-  return (msg.text || msg.caption || '').replace(/@\w+/g, '').trim();
-}
-
 function isBotMentioned(msg, botUsername) {
   const ents = msg.entities || msg.caption_entities || [];
   for (const e of ents) {
@@ -80,15 +65,82 @@ function isBotMentioned(msg, botUsername) {
   return false;
 }
 
-// ---------- Message handler ----------
+function extractSource(msg) {
+  if (msg.reply_to_message) {
+    return msg.reply_to_message.text || msg.reply_to_message.caption || '';
+  }
+  return (msg.text || msg.caption || '').replace(/@\w+/g, '').trim();
+}
+
+function extractReplyTarget(msg) {
+  const r = msg.reply_to_message;
+  if (!r) return null;
+  const hasMedia = r.photo || r.video || r.animation ||
+                   r.document || r.audio || r.voice;
+  return hasMedia ? { chat_id: r.chat.id, message_id: r.message_id } : null;
+}
+
+// ---------- Step 4: handle the user's "✅ send <id>" message ----------
+async function handleSendToken(env, msg, id) {
+  const stored = await env.POSTS.get(id);
+  if (!stored) {
+    return tg(env, 'sendMessage', {
+      chat_id: msg.chat.id,
+      text: '⚠️ This request has expired. Please reply to the original message and mention me again.',
+      reply_markup: { remove_keyboard: true },
+    });
+  }
+
+  let data;
+  try { data = JSON.parse(stored); } catch { data = { text: stored }; }
+
+  const formatted = formatPost(data.text || '');
+  if (!formatted) {
+    return tg(env, 'sendMessage', {
+      chat_id: msg.chat.id,
+      text: '⚠️ Nothing to format.',
+      reply_markup: { remove_keyboard: true },
+    });
+  }
+
+  if (data.media) {
+    const caption = formatted.length > 1024
+      ? formatted.slice(0, 1021) + '…'
+      : formatted;
+    await tg(env, 'copyMessage', {
+      chat_id: msg.chat.id,
+      from_chat_id: data.media.chat_id,
+      message_id: data.media.message_id,
+      caption,
+      parse_mode: 'HTML',
+      reply_markup: { remove_keyboard: true },
+    });
+  } else {
+    await tg(env, 'sendMessage', {
+      chat_id: msg.chat.id,
+      text: formatted,
+      parse_mode: 'HTML',
+      reply_markup: { remove_keyboard: true },
+    });
+  }
+
+  try { await env.POSTS.delete(id); } catch {}
+}
+
+// ---------- Main message handler ----------
 async function handleMessage(update, env) {
   const msg = update.message || update.edited_message;
   if (!msg) return;
 
-  const isPrivate = msg.chat.type === 'private';
-
-  // In private chat, ignore /start and other commands unless followed by text
   const text = msg.text || msg.caption || '';
+
+  // 1) Did the user tap our reply-keyboard button?
+  if (text.startsWith(SEND_PREFIX)) {
+    const id = text.slice(SEND_PREFIX.length).trim();
+    if (ID_RE.test(id)) return handleSendToken(env, msg, id);
+  }
+
+  const isPrivate = msg.chat.type === 'private';
 
   if (isPrivate && /^\/start\b/.test(text)) {
     return tg(env, 'sendMessage', {
@@ -96,15 +148,14 @@ async function handleMessage(update, env) {
       text:
         '👋 Send me a message like:\n\n' +
         '<code>تیتر\n\nمتن</code>\n\n' +
-        'Or reply to any message with that format and mention me in a group. ' +
-        'I will give you a button to compose the formatted post.',
+        'Or reply to any message with that format (media allowed) and mention me in a group.',
       parse_mode: 'HTML',
+      reply_markup: { remove_keyboard: true },
     });
   }
 
   const botUsername = await getBotUsername(env);
   const mentioned = isBotMentioned(msg, botUsername);
-
   if (!isPrivate && !mentioned) return;
 
   const sourceText = extractSource(msg);
@@ -116,76 +167,29 @@ async function handleMessage(update, env) {
     });
   }
 
-  // Store the source text under a short id, so the button query stays short.
+  // 2) Store the source and reply with a reply-keyboard button.
   const id = makeShortId();
-  if (env.POSTS && typeof env.POSTS.put === 'function') {
-    await env.POSTS.put(id, sourceText, { expirationTtl: 3600 });
-  } else {
-    console.warn('POSTS KV binding missing — falling back to raw text (256 char limit).');
-    return tg(env, 'sendMessage', {
-      chat_id: msg.chat.id,
-      text: '⚠️ Bot is misconfigured: missing POSTS KV binding.',
-      reply_parameters: { message_id: msg.message_id },
-    });
-  }
+  await env.POSTS.put(
+    id,
+    JSON.stringify({ text: sourceText, media: extractReplyTarget(msg) }),
+    { expirationTtl: 3600 },
+  );
 
   return tg(env, 'sendMessage', {
     chat_id: msg.chat.id,
-    text: '📝 Tap the button below to compose the formatted post.',
+    text: '📝 Press the button below to send the formatted message.',
     reply_parameters: { message_id: msg.message_id },
     reply_markup: {
-      inline_keyboard: [[
-        {
-          text: '✍️ Send formatted message',
-          switch_inline_query_current_chat: id,
-        },
-      ]],
+      keyboard: [[{ text: `${SEND_PREFIX}${id}` }]],
+      resize_keyboard: true,
+      one_time_keyboard: true,
     },
-  });
-}
-
-// ---------- Inline handler ----------
-async function handleInline(update, env) {
-  const q = update.inline_query;
-  if (!q) return;
-
-  const query = (q.query || '').trim();
-  let sourceText = query;
-
-  // If the query is a short id we stored, resolve the original text.
-  if (env.POSTS && typeof env.POSTS.get === 'function' && ID_RE.test(query)) {
-    const stored = await env.POSTS.get(query);
-    if (stored) sourceText = stored;
-  }
-
-  const results = [];
-  if (sourceText) {
-    const formatted = formatPost(sourceText);
-    if (formatted) {
-      results.push({
-        type: 'article',
-        id: `post-${Date.now()}`,
-        title: 'Formatted post',
-        description: sourceText.slice(0, 80),
-        input_message_content: {
-          message_text: formatted,
-          parse_mode: 'HTML',
-        },
-      });
-    }
-  }
-
-  return tg(env, 'answerInlineQuery', {
-    inline_query_id: q.id,
-    results,
-    cache_time: 0,
-    is_personal: true,
   });
 }
 
 // ---------- Worker ----------
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (request.method === 'GET' && url.pathname === '/') {
@@ -199,8 +203,6 @@ export default {
       try {
         if (update.message || update.edited_message) {
           await handleMessage(update, env);
-        } else if (update.inline_query) {
-          await handleInline(update, env);
         }
       } catch (e) {
         console.error('handler error:', e && e.stack || e);
