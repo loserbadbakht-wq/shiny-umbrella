@@ -1,8 +1,13 @@
 {
-  "name": "shiny-tm",
-  "private": true,
+  "name": "shiny-umbrella",
+  "version": "1.0.0",
+  "description": "Telegram bot running on Cloudflare Workers",
+  "main": "src/index.js",
   "type": "module",
-  "scripts": {
-    "deploy": "wrangler deploy"
+  "dependencies": {
+    "grammy": "^1.26.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
   }
 }
