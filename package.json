@@ -1,10 +1,8 @@
 {
-  "name": "shiny-cyrillic",
-  "version": "1.0.0",
+  "name": "shiny-tm",
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "deploy": "wrangler deploy"
   }
 }
