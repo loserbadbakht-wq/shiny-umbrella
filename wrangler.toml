@@ -18,4 +18,4 @@ class_name = "ButtonCounter"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["ButtonCounter"]
+new_sqlite_classes = ["ButtonCounter"]
