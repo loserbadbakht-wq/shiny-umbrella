@@ -2,10 +2,20 @@ name = "shiny-scam"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-# 00:00 Iran time (UTC+3:30) = 20:30 UTC → cron runs in UTC
 [triggers]
-crons = ["30 20 * * *", "0 17 * * *"]
-# KV namespace to remember which topic to send to
+crons = ["30 20 * * *"]
+
+[observability]
+enabled = true
+
 [[kv_namespaces]]
 binding = "BOT_KV"
 id = "d97a738c46a74230bc7bbb597956bee5"
+
+[[durable_objects.bindings]]
+name = "BTN_COUNTER"
+class_name = "ButtonCounter"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ButtonCounter"]
