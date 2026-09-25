@@ -1,7 +1,7 @@
 // src/index.js
 // Stateless Telegram bot — HTML → Rich Message (Bot API 10.1+)
-// Strips the bot's own @mention, supports replying to a source message.
-// Adds /debug for diagnostics.
+// If the user replies to a message with @bot, the bot converts THAT message
+// and attaches its rich reply to it (not to the @bot mention).
 
 // ---------- Telegram helper ----------
 async function tg(env, method, payload) {
@@ -42,8 +42,13 @@ function isDebugCommand(message, username) {
   return re.test(raw);
 }
 
-// ---------- Resolve the source text for a message ----------
-function resolveSourceText(message, username) {
+// ---------- Resolve HTML source AND which message to reply to ----------
+// Returns { html, replyToMessageId }
+// - If the user replied to another message → use that message's text as HTML,
+//   and attach the bot's rich reply to THAT message.
+// - Otherwise → use the user's own text (mention stripped),
+//   and attach the reply to the user's message.
+function resolveTarget(message, username) {
   const incoming = message.text || message.caption || '';
   const replied = message.reply_to_message;
 
@@ -51,19 +56,24 @@ function resolveSourceText(message, username) {
     const repliedText = replied.text || replied.caption || '';
     if (repliedText.trim()) {
       const extra = stripBotMention(incoming, username);
-      return extra ? `${repliedText}\n\n${extra}` : repliedText;
+      return {
+        html: extra ? `${repliedText}\n\n${extra}` : repliedText,
+        replyToMessageId: replied.message_id,
+      };
     }
   }
 
-  return stripBotMention(incoming, username);
+  return {
+    html: stripBotMention(incoming, username),
+    replyToMessageId: message.message_id,
+  };
 }
 
-// ---------- Truncate long strings for display ----------
+// ---------- Truncate / escape helpers ----------
 function clip(s, n = 800) {
   s = String(s ?? '');
   return s.length > n ? s.slice(0, n) + `\n…[+${s.length - n} more chars]` : s;
 }
-
 function htmlEscape(s) {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -71,64 +81,57 @@ function htmlEscape(s) {
     .replace(/>/g, '&gt;');
 }
 
-// ---------- /debug handler ----------
+// ---------- /debug ----------
 async function handleDebug(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
-  const html = resolveSourceText(message, username);
+  const target = resolveTarget(message, username);
 
-  // Probe sendRichMessage with a minimal payload (does not send anything visible —
-  // we send it into the same chat as a reply; that IS the debug reply).
-  const probePayload = {
+  const probe = await tg(env, 'sendRichMessage', {
     chat_id: message.chat.id,
-    rich_message: { html: html || '<b>debug</b>' },
-    reply_parameters: { message_id: message.message_id },
-  };
-  const probe = await tg(env, 'sendRichMessage', probePayload);
+    rich_message: { html: target.html || '<b>debug</b>' },
+    reply_parameters: { message_id: target.replyToMessageId },
+  });
 
   const lines = [
     '<b>🛠 /debug</b>',
     '',
-    `<b>Bot</b>`,
+    '<b>Bot</b>',
     `id: <code>${htmlEscape(bot.id)}</code>`,
     `username: <code>@${htmlEscape(username)}</code>`,
-    `first_name: ${htmlEscape(bot.first_name || '')}`,
-    `can_join_groups: ${bot.can_join_groups}`,
-    `can_read_all_group_messages: ${bot.can_read_all_group_messages}`,
     `supports_inline_queries: ${bot.supports_inline_queries}`,
     '',
-    `<b>Chat</b>`,
+    '<b>Chat</b>',
     `id: <code>${htmlEscape(message.chat.id)}</code>`,
     `type: <code>${htmlEscape(message.chat.type)}</code>`,
-    `title: ${htmlEscape(message.chat.title || message.chat.username || message.chat.first_name || '')}`,
     '',
-    `<b>Message</b>`,
+    '<b>Incoming message</b>',
     `message_id: <code>${htmlEscape(message.message_id)}</code>`,
-    `date: <code>${htmlEscape(message.date)}</code>`,
     `has_reply: ${!!message.reply_to_message}`,
-    `text_length: ${(message.text || message.caption || '').length}`,
+    `replied_to_id: <code>${htmlEscape(message.reply_to_message?.message_id ?? '—')}</code>`,
     '',
-    `<b>Update keys</b>`,
-    `<code>${htmlEscape(Object.keys(update).join(', '))}</code>`,
+    '<b>Target</b>',
+    `reply_to_message_id: <code>${htmlEscape(target.replyToMessageId)}</code>`,
+    `html_length: ${target.html.length}`,
+    `<pre>${htmlEscape(clip(target.html))}</pre>`,
     '',
-    `<b>Resolved HTML (${html.length} chars)</b>`,
-    `<pre>${htmlEscape(clip(html))}</pre>`,
-    '',
-    `<b>sendRichMessage probe</b>`,
+    '<b>sendRichMessage probe</b>',
     probe.ok
       ? `✅ ok — reply message_id: <code>${htmlEscape(probe.result?.message_id)}</code>`
       : `❌ failed\n<pre>${htmlEscape(clip(JSON.stringify(probe), 600))}</pre>`,
+    '',
+    '<b>Update keys</b>',
+    `<code>${htmlEscape(Object.keys(update).join(', '))}</code>`,
   ];
 
-  // Send the debug report as a rich message itself
   await tg(env, 'sendRichMessage', {
     chat_id: message.chat.id,
     rich_message: { html: lines.join('\n') },
-    reply_parameters: { message_id: message.message_id },
+    reply_parameters: { message_id: target.replyToMessageId },
   });
 }
 
-// ---------- Send a Rich Message as a reply ----------
+// ---------- Main dispatcher ----------
 async function replyWithRichMessage(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
@@ -137,17 +140,16 @@ async function replyWithRichMessage(message, env, update) {
     return handleDebug(message, env, update);
   }
 
-  const html = resolveSourceText(message, username);
-
-  if (!html) {
+  const target = resolveTarget(message, username);
+  if (!target.html) {
     console.warn('Nothing to send after stripping mention.');
     return;
   }
 
   const result = await tg(env, 'sendRichMessage', {
     chat_id: message.chat.id,
-    rich_message: { html },
-    reply_parameters: { message_id: message.message_id },
+    rich_message: { html: target.html },
+    reply_parameters: { message_id: target.replyToMessageId }, // ← attach to the SOURCE
   });
 
   if (!result.ok) {
