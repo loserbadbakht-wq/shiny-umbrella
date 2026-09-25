@@ -3,7 +3,8 @@
 // With encrypted KV storage, batch filter, duplicate prevention,
 // MAL link resolution (Jikan + fallback + cache), bold titles,
 // season/episode reformatter, PV-only /unsub, group /unsub hint,
-// /debug, /maltest, and /schedule (bilingual: fa=Asia/Tehran, en=UTC).
+// /debug, /maltest, and /schedule using native Telegram tables
+// (Bot API 10.1+ sendRichMessage) with plain-text fallback.
 // ============================================================
 
 const RSS_URL = 'https://subsplease.org/rss/?t&r=1080';
@@ -313,14 +314,6 @@ function splitMessage(text, maxLength = 4000) {
     return chunks;
 }
 
-function truncateForEdit(text, maxLength = 4000) {
-    if (text.length <= maxLength) return text;
-    return (
-        text.slice(0, maxLength - 40).replace(/\n[^\n]*$/, '') +
-        '\n\n<i>… (truncated)</i>'
-    );
-}
-
 // ============= TELEGRAM API HELPERS =============
 
 async function sendMessage(env, chatId, text, extra = {}) {
@@ -352,6 +345,53 @@ async function editMessage(env, chatId, messageId, text, extra = {}) {
         text: text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
+        ...extra,
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    try {
+        return await res.json();
+    } catch {
+        return { ok: res.ok };
+    }
+}
+
+/**
+ * Send a rich message (Bot API 10.1+). Supports native tables, headings,
+ * lists, and other rich blocks. `html` is raw rich HTML.
+ */
+async function sendRichMessage(env, chatId, html, extra = {}) {
+    const url = `${TELEGRAM_API}${env.BOT_TOKEN}/sendRichMessage`;
+    const payload = {
+        chat_id: chatId,
+        rich_message: { html },
+        ...extra,
+    };
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    try {
+        return await res.json();
+    } catch {
+        return { ok: res.ok };
+    }
+}
+
+/**
+ * Edit an existing message in place with rich content. Uses editMessageText's
+ * `rich_message` parameter (added alongside sendRichMessage).
+ */
+async function editRichMessage(env, chatId, messageId, html, extra = {}) {
+    const url = `${TELEGRAM_API}${env.BOT_TOKEN}/editMessageText`;
+    const payload = {
+        chat_id: chatId,
+        message_id: messageId,
+        rich_message: { html },
         ...extra,
     };
     const res = await fetch(url, {
@@ -515,9 +555,69 @@ async function fetchSchedule(tz) {
     return json.schedule;
 }
 
+function escapeHtml(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+/**
+ * Build the day schedule as rich HTML with a native Telegram table.
+ * Uses <table bordered striped> so rows are visually separated.
+ *
+ * @param {string} day
+ * @param {Array} entries
+ * @param {'en'|'fa'} lang
+ * @returns {string} rich HTML
+ */
 function formatDaySchedule(day, entries, lang) {
     const isFa = lang === 'fa';
+    const dayName = isFa ? DAY_FULL_FA[day] : day;
+    const tzLabel = isFa ? 'به وقت ایران' : 'UTC';
 
+    let html = `<h3>📅 ${dayName} (${tzLabel})</h3>`;
+
+    if (!entries || entries.length === 0) {
+        html += isFa
+            ? '<p><i>هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.</i></p>'
+            : '<p><i>No releases scheduled.</i></p>';
+        return html;
+    }
+
+    // Cap rows to stay comfortably within Telegram's message size limits.
+    const MAX_ROWS = 100;
+    const shown = entries.slice(0, MAX_ROWS);
+
+    html += '<table bordered striped>';
+    html += isFa
+        ? '<tr><th>ساعت</th><th>انیمه</th></tr>'
+        : '<tr><th>Time</th><th>Show</th></tr>';
+
+    for (const entry of shown) {
+        html +=
+            `<tr><td>${escapeHtml(entry.time)}</td>` +
+            `<td>${escapeHtml(entry.title)}</td></tr>`;
+    }
+
+    html += '</table>';
+
+    if (entries.length > MAX_ROWS) {
+        const more = entries.length - MAX_ROWS;
+        html += isFa
+            ? `<p><i>… و ${more} مورد دیگر</i></p>`
+            : `<p><i>… and ${more} more</i></p>`;
+    }
+
+    return html;
+}
+
+/**
+ * Plain-text fallback used if sendRichMessage / editRichMessage fails
+ * (e.g. on older Bot API versions or restricted contexts).
+ */
+function formatDaySchedulePlain(day, entries, lang) {
+    const isFa = lang === 'fa';
     const dayName = isFa ? DAY_FULL_FA[day] : day;
     const tzLabel = isFa ? 'به وقت ایران' : 'UTC';
 
@@ -531,11 +631,7 @@ function formatDaySchedule(day, entries, lang) {
     }
 
     for (const entry of entries) {
-        const safeTitle = String(entry.title || '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
-        msg += `<code>${entry.time}</code>  ${safeTitle}\n`;
+        msg += `<code>${escapeHtml(entry.time)}</code>  ${escapeHtml(entry.title)}\n`;
     }
     return msg;
 }
@@ -555,6 +651,47 @@ function buildDayKeyboard(activeDay, lang) {
     const rows = [row1, row2].filter((r) => r.length > 0);
 
     return { inline_keyboard: rows };
+}
+
+/**
+ * Send the schedule as a rich (table) message, with a plain-text fallback.
+ */
+async function sendScheduleMessage(env, chatId, day, entries, lang, keyboard) {
+    const html = formatDaySchedule(day, entries, lang);
+    const richRes = await sendRichMessage(env, chatId, html, {
+        reply_markup: keyboard,
+    });
+
+    if (richRes && richRes.ok) return;
+
+    console.warn(
+        '[SCHEDULE] sendRichMessage failed, falling back to plain text:',
+        JSON.stringify(richRes).slice(0, 300)
+    );
+
+    const plain = formatDaySchedulePlain(day, entries, lang);
+    await sendMessage(env, chatId, plain, { reply_markup: keyboard });
+}
+
+/**
+ * Edit the schedule message in place with rich (table) content, with a
+ * plain-text fallback.
+ */
+async function editScheduleMessage(env, chatId, messageId, day, entries, lang, keyboard) {
+    const html = formatDaySchedule(day, entries, lang);
+    const richRes = await editRichMessage(env, chatId, messageId, html, {
+        reply_markup: keyboard,
+    });
+
+    if (richRes && richRes.ok) return;
+
+    console.warn(
+        '[SCHEDULE] editRichMessage failed, falling back to plain text:',
+        JSON.stringify(richRes).slice(0, 300)
+    );
+
+    const plain = formatDaySchedulePlain(day, entries, lang);
+    await editMessage(env, chatId, messageId, plain, { reply_markup: keyboard });
 }
 
 // ============= COMMAND HANDLERS =============
@@ -661,11 +798,16 @@ async function handleSchedule(env, chatId) {
 
         const schedule = await fetchSchedule(tz);
         const today = getCurrentDay(tz);
-
-        const text = truncateForEdit(formatDaySchedule(today, schedule[today], lang));
         const keyboard = buildDayKeyboard(today, lang);
 
-        await sendMessage(env, chatId, text, { reply_markup: keyboard });
+        await sendScheduleMessage(
+            env,
+            chatId,
+            today,
+            schedule[today],
+            lang,
+            keyboard
+        );
     } catch (e) {
         console.error('[ERROR] /schedule failed:', e);
         const lang = await getLang(env, chatId);
@@ -721,11 +863,17 @@ async function handleCallbackQuery(env, callbackQuery) {
             const tz = SCHEDULE_TZ[lang] || SCHEDULE_TZ.en;
 
             const schedule = await fetchSchedule(tz);
-            const text = truncateForEdit(formatDaySchedule(day, schedule[day], lang));
             const keyboard = buildDayKeyboard(day, lang);
-            await editMessage(env, chatId, messageId, text, {
-                reply_markup: keyboard,
-            });
+
+            await editScheduleMessage(
+                env,
+                chatId,
+                messageId,
+                day,
+                schedule[day],
+                lang,
+                keyboard
+            );
             await answerCallback(env, id);
         } catch (e) {
             console.error('[ERROR] sched callback failed:', e);
