@@ -1,13 +1,17 @@
 // src/index.js
 // Rich Message bot — privacy-mode friendly.
 //
+// Sources of HTML (in priority order, per message):
+//   message.text          → normal text / caption
+//   message.rich_message  → a rich message (bot or user posted with parse_mode rich)
+//
 // Trigger flows:
-//   [user]  HTML text message
-//   [user]  reply to it with @botusername        → rich reply attached to the HTML
+//   [user]  HTML text or rich message
+//   [user]  reply to it with @botusername        → rich reply attached to the source
 //   [user]  @botusername <html>                  → rich reply attached to the user's msg
 //   /ping, /debug                                → plain reports only
 //
-// Silent on bare chatter. Never sends a rich probe from /debug.
+// Silent on bare chatter. No visible probe from /debug.
 
 const DEBUG = true;
 
@@ -36,6 +40,20 @@ async function getBotInfo(env) {
   return BOT_INFO;
 }
 
+// ---------- Pull HTML out of ANY message object ----------
+// Telegram exposes content in different fields depending on how it was sent.
+function extractContent(msg) {
+  if (!msg) return { html: '', kind: 'none' };
+  if (typeof msg.text === 'string' && msg.text.length)        return { html: msg.text,    kind: 'text' };
+  if (typeof msg.caption === 'string' && msg.caption.length)  return { html: msg.caption, kind: 'caption' };
+  if (msg.rich_message) {
+    if (typeof msg.rich_message.html === 'string')            return { html: msg.rich_message.html, kind: 'rich_message.html' };
+    if (typeof msg.rich_message === 'string')                 return { html: msg.rich_message,      kind: 'rich_message(string)' };
+    return { html: JSON.stringify(msg.rich_message), kind: 'rich_message(json)' };
+  }
+  return { html: '', kind: 'none' };
+}
+
 // ---------- Text helpers ----------
 function stripBotMention(text, username) {
   if (!text) return '';
@@ -55,43 +73,45 @@ function isCmd(message, username, cmd) {
 function hasRichHtml(text) {
   return !!text && /<\s*\/?\s*[a-z][^>]*>/i.test(text);
 }
-function wasMentioned(message, username) {
-  if (!username) return false;
-  const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const t = message.text || message.caption || '';
-  return new RegExp(`@${esc}\\b`, 'i').test(t);
-}
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ---------- Resolve source + reply target ----------
 function resolveTarget(message, username) {
-  const incoming = message.text || message.caption || '';
-  const replied  = message.reply_to_message;
+  const incoming       = extractContent(message);                 // what the user typed
+  const incomingStripped = stripBotMention(incoming.html, username);
+  const repliedMsg     = message.reply_to_message;
+  const replied        = extractContent(repliedMsg);              // the replied-to message
 
-  if (replied) {
-    const repliedText = (replied.text || replied.caption || '').trim();
-    const extra       = stripBotMention(incoming, username);
-
-    const html = repliedText && extra
-      ? `${repliedText}\n\n${extra}`
-      : repliedText || extra;
+  if (repliedMsg) {
+    // Combine replied content + (stripped) own content
+    let html;
+    if (replied.html && incomingStripped) html = `${replied.html}\n\n${incomingStripped}`;
+    else if (replied.html)                html = replied.html;
+    else                                  html = incomingStripped;
 
     let reason;
-    if (repliedText)              reason = 'reply';           // source has text
-    else if (extra && hasRichHtml(extra)) reason = 'reply-own-html'; // user typed HTML after mention
-    else if (extra)               reason = 'reply-own-plain'; // user typed plain after mention
-    else                          reason = 'reply-empty';     // only "@bot"
+    if (replied.html)                                reason = 'reply';
+    else if (incomingStripped && hasRichHtml(incomingStripped)) reason = 'reply-own-html';
+    else if (incomingStripped)                       reason = 'reply-own-plain';
+    else                                             reason = 'reply-empty';
 
-    return { html, replyToMessageId: replied.message_id, reason };
+    return {
+      html,
+      replyToMessageId: repliedMsg.message_id,
+      reason,
+      repliedKind: replied.kind,
+      incomingKind: incoming.kind,
+    };
   }
 
-  const cleaned = stripBotMention(incoming, username);
   return {
-    html: cleaned,
+    html: incomingStripped,
     replyToMessageId: message.message_id,
-    reason: hasRichHtml(cleaned) ? 'has-html' : 'plain',
+    reason: hasRichHtml(incomingStripped) ? 'has-html' : 'plain',
+    repliedKind: '—',
+    incomingKind: incoming.kind,
   };
 }
 
@@ -123,11 +143,14 @@ async function handleDebug(message, env, update) {
   const username = bot.username || '';
   const target = resolveTarget(message, username);
 
-  // NO visible probe. The debug report itself is the output.
-  const incomingText   = message.text || message.caption || '';
-  const repliedMsg     = message.reply_to_message;
-  const repliedTextRaw = repliedMsg ? (repliedMsg.text || repliedMsg.caption || '') : '';
-  const repliedHasText = repliedTextRaw.trim().length > 0;
+  const repliedMsg = message.reply_to_message;
+  const repliedContent = extractContent(repliedMsg);
+  const incomingContent = extractContent(message);
+
+  // Which keys are visible on the replied-to message (helps diagnose "no text")
+  const repliedKeys = repliedMsg ? Object.keys(repliedMsg).filter(k =>
+    ['text','caption','rich_message','photo','video','sticker','audio','voice','document','animation','poll','location','venue','contact','dice'].includes(k)
+  ) : [];
 
   const lines = [
     '<b>🛠 /debug</b>',
@@ -136,10 +159,14 @@ async function handleDebug(message, env, update) {
     '',
     '<b>Incoming</b>',
     `msg_id: <code>${escapeHtml(message.message_id)}</code>`,
-    `text: <pre>${escapeHtml(incomingText.slice(0, 200))}</pre>`,
-    `reply_to.id: <code>${escapeHtml(repliedMsg?.message_id ?? '—')}</code>`,
-    `reply_to has text: ${repliedHasText}`,
-    `reply_to.text: <pre>${escapeHtml(repliedTextRaw.slice(0, 200) || '—')}</pre>`,
+    `kind: <code>${escapeHtml(incomingContent.kind)}</code>`,
+    `text: <pre>${escapeHtml((message.text || message.caption || '').slice(0, 200))}</pre>`,
+    '',
+    '<b>Replied-to message</b>',
+    `id: <code>${escapeHtml(repliedMsg?.message_id ?? '—')}</code>`,
+    `content kind: <code>${escapeHtml(repliedContent.kind)}</code>`,
+    `content keys present: <code>${escapeHtml(repliedKeys.join(', ') || '—')}</code>`,
+    `extracted html: <pre>${escapeHtml(repliedContent.html.slice(0, 300) || '—')}</pre>`,
     '',
     '<b>Resolved target</b>',
     `reply_to_message_id: <code>${escapeHtml(target.replyToMessageId)}</code>`,
@@ -161,20 +188,13 @@ function renderDecision(target) {
     return `⚠️ nothing to convert (reason: ${target.reason})`;
   }
   switch (target.reason) {
-    case 'plain':
-      return '🔇 silent (plain chatter, no HTML)';
-    case 'reply-empty':
-      return '⚠️ replied-to message has no readable text — nothing to convert';
-    case 'reply-own-plain':
-      return '🔇 silent (own text after mention is plain, not HTML)';
-    case 'reply-own-html':
-      return `✅ sendRichMessage (own HTML) → reply to ${target.replyToMessageId}`;
-    case 'reply':
-      return `✅ sendRichMessage (from replied msg) → reply to ${target.replyToMessageId}`;
-    case 'has-html':
-      return `✅ sendRichMessage → reply to ${target.replyToMessageId}`;
-    default:
-      return `? unknown reason ${target.reason}`;
+    case 'plain':           return '🔇 silent (plain chatter, no HTML)';
+    case 'reply-empty':     return '⚠️ replied-to message has NO readable content — nothing to convert';
+    case 'reply-own-plain': return '🔇 silent (own text after mention is plain, not HTML)';
+    case 'reply-own-html':  return `✅ sendRichMessage (own HTML) → reply to ${target.replyToMessageId}`;
+    case 'reply':           return `✅ sendRichMessage (from replied msg) → reply to ${target.replyToMessageId}`;
+    case 'has-html':        return `✅ sendRichMessage → reply to ${target.replyToMessageId}`;
+    default:                return `? unknown reason ${target.reason}`;
   }
 }
 
@@ -189,8 +209,10 @@ async function handle(message, env, update) {
       chat_id: message.chat.id,
       chat_type: message.chat.type,
       text: (message.text || message.caption || '').slice(0, 120),
+      has_rich: !!message.rich_message,
       reply_to_id: message.reply_to_message?.message_id,
       reply_to_text: (message.reply_to_message?.text || '').slice(0, 120),
+      reply_to_has_rich: !!message.reply_to_message?.rich_message,
     }));
   }
 
@@ -199,31 +221,24 @@ async function handle(message, env, update) {
 
   const target = resolveTarget(message, username);
 
-  // ── reply-empty: reply to a message that has no text ─────────────
   if (target.reason === 'reply-empty') {
     await sendPlain(env, message.chat.id, target.replyToMessageId,
-      '⚠️ The message you replied to has no text I can read (photo/sticker/rich message with no caption).\n\n' +
-      'Reply to a <b>text message</b> containing HTML, or put the HTML in the same message after the mention:\n' +
-      '<code>@' + escapeHtml(username) + ' &lt;b&gt;Hello&lt;/b&gt;</code>');
+      '⚠️ The message you replied to has no readable content (photo/sticker with no caption, or a service message).\n\n' +
+      'Reply to a <b>text message</b> or a <b>rich message</b>, or put HTML in the same message after the mention:\n' +
+      `<code>@${escapeHtml(username)} &lt;b&gt;Hello&lt;/b&gt;</code>`);
     return;
   }
-
-  // ── plain chatter: silent ────────────────────────────────────────
   if (target.reason === 'plain') {
-    if (DEBUG) console.log('skip: plain chatter, no HTML');
+    if (DEBUG) console.log('skip: plain chatter');
     return;
   }
-
-  // ── own text after mention is plain, no HTML to convert ──────────
   if (target.reason === 'reply-own-plain') {
     await sendPlain(env, message.chat.id, target.replyToMessageId,
-      '⚠️ I don\'t see HTML in your message. Include markup like <code>&lt;b&gt;Hello&lt;/b&gt;</code> or reply to a message that contains HTML.');
+      '⚠️ I don\'t see HTML in your message. Include markup like <code>&lt;b&gt;Hello&lt;/b&gt;</code>, or reply to a message that contains HTML.');
     return;
   }
-
-  // ── actually convert ─────────────────────────────────────────────
   if (!target.html || !target.html.trim()) {
-    if (DEBUG) console.log('skip: empty html after resolution');
+    if (DEBUG) console.log('skip: empty html');
     return;
   }
 
