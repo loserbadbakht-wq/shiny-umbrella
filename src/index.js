@@ -1,6 +1,13 @@
 // src/index.js
-// Rich Message bot — bulletproof diagnostics.
-// Never stays silent when addressed. Always sends something.
+// Rich Message bot — command-driven, reply-safe.
+//
+// Usage in any group (privacy mode ON or OFF):
+//   /rich                        (reply to an HTML message)  → converts it
+//   /rich <b>Hello</b>            (inline HTML)                → converts it
+//   /ping    /debug    /help
+//
+// Guard: if the incoming message is a reply to the bot's OWN message,
+// the bot does nothing — prevents feedback loops and nonsense echoes.
 
 const DEBUG = true;
 
@@ -14,11 +21,8 @@ async function tg(env, method, payload) {
   const txt = await res.text();
   let data;
   try { data = JSON.parse(txt); } catch { data = { ok: false, raw: txt }; }
-  if (!res.ok || data.ok === false) {
-    console.error(`[tg:${method}] HTTP ${res.status} →`, txt.slice(0, 800));
-  } else if (DEBUG) {
-    console.log(`[tg:${method}] ok`);
-  }
+  if (!res.ok || data.ok === false) console.error(`[tg:${method}] ${res.status}:`, txt.slice(0, 800));
+  else if (DEBUG) console.log(`[tg:${method}] ok`);
   return data;
 }
 
@@ -34,33 +38,20 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 function jsonBlock(obj, max = 3000) {
-  let s;
-  try { s = JSON.stringify(obj, null, 2); } catch { s = String(obj); }
-  if (s.length > max) s = s.slice(0, max) + `\n…[truncated ${s.length - max} chars]`;
+  let s; try { s = JSON.stringify(obj, null, 2); } catch { s = String(obj); }
+  if (s.length > max) s = s.slice(0, max) + `\n…[+${s.length - max}]`;
   return s;
 }
-function stripBotMention(text, username) {
-  if (!text) return '';
-  if (!username) return text.trim();
-  const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return text.replace(new RegExp(`@${esc}\\b`, 'gi'), '').trim();
-}
-function isCmd(message, username, cmd) {
-  const raw = (message.text || message.caption || '').trim();
-  if (!raw) return false;
-  const esc = username ? username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : null;
-  const re = esc
-    ? new RegExp(`^/${cmd}(?:@${esc})?(?:\\s|$)`, 'i')
-    : new RegExp(`^/${cmd}(?:\\s|$)`, 'i');
-  return re.test(raw);
-}
-function hasRichHtml(text) {
-  return !!text && /<\s*\/?\s*[a-z][^>]*>/i.test(text);
-}
-function wasMentioned(text, username) {
-  if (!text || !username) return false;
-  const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`@${esc}\\b`, 'i').test(text);
+function hasRichHtml(t) { return !!t && /<\s*\/?\s*[a-z][^>]*>/i.test(t); }
+
+// ---------- Command parsing ----------
+function parseCommand(text, botUsername) {
+  if (!text) return null;
+  const m = text.match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+  const [, cmd, target, args] = m;
+  if (target && target.toLowerCase() !== (botUsername || '').toLowerCase()) return null;
+  return { cmd: cmd.toLowerCase(), args: (args || '').trim() };
 }
 
 // ---------- Extract content from any message ----------
@@ -78,158 +69,172 @@ function extractContent(msg) {
   return { html: '', kind: 'none' };
 }
 
-// ---------- Resolve target ----------
-function resolveTarget(message, username) {
-  const incoming    = extractContent(message);
-  const own         = stripBotMention(incoming.html, username);
-  const replied     = message.reply_to_message;
-  const fromReplied = extractContent(replied);
-
-  if (replied) {
-    const html = fromReplied.html && own
-      ? `${fromReplied.html}\n\n${own}`
-      : fromReplied.html || own;
-
-    let reason;
-    if (fromReplied.html)             reason = 'reply';
-    else if (own && hasRichHtml(own)) reason = 'reply-own-html';
-    else if (own)                     reason = 'reply-own-plain';
-    else                              reason = 'reply-empty';
-
-    return { html, replyToMessageId: replied.message_id, reason, repliedKind: fromReplied.kind };
-  }
-
-  if (!own && wasMentioned(incoming.html, username)) {
-    return { html: '', replyToMessageId: message.message_id, reason: 'mentioned-empty', repliedKind: '—' };
-  }
-  if (!own) {
-    return { html: '', replyToMessageId: message.message_id, reason: 'plain', repliedKind: '—' };
-  }
-  return {
-    html: own,
-    replyToMessageId: message.message_id,
-    reason: hasRichHtml(own) ? 'has-html' : 'plain',
-    repliedKind: '—',
-  };
-}
-
 // ---------- Send ----------
-async function sendRich(env, chatId, replyToId, html) {
-  const withReply = await tg(env, 'sendRichMessage', {
+async function sendRich(env, chatId, replyToId, html, threadId) {
+  const payload = {
     chat_id: chatId,
     rich_message: { html },
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
-  });
-  if (withReply.ok) return withReply;
+  };
+  if (threadId != null) payload.message_thread_id = threadId;
 
-  console.warn('sendRichMessage with reply failed:', withReply.description);
-  const without = await tg(env, 'sendRichMessage', {
-    chat_id: chatId,
-    rich_message: { html },
-  });
-  return without;
+  let r = await tg(env, 'sendRichMessage', payload);
+  if (r.ok) return r;
+
+  console.warn('sendRichMessage(reply) failed:', r.description);
+  const p2 = { chat_id: chatId, rich_message: { html } };
+  if (threadId != null) p2.message_thread_id = threadId;
+  r = await tg(env, 'sendRichMessage', p2);
+  return r;
 }
-async function sendPlain(env, chatId, replyToId, text) {
-  return tg(env, 'sendMessage', {
+async function sendPlain(env, chatId, replyToId, text, threadId) {
+  const payload = {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
-  });
+  };
+  if (threadId != null) payload.message_thread_id = threadId;
+  return tg(env, 'sendMessage', payload);
 }
 
-// ---------- Commands ----------
+// ---------- Command handlers ----------
+async function handleHelp(message, env) {
+  await sendPlain(env, message.chat.id, message.message_id,
+    '<b>🤖 Rich Message Bot</b>\n\n' +
+    '<b>Commands</b>\n' +
+    '<code>/rich</code> — reply to a message containing HTML, or pass HTML as the argument\n' +
+    '<code>/rich &lt;b&gt;Hello&lt;/b&gt;</code> — convert inline HTML\n' +
+    '<code>/ping</code> — health check\n' +
+    '<code>/debug</code> — dump the raw update\n' +
+    '<code>/help</code> — this message',
+    message.message_thread_id);
+}
+
 async function handlePing(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
-    `🏓 pong\nchat: <code>${escapeHtml(message.chat.id)}</code>`);
+    `🏓 pong\nchat: <code>${escapeHtml(message.chat.id)}</code>\nthread: <code>${escapeHtml(message.message_thread_id ?? '—')}</code>`,
+    message.message_thread_id);
 }
 
 async function handleDebug(message, env, update) {
   const bot = await getBotInfo(env);
-  const username = bot.username || '';
-  const parts = [];
-  parts.push('<b>🛠 /debug — raw dump</b>');
-  parts.push(`<b>Bot:</b> @${escapeHtml(username)}`);
-  parts.push(`<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code>`);
-  parts.push('');
-  parts.push('<b>── Full update JSON ──</b>');
-  parts.push(`<pre>${escapeHtml(jsonBlock(update, 3800))}</pre>`);
-
-  const text = parts.join('\n');
+  const text = [
+    '<b>🛠 /debug — raw dump</b>',
+    `<b>Bot:</b> @${escapeHtml(bot.username || '?')}`,
+    `<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code>`,
+    `<b>thread_id:</b> <code>${escapeHtml(message.message_thread_id ?? '—')}</code>`,
+    '',
+    '<b>── Full update JSON ──</b>',
+    `<pre>${escapeHtml(jsonBlock(update, 3600))}</pre>`,
+  ].join('\n');
   const CHUNK = 3900;
   for (let i = 0; i < text.length; i += CHUNK) {
-    await sendPlain(env, message.chat.id, message.message_id, text.slice(i, i + CHUNK));
+    await sendPlain(env, message.chat.id, message.message_id, text.slice(i, i + CHUNK), message.message_thread_id);
   }
 }
 
-// ---------- Main ----------
+// ---------- /rich ----------
+async function handleRich(message, env, args, botId) {
+  const threadId = message.message_thread_id;
+
+  const replied = message.reply_to_message;
+
+  // Extra safety net (belt and suspenders — the top-level guard already
+  // catches this, but keep it here too so /rich can never echo the bot).
+  if (replied?.from?.id === botId) {
+    if (DEBUG) console.log('rich skip: reply to bot itself');
+    return;
+  }
+
+  const fromReplied = extractContent(replied);
+
+  let html;
+  let replyToId;
+
+  if (args) {
+    html = args;
+    replyToId = replied ? replied.message_id : message.message_id;
+  } else if (fromReplied.html) {
+    html = fromReplied.html;
+    replyToId = replied.message_id;
+  } else if (replied) {
+    await sendPlain(env, message.chat.id, replied.message_id,
+      `⚠️ <b>The message you replied to has no readable content.</b>\n` +
+      `extracted kind: <code>${escapeHtml(fromReplied.kind)}</code>\n\n` +
+      `<b>Raw reply_to_message:</b>\n<pre>${escapeHtml(jsonBlock(replied, 2500))}</pre>`,
+      threadId);
+    return;
+  } else {
+    await sendPlain(env, message.chat.id, message.message_id,
+      '⚠️ <b>Nothing to convert.</b>\n\n' +
+      'Either reply to a message containing HTML, or pass the HTML as an argument:\n' +
+      '<code>/rich &lt;b&gt;Hello&lt;/b&gt;</code>',
+      threadId);
+    return;
+  }
+
+  if (!html.trim()) {
+    await sendPlain(env, message.chat.id, replyToId, '⚠️ Empty input after parsing.', threadId);
+    return;
+  }
+
+  if (DEBUG) console.log('rich →', JSON.stringify({ replyToId, threadId, len: html.length }));
+
+  const rich = await sendRich(env, message.chat.id, replyToId, html, threadId);
+  if (rich.ok) {
+    if (DEBUG) console.log(`sendRichMessage ok msg_id=${rich.result?.message_id}`);
+    return;
+  }
+
+  console.warn('sendRichMessage failed → fallback to plain:', rich.description);
+  const plain = await sendPlain(env, message.chat.id, replyToId, html, threadId);
+  if (!plain.ok) {
+    await sendPlain(env, message.chat.id, replyToId,
+      `<b>❌ All sends failed</b>\n` +
+      `rich: <code>${escapeHtml((rich.description || '').slice(0, 200))}</code>\n` +
+      `plain: <code>${escapeHtml((plain.description || '').slice(0, 200))}</code>`,
+      threadId);
+  }
+}
+
+// ---------- Main dispatch ----------
 async function handle(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
+  const botId = bot.id;
 
-  console.log('=== update ===', JSON.stringify(update).slice(0, 2500));
+  if (DEBUG) console.log('=== update ===', JSON.stringify(update).slice(0, 2200));
 
-  if (isCmd(message, username, 'ping'))  return handlePing(message, env);
-  if (isCmd(message, username, 'debug')) return handleDebug(message, env, update);
-
-  const target = resolveTarget(message, username);
-  console.log('=== resolved ===', JSON.stringify({
-    reason: target.reason,
-    htmlLen: target.html.length,
-    replyTo: target.replyToMessageId,
-    repliedKind: target.repliedKind,
-    hasReplyTo: !!message.reply_to_message,
-  }));
-
-  // ── Addressed but replied-to message has no readable content ──
-  if (target.reason === 'reply-empty') {
-    const raw = message.reply_to_message
-      ? jsonBlock(message.reply_to_message, 2500)
-      : 'absent';
-    await sendPlain(env, message.chat.id, target.replyToMessageId,
-      `⚠️ <b>Replied-to message has no readable content.</b>\n` +
-      `kind: <code>${escapeHtml(target.repliedKind)}</code>\n\n` +
-      `<b>Raw reply_to_message object:</b>\n<pre>${escapeHtml(raw)}</pre>`);
+  // ── GUARD: do nothing if this message is a reply to the bot itself ──
+  if (message.reply_to_message?.from?.id === botId) {
+    if (DEBUG) console.log('skip: reply to bot itself');
+    return;
+  }
+  // ── Also skip if a forwarded/channel-post reply is from a bot ──
+  if (message.reply_to_message?.from?.is_bot === true &&
+      message.reply_to_message.from.id === botId) {
+    if (DEBUG) console.log('skip: reply to bot (is_bot)');
     return;
   }
 
-  // ── Mentioned alone, no reply, no HTML ──
-  if (target.reason === 'mentioned-empty') {
-    await sendPlain(env, message.chat.id, message.message_id,
-      `⚠️ <b>Mentioned, but no HTML and no reply target.</b>\n` +
-      `Try: <code>@${escapeHtml(username)} &lt;b&gt;Hello&lt;/b&gt;</code>`);
+  const text = message.text || message.caption || '';
+  const cmd = parseCommand(text, username);
+  if (!cmd) {
+    if (DEBUG) console.log('skip: not a command for this bot');
     return;
   }
 
-  // ── Replied with plain text after mention ──
-  if (target.reason === 'reply-own-plain') {
-    await sendPlain(env, message.chat.id, target.replyToMessageId,
-      `⚠️ <b>No HTML in your reply.</b>\n` +
-      `Try: <code>&lt;b&gt;Hello&lt;/b&gt;</code>`);
-    return;
-  }
-
-  // ── Not addressed — silent ──
-  if (target.reason === 'plain') return;
-  if (!target.html.trim()) return;
-
-  // ── Convert ──
-  const rich = await sendRich(env, message.chat.id, target.replyToMessageId, target.html);
-  if (rich.ok) {
-    if (DEBUG) {
-      const attached = rich?.result?.reply_to_message?.message_id ?? null;
-      console.log(`sendRichMessage: attached=${attached} expected=${target.replyToMessageId}`);
-    }
-    return;
-  }
-
-  // Rich failed → plain fallback
-  const plain = await sendPlain(env, message.chat.id, target.replyToMessageId, target.html);
-  if (!plain.ok) {
-    await sendPlain(env, message.chat.id, target.replyToMessageId,
-      `<b>❌ All send attempts failed</b>\n` +
-      `rich: <code>${escapeHtml((rich.description || '').slice(0, 200))}</code>\n` +
-      `plain: <code>${escapeHtml((plain.description || '').slice(0, 200))}</code>`);
+  switch (cmd.cmd) {
+    case 'start':
+    case 'help': return handleHelp(message, env);
+    case 'ping': return handlePing(message, env);
+    case 'debug': return handleDebug(message, env, update);
+    case 'rich': return handleRich(message, env, cmd.args, botId);
+    default:
+      await sendPlain(env, message.chat.id, message.message_id,
+        `❓ Unknown command <code>/${escapeHtml(cmd.cmd)}</code>. Try /help.`,
+        message.message_thread_id);
   }
 }
 
@@ -247,9 +252,7 @@ export default {
       try {
         const msg = update.message || update.edited_message;
         if (msg) await handle(msg, env, update);
-      } catch (e) {
-        console.error('handler error:', e && e.stack || e);
-      }
+      } catch (e) { console.error('handler error:', e && e.stack || e); }
       return new Response('OK', { status: 200 });
     }
     return new Response('Not Found', { status: 404 });
