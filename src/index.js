@@ -1,5 +1,11 @@
 // src/index.js
-// Rich Message bot — uses the correct media array for tg:// links.
+// Rich Message bot.
+//
+//  ▸ PV media         → replies with a tag using the file_id as the id.
+//  ▸ Channels (admin) → auto-edits HTML posts into rich messages.
+//  ▸ Groups / DMs     → /rich, /ping, /debug, /help
+//
+// The /rich command parses tg:// links and builds the media array automatically.
 
 const DEBUG = true;
 
@@ -65,104 +71,71 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Build media descriptor: { html, media }
+// Build media array from tg:// links in HTML
 // ═══════════════════════════════════════════════════════════════════════
-function buildMediaDescriptor(message) {
-  // Photo
+function buildMediaArray(html) {
+  const media = [];
+  const seen = new Set();
+
+  // Match tg://photo?id=..., tg://video?id=..., tg://audio?id=..., tg://document?id=...
+  const re = /tg:\/\/(photo|video|audio|document)\?id=([^"'\s&<>]+)/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const type = m[1];
+    const id = m[2];
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    // Map URL scheme to InputMedia type
+    let mediaType;
+    if (type === 'photo')    mediaType = 'photo';
+    else if (type === 'video')   mediaType = 'video';
+    else if (type === 'audio')   mediaType = 'audio';
+    else if (type === 'document') mediaType = 'document';
+    else continue;
+
+    media.push({
+      id: id,
+      media: {
+        type: mediaType,
+        media: id,   // id is the file_id (see PV handler below)
+      },
+    });
+  }
+  return media;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Media → HTML tag (using file_id as id)
+// ═══════════════════════════════════════════════════════════════════════
+function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
-    const id = 'photo_' + p.file_unique_id;
-    return {
-      html: `<img src="tg://photo?id=${id}"/>`,
-      media: [{
-        id: id,
-        media: {
-          type: 'photo',
-          media: p.file_id,
-        }
-      }]
-    };
+    return `<img src="tg://photo?id=${p.file_id}"/>`;
   }
-
-  // Video
   if (message.video) {
-    const v = message.video;
-    const id = 'video_' + v.file_unique_id;
-    return {
-      html: `<video src="tg://video?id=${id}"/>`,
-      media: [{
-        id: id,
-        media: { type: 'video', media: v.file_id }
-      }]
-    };
+    return `<video src="tg://video?id=${message.video.file_id}"/>`;
   }
-
-  // Animation (GIF)
   if (message.animation) {
-    const a = message.animation;
-    const id = 'anim_' + a.file_unique_id;
-    return {
-      html: `<video src="tg://video?id=${id}"/>`,
-      media: [{
-        id: id,
-        media: { type: 'animation', media: a.file_id }
-      }]
-    };
+    return `<video src="tg://video?id=${message.animation.file_id}"/>`;
   }
-
-  // Document
+  if (message.video_note) {
+    return `<video src="tg://video?id=${message.video_note.file_id}"/>`;
+  }
   if (message.document) {
     const d = message.document;
-    const id = 'doc_' + d.file_unique_id;
     const label = d.file_name || 'document';
-    return {
-      html: `<a href="tg://document?id=${id}">${escapeHtml(label)}</a>`,
-      media: [{
-        id: id,
-        media: { type: 'document', media: d.file_id }
-      }]
-    };
+    return `<a href="tg://document?id=${d.file_id}">${escapeHtml(label)}</a>`;
   }
-
-  // Audio
   if (message.audio) {
-    const a = message.audio;
-    const id = 'audio_' + a.file_unique_id;
-    return {
-      html: `<audio src="tg://audio?id=${id}"/>`,
-      media: [{
-        id: id,
-        media: { type: 'audio', media: a.file_id }
-      }]
-    };
+    return `<audio src="tg://audio?id=${message.audio.file_id}"/>`;
   }
-
-  // Voice
   if (message.voice) {
-    const v = message.voice;
-    const id = 'voice_' + v.file_unique_id;
-    return {
-      html: `<audio src="tg://audio?id=${id}"/>`,
-      media: [{
-        id: id,
-        media: { type: 'voice', media: v.file_id }
-      }]
-    };
+    return `<audio src="tg://audio?id=${message.voice.file_id}"/>`;
   }
-
-  // Sticker
   if (message.sticker) {
-    const s = message.sticker;
-    const id = 'sticker_' + s.file_unique_id;
-    return {
-      html: `<img src="tg://photo?id=${id}"/>`,
-      media: [{
-        id: id,
-        media: { type: 'photo', media: s.file_id }
-      }]
-    };
+    return `<img src="tg://photo?id=${message.sticker.file_id}"/>`;
   }
-
   return null;
 }
 
@@ -176,22 +149,12 @@ async function sendRich(env, chatId, replyToId, richMessage, threadId) {
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
   };
   if (threadId != null) payload.message_thread_id = threadId;
-
-  let r = await tg(env, 'sendRichMessage', payload);
-  if (r.ok) return r;
-
-  // If rich send fails, try sending the HTML as plain text so the user still gets something
-  console.warn('sendRichMessage failed, falling back to plain HTML text:', r.description);
-  if (richMessage.html) {
-    return sendPlain(env, chatId, replyToId, richMessage.html, threadId);
-  }
-  return r;
+  return tg(env, 'sendRichMessage', payload);
 }
-
 async function sendPlain(env, chatId, replyToId, text, threadId) {
   const payload = {
     chat_id: chatId,
-    text: text,
+    text,
     parse_mode: 'HTML',
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
   };
@@ -200,17 +163,16 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler
+// PV media handler — reply with just the tag
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
 
-  const desc = buildMediaDescriptor(message);
-  if (!desc) return false;
+  const tag = mediaTag(message);
+  if (!tag) return false;
 
-  // Send the HTML tag as a copyable code block
-  const tagText = `<code>${escapeHtml(desc.html)}</code>`;
-  const r = await sendPlain(env, message.chat.id, message.message_id, tagText, message.message_thread_id);
+  const text = `<code>${escapeHtml(tag)}</code>`;
+  const r = await sendPlain(env, message.chat.id, message.message_id, text, message.message_thread_id);
   if (!r.ok) console.error('media send failed:', r.description);
   return true;
 }
@@ -221,7 +183,8 @@ async function handleMediaPV(message, env) {
 async function handleHelp(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
     '<b>🤖 Rich Message Bot</b>\n\n' +
-    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with its HTML tag.\n\n' +
+    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a tag.\n' +
+    'Use <code>/rich</code> with that tag to convert it into a rich message.\n\n' +
     '<b>Groups / DMs</b>\n' +
     '<code>/rich</code> reply to HTML, or <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code>\n' +
     '<code>/ping</code> <code>/debug</code> <code>/help</code>',
@@ -247,7 +210,6 @@ async function handleDebug(message, env, update) {
     await sendPlain(env, message.chat.id, message.message_id, text.slice(i, i + CHUNK), message.message_thread_id);
   }
 }
-
 async function handleRich(message, env, args, botId) {
   const threadId = message.message_thread_id;
   const replied = message.reply_to_message;
@@ -275,6 +237,9 @@ async function handleRich(message, env, args, botId) {
   if (!html.trim()) return;
 
   const richMessage = { html };
+  const media = buildMediaArray(html);
+  if (media.length) richMessage.media = media;
+
   const rich = await sendRich(env, message.chat.id, replyToId, richMessage, threadId);
   if (rich.ok) return;
   await sendPlain(env, message.chat.id, replyToId, html, threadId);
@@ -296,6 +261,9 @@ async function handleChannelPost(post, env, isEdit) {
   if (!hasHtmlTag(post.text)) { console.log('[channel] skip: no HTML tag'); return; }
 
   const richMessage = { html: post.text };
+  const media = buildMediaArray(post.text);
+  if (media.length) richMessage.media = media;
+
   const edit = await tg(env, 'editMessageText', {
     chat_id: chatId,
     message_id: msgId,
