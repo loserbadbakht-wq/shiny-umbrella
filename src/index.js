@@ -1,11 +1,11 @@
 // src/index.js
 // Rich Message bot.
 //
-//  ▸ PV media         → replies with a tag using the file_id as the id.
-//  ▸ Channels (admin) → auto-edits HTML posts into rich messages.
+//  ▸ PV media         → replies with a tag using a short id (Cache-API mapped to file_id)
+//  ▸ Channels (admin) → auto-edits HTML posts into rich messages (with media array)
 //  ▸ Groups / DMs     → /rich, /ping, /debug, /help
 //
-// The /rich command parses tg:// links and builds the media array automatically.
+// No KV. Uses caches.default for the id → file_id mapping.
 
 const DEBUG = true;
 
@@ -71,34 +71,71 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Build media array from tg:// links in HTML
+// Cache-based id ↔ file_id mapping (no KV bindings)
 // ═══════════════════════════════════════════════════════════════════════
-function buildMediaArray(html) {
+const CACHE_TTL = 60 * 60 * 24 * 30; // 30 days
+
+function cacheKey(id) {
+  return new Request(`https://rich-bot.internal/media/${id}`);
+}
+
+async function rememberMedia(id, fileId) {
+  const res = new Response(fileId, {
+    headers: { 'Cache-Control': `max-age=${CACHE_TTL}` },
+  });
+  await caches.default.put(cacheKey(id), res);
+}
+
+async function lookupMedia(id) {
+  const res = await caches.default.match(cacheKey(id));
+  return res ? await res.text() : null;
+}
+
+// Short, URL-safe id from a file_id
+function shortId(fileId) {
+  // FNV-1a 32-bit hash, base36-encoded → ~7 chars, safe for tg:// id
+  let h = 0x811c9dc5;
+  for (let i = 0; i < fileId.length; i++) {
+    h ^= fileId.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return 'm' + h.toString(36);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Build media array from tg:// links in HTML (looks up real file_id in cache)
+// ═══════════════════════════════════════════════════════════════════════
+async function buildMediaArray(html) {
   const media = [];
   const seen = new Set();
 
-  // Match tg://photo?id=..., tg://video?id=..., tg://audio?id=..., tg://document?id=...
-  const re = /tg:\/\/(photo|video|audio|document)\?id=([^"'\s&<>]+)/g;
+  // Capture kind (photo/video/audio/document) + id from tg:// links
+  const re = /tg:\/\/(photo|video|audio|document)\?id=([A-Za-z0-9_-]+)/g;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const type = m[1];
+    const kind = m[1];
     const id = m[2];
     if (seen.has(id)) continue;
     seen.add(id);
 
-    // Map URL scheme to InputMedia type
+    const fileId = await lookupMedia(id);
+    if (!fileId) {
+      console.warn(`[media] no cached file_id for id=${id}`);
+      continue;
+    }
+
     let mediaType;
-    if (type === 'photo')    mediaType = 'photo';
-    else if (type === 'video')   mediaType = 'video';
-    else if (type === 'audio')   mediaType = 'audio';
-    else if (type === 'document') mediaType = 'document';
+    if (kind === 'photo')         mediaType = 'photo';
+    else if (kind === 'video')    mediaType = 'video';
+    else if (kind === 'audio')    mediaType = 'audio';
+    else if (kind === 'document') mediaType = 'document';
     else continue;
 
     media.push({
       id: id,
       media: {
         type: mediaType,
-        media: id,   // id is the file_id (see PV handler below)
+        media: fileId,
       },
     });
   }
@@ -106,35 +143,51 @@ function buildMediaArray(html) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media → HTML tag (using file_id as id)
+// Media → HTML tag (short id; real file_id stored in Cache API)
 // ═══════════════════════════════════════════════════════════════════════
-function mediaTag(message) {
+async function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
-    return `<img src="tg://photo?id=${p.file_id}"/>`;
+    const id = shortId(p.file_id);
+    await rememberMedia(id, p.file_id);
+    return `<img src="tg://photo?id=${id}"/>`;
   }
   if (message.video) {
-    return `<video src="tg://video?id=${message.video.file_id}"/>`;
+    const id = shortId(message.video.file_id);
+    await rememberMedia(id, message.video.file_id);
+    return `<video src="tg://video?id=${id}"/>`;
   }
   if (message.animation) {
-    return `<video src="tg://video?id=${message.animation.file_id}"/>`;
+    const id = shortId(message.animation.file_id);
+    await rememberMedia(id, message.animation.file_id);
+    return `<video src="tg://video?id=${id}"/>`;
   }
   if (message.video_note) {
-    return `<video src="tg://video?id=${message.video_note.file_id}"/>`;
+    const id = shortId(message.video_note.file_id);
+    await rememberMedia(id, message.video_note.file_id);
+    return `<video src="tg://video?id=${id}"/>`;
   }
   if (message.document) {
     const d = message.document;
+    const id = shortId(d.file_id);
+    await rememberMedia(id, d.file_id);
     const label = d.file_name || 'document';
-    return `<a href="tg://document?id=${d.file_id}">${escapeHtml(label)}</a>`;
+    return `<a href="tg://document?id=${id}">${escapeHtml(label)}</a>`;
   }
   if (message.audio) {
-    return `<audio src="tg://audio?id=${message.audio.file_id}"/>`;
+    const id = shortId(message.audio.file_id);
+    await rememberMedia(id, message.audio.file_id);
+    return `<audio src="tg://audio?id=${id}"/>`;
   }
   if (message.voice) {
-    return `<audio src="tg://audio?id=${message.voice.file_id}"/>`;
+    const id = shortId(message.voice.file_id);
+    await rememberMedia(id, message.voice.file_id);
+    return `<audio src="tg://audio?id=${id}"/>`;
   }
   if (message.sticker) {
-    return `<img src="tg://photo?id=${message.sticker.file_id}"/>`;
+    const id = shortId(message.sticker.file_id);
+    await rememberMedia(id, message.sticker.file_id);
+    return `<img src="tg://photo?id=${id}"/>`;
   }
   return null;
 }
@@ -168,7 +221,7 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
 
-  const tag = mediaTag(message);
+  const tag = await mediaTag(message);
   if (!tag) return false;
 
   const text = `<code>${escapeHtml(tag)}</code>`;
@@ -183,7 +236,7 @@ async function handleMediaPV(message, env) {
 async function handleHelp(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
     '<b>🤖 Rich Message Bot</b>\n\n' +
-    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a tag.\n' +
+    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a short tag.\n' +
     'Use <code>/rich</code> with that tag to convert it into a rich message.\n\n' +
     '<b>Groups / DMs</b>\n' +
     '<code>/rich</code> reply to HTML, or <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code>\n' +
@@ -237,8 +290,10 @@ async function handleRich(message, env, args, botId) {
   if (!html.trim()) return;
 
   const richMessage = { html };
-  const media = buildMediaArray(html);
+  const media = await buildMediaArray(html);
   if (media.length) richMessage.media = media;
+
+  if (DEBUG) console.log('rich payload:', JSON.stringify(richMessage).slice(0, 800));
 
   const rich = await sendRich(env, message.chat.id, replyToId, richMessage, threadId);
   if (rich.ok) return;
@@ -261,8 +316,10 @@ async function handleChannelPost(post, env, isEdit) {
   if (!hasHtmlTag(post.text)) { console.log('[channel] skip: no HTML tag'); return; }
 
   const richMessage = { html: post.text };
-  const media = buildMediaArray(post.text);
+  const media = await buildMediaArray(post.text);
   if (media.length) richMessage.media = media;
+
+  if (DEBUG) console.log('channel rich payload:', JSON.stringify(richMessage).slice(0, 800));
 
   const edit = await tg(env, 'editMessageText', {
     chat_id: chatId,
