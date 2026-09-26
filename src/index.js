@@ -1,24 +1,15 @@
 // src/index.js
-// Telegram Rich Message bot — privacy-mode friendly.
-//
-// In groups with privacy mode ON, the bot only receives:
-//   • /commands
-//   • messages that contain @botusername
-//   • replies to the bot's own messages
-//
-// Trigger flow:
-//   [user]  HTML message
-//   [user]  reply to it with @botusername
-//   [bot]   Rich Message reply, attached to the HTML message
-//
-// Plain chatter (no mention, no HTML) → bot stays silent. No echo.
+// Rich Message bot. Handles BOTH reply conventions for sendRichMessage:
+//   1) reply_parameters: { message_id }
+//   2) reply_to_message_id + allow_sending_without_reply
+// The API returns ok:true even when it silently ignores the reply field,
+// so we verify by inspecting the returned message.
 
 const DEBUG = true;
 
-// ---------- Telegram helper ----------
+// ---------- Telegram ----------
 async function tg(env, method, payload) {
-  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
-  const res = await fetch(url, {
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -26,15 +17,10 @@ async function tg(env, method, payload) {
   const txt = await res.text();
   let data;
   try { data = JSON.parse(txt); } catch { data = { ok: false, raw: txt }; }
-  if (!res.ok || data.ok === false) {
-    console.error(`[tg:${method}] HTTP ${res.status} →`, txt.slice(0, 600));
-  } else if (DEBUG) {
-    console.log(`[tg:${method}] ok`);
-  }
+  if (!res.ok || data.ok === false) console.error(`[tg:${method}] ${res.status}:`, txt.slice(0, 600));
   return data;
 }
 
-// ---------- Bot identity ----------
 let BOT_INFO = null;
 async function getBotInfo(env) {
   if (BOT_INFO) return BOT_INFO;
@@ -49,7 +35,6 @@ function stripBotMention(text, username) {
   const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return text.replace(new RegExp(`@${esc}\\b`, 'gi'), '').trim();
 }
-
 function isCmd(message, username, cmd) {
   const raw = (message.text || message.caption || '').trim();
   if (!raw) return false;
@@ -59,18 +44,14 @@ function isCmd(message, username, cmd) {
     : new RegExp(`^/${cmd}(?:\\s|$)`, 'i');
   return re.test(raw);
 }
-
-// Any `<tag>` — matches both rich-only (`<tg-map/>`) and standard (`<b>`) markup
 function hasRichHtml(text) {
-  if (!text) return false;
-  return /<\s*\/?\s*[a-z][^>]*>/i.test(text);
+  return !!text && /<\s*\/?\s*[a-z][^>]*>/i.test(text);
 }
-
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// ---------- Pick HTML source + which message to reply to ----------
+// ---------- Resolve target ----------
 function resolveTarget(message, username) {
   const incoming = message.text || message.caption || '';
   const replied  = message.reply_to_message;
@@ -95,28 +76,68 @@ function resolveTarget(message, username) {
   };
 }
 
-// ---------- Send helpers ----------
-function sendRich(env, chatId, replyToId, html) {
-  return tg(env, 'sendRichMessage', {
-    chat_id: chatId,
-    rich_message: { html },
-    reply_parameters: { message_id: replyToId },
-  });
+// ---------- sendRichMessage with reply-convention fallbacks ----------
+// Telegram's sendRichMessage has been observed to ignore `reply_parameters`
+// and only honor `reply_to_message_id`. We try both and verify by inspecting
+// the returned message's `reply_to_message`.
+async function sendRichReply(env, chatId, replyToId, html) {
+  const attempts = [
+    {
+      label: 'reply_parameters',
+      payload: {
+        chat_id: chatId,
+        rich_message: { html },
+        reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
+      },
+    },
+    {
+      label: 'reply_to_message_id',
+      payload: {
+        chat_id: chatId,
+        rich_message: { html },
+        reply_to_message_id: replyToId,
+        allow_sending_without_reply: true,
+      },
+    },
+    {
+      label: 'no-reply',
+      payload: {
+        chat_id: chatId,
+        rich_message: { html },
+      },
+    },
+  ];
+
+  const log = [];
+  for (const a of attempts) {
+    const r = await tg(env, 'sendRichMessage', a.payload);
+    const attached = r?.result?.reply_to_message?.message_id;
+    log.push({
+      attempt: a.label,
+      ok: !!r?.ok,
+      err: r?.description,
+      replied_to: attached ?? null,
+    });
+    if (r?.ok) {
+      return { result: r, attached, usedLabel: a.label, log };
+    }
+  }
+  return { result: { ok: false, description: 'all attempts failed' }, attached: null, log };
 }
 
-function sendPlain(env, chatId, replyToId, text) {
+async function sendPlain(env, chatId, replyToId, text) {
   return tg(env, 'sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
-    reply_parameters: { message_id: replyToId },
+    reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
   });
 }
 
 // ---------- Commands ----------
 async function handlePing(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
-    `🏓 pong\nchat_id: <code>${escapeHtml(message.chat.id)}</code>\ntype: <code>${escapeHtml(message.chat.type)}</code>`);
+    `🏓 pong\nchat: <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`);
 }
 
 async function handleDebug(message, env, update) {
@@ -124,35 +145,32 @@ async function handleDebug(message, env, update) {
   const username = bot.username || '';
   const target = resolveTarget(message, username);
 
-  const probeHtml = target.html || '<b>debug probe</b>';
-  const probe = await sendRich(env, message.chat.id, target.replyToMessageId, probeHtml);
-
-  const probeLine = probe.ok
-    ? `✅ ok — reply msg_id <code>${escapeHtml(probe.result?.message_id)}</code>`
-    : `❌ <code>${escapeHtml((probe.description || probe.raw || 'unknown').slice(0, 500))}</code>`;
+  const probe = await sendRichReply(
+    env, message.chat.id, target.replyToMessageId,
+    target.html || '<b>debug probe</b>'
+  );
 
   const lines = [
     '<b>🛠 /debug</b>',
-    `<b>Bot:</b> @${escapeHtml(username)} (id <code>${escapeHtml(bot.id)}</code>)`,
+    `<b>Bot:</b> @${escapeHtml(username)}`,
     `<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`,
     '',
     '<b>Incoming</b>',
-    `id: <code>${escapeHtml(message.message_id)}</code>`,
-    `text: <pre>${escapeHtml((message.text || message.caption || '').slice(0, 200))}</pre>`,
-    `has reply_to_message: ${!!message.reply_to_message}`,
+    `msg_id: <code>${escapeHtml(message.message_id)}</code>`,
     `reply_to.id: <code>${escapeHtml(message.reply_to_message?.message_id ?? '—')}</code>`,
-    `reply_to.text: <pre>${escapeHtml((message.reply_to_message?.text || message.reply_to_message?.caption || '—').slice(0, 200))}</pre>`,
+    `reply_to.text: <pre>${escapeHtml((message.reply_to_message?.text || message.reply_to_message?.caption || '—').slice(0, 160))}</pre>`,
     '',
-    '<b>Resolved</b>',
+    '<b>Resolved target</b>',
     `reply_to_message_id: <code>${escapeHtml(target.replyToMessageId)}</code>`,
     `reason: ${escapeHtml(target.reason)}`,
-    `html length: ${target.html.length}`,
-    `html: <pre>${escapeHtml(target.html.slice(0, 400))}</pre>`,
     '',
-    `<b>Update keys:</b> <code>${escapeHtml(Object.keys(update).join(', '))}</code>`,
+    '<b>sendRichMessage attempts</b>',
+    `<pre>${escapeHtml(JSON.stringify(probe.log, null, 2))}</pre>`,
+    `<b>Used attempt:</b> <code>${escapeHtml(probe.usedLabel || '—')}</code>`,
+    `<b>Attached to msg:</b> <code>${escapeHtml(probe.attached ?? 'null — NOT A REPLY')}</code>`,
     '',
-    '<b>sendRichMessage probe:</b>',
-    probeLine,
+    '<b>Update keys</b>',
+    `<code>${escapeHtml(Object.keys(update).join(', '))}</code>`,
   ];
 
   await sendPlain(env, message.chat.id, message.message_id, lines.join('\n'));
@@ -163,35 +181,44 @@ async function handle(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
 
-  if (DEBUG) {
-    console.log('incoming:', JSON.stringify({
-      msg_id: message.message_id,
-      chat_id: message.chat.id,
-      chat_type: message.chat.type,
-      text: (message.text || message.caption || '').slice(0, 120),
-      reply_to_id: message.reply_to_message?.message_id,
-      reply_to_text: (message.reply_to_message?.text || '').slice(0, 120),
-    }));
-  }
+  if (DEBUG) console.log('incoming:', JSON.stringify({
+    msg_id: message.message_id,
+    chat_id: message.chat.id,
+    chat_type: message.chat.type,
+    reply_to_id: message.reply_to_message?.message_id,
+    text: (message.text || message.caption || '').slice(0, 120),
+  }));
 
   if (isCmd(message, username, 'ping'))  return handlePing(message, env);
   if (isCmd(message, username, 'debug')) return handleDebug(message, env, update);
 
   const target = resolveTarget(message, username);
-
-  if (!target.html) {
-    if (DEBUG) console.log('skip: empty html');
-    return;
-  }
+  if (!target.html) return;
   if (target.reason === 'plain') {
-    if (DEBUG) console.log('skip: no HTML markup, plain chatter');
+    if (DEBUG) console.log('skip: plain chatter, no HTML');
     return;
   }
 
-  const rich = await sendRich(env, message.chat.id, target.replyToMessageId, target.html);
-  if (!rich.ok) {
+  const { result, attached, usedLabel } = await sendRichReply(
+    env, message.chat.id, target.replyToMessageId, target.html
+  );
+
+  if (!result.ok) {
     await sendPlain(env, message.chat.id, target.replyToMessageId,
-      `<b>❌ sendRichMessage failed</b>\n<pre>${escapeHtml((rich.description || rich.raw || '').slice(0, 700))}</pre>`);
+      `<b>❌ sendRichMessage failed</b>\n<pre>${escapeHtml((result.description || result.raw || '').slice(0, 700))}</pre>`);
+    return;
+  }
+
+  if (DEBUG) {
+    console.log(`sendRichMessage: used=${usedLabel} attached=${attached} expected=${target.replyToMessageId}`);
+  }
+
+  // If even `reply_to_message_id` didn't attach, fall back to a normal
+  // sendMessage reply containing the same rich HTML so the user at least
+  // sees the content attached to the source message.
+  if (attached !== target.replyToMessageId) {
+    console.warn('sendRichMessage did not attach the reply; falling back to sendMessage.');
+    await sendPlain(env, message.chat.id, target.replyToMessageId, target.html);
   }
 }
 
@@ -199,18 +226,15 @@ async function handle(message, env, update) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (request.method === 'GET' && url.pathname === '/') {
       return new Response('✅ Bot running.', { status: 200 });
     }
-
     if (request.method === 'POST' && url.pathname === '/webhook') {
       let update;
       try { update = await request.json(); }
       catch { return new Response('Bad JSON', { status: 400 }); }
 
       console.log('=== update ===', JSON.stringify(update).slice(0, 1200));
-
       try {
         const msg = update.message || update.edited_message;
         if (msg) await handle(msg, env, update);
@@ -219,7 +243,6 @@ export default {
       }
       return new Response('OK', { status: 200 });
     }
-
     return new Response('Not Found', { status: 404 });
   },
 };
