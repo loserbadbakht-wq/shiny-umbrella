@@ -1,11 +1,13 @@
 // src/index.js
 // Rich Message bot.
 //
-//  ▸ PV media         → replies with a tag using a short id (Cache-API mapped to file_id)
-//  ▸ Channels (admin) → auto-edits HTML posts into rich messages (with media array)
-//  ▸ Groups / DMs     → /rich, /ping, /debug, /help
+//  ▸ PV media         → replies with a tag using a short id
+//  ▸ /rich & tag       → builds rich message with media array
+//  ▸ Channels (admin) → auto-edits HTML posts into rich messages
 //
-// No KV. Uses caches.default for the id → file_id mapping.
+// id → file_id is kept in a module-scope Map (fast, same isolate)
+// plus Cloudflare cache as backup. sendRichMessage errors are shown
+// to the user so we can see exactly what the API rejects.
 
 const DEBUG = true;
 
@@ -71,29 +73,35 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Cache-based id ↔ file_id mapping (no KV bindings)
+// id ↔ file_id mapping (module Map + cache backup)
 // ═══════════════════════════════════════════════════════════════════════
-const CACHE_TTL = 60 * 60 * 24 * 30; // 30 days
+const MEDIA_MAP = new Map();          // survives across requests in the same isolate
+const CACHE_TTL = 60 * 60 * 24 * 30;  // 30 days
 
 function cacheKey(id) {
   return new Request(`https://rich-bot.internal/media/${id}`);
 }
 
 async function rememberMedia(id, fileId) {
-  const res = new Response(fileId, {
-    headers: { 'Cache-Control': `max-age=${CACHE_TTL}` },
-  });
-  await caches.default.put(cacheKey(id), res);
+  MEDIA_MAP.set(id, fileId);
+  try {
+    await caches.default.put(cacheKey(id), new Response(fileId, {
+      headers: { 'Cache-Control': `max-age=${CACHE_TTL}` },
+    }));
+  } catch (e) { /* cache optional */ }
 }
 
 async function lookupMedia(id) {
-  const res = await caches.default.match(cacheKey(id));
-  return res ? await res.text() : null;
+  if (MEDIA_MAP.has(id)) return MEDIA_MAP.get(id);
+  try {
+    const res = await caches.default.match(cacheKey(id));
+    if (res) return await res.text();
+  } catch (e) { /* ignore */ }
+  return null;
 }
 
-// Short, URL-safe id from a file_id
+// Short URL-safe id (FNV-1a 32-bit, base36)
 function shortId(fileId) {
-  // FNV-1a 32-bit hash, base36-encoded → ~7 chars, safe for tg:// id
   let h = 0x811c9dc5;
   for (let i = 0; i < fileId.length; i++) {
     h ^= fileId.charCodeAt(i);
@@ -103,13 +111,13 @@ function shortId(fileId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Build media array from tg:// links in HTML (looks up real file_id in cache)
+// Parse tg:// links → media array
 // ═══════════════════════════════════════════════════════════════════════
 async function buildMediaArray(html) {
   const media = [];
   const seen = new Set();
 
-  // Capture kind (photo/video/audio/document) + id from tg:// links
+  // Also match variant src/href forms and allow optional quotes
   const re = /tg:\/\/(photo|video|audio|document)\?id=([A-Za-z0-9_-]+)/g;
   let m;
   while ((m = re.exec(html)) !== null) {
@@ -119,10 +127,8 @@ async function buildMediaArray(html) {
     seen.add(id);
 
     const fileId = await lookupMedia(id);
-    if (!fileId) {
-      console.warn(`[media] no cached file_id for id=${id}`);
-      continue;
-    }
+    console.log(`[media] lookup id=${id} kind=${kind} → ${fileId ? 'hit' : 'MISS'}`);
+    if (!fileId) continue;
 
     let mediaType;
     if (kind === 'photo')         mediaType = 'photo';
@@ -143,7 +149,7 @@ async function buildMediaArray(html) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media → HTML tag (short id; real file_id stored in Cache API)
+// Media → tag
 // ═══════════════════════════════════════════════════════════════════════
 async function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
@@ -202,7 +208,11 @@ async function sendRich(env, chatId, replyToId, richMessage, threadId) {
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
   };
   if (threadId != null) payload.message_thread_id = threadId;
-  return tg(env, 'sendRichMessage', payload);
+
+  console.log('[sendRich] request:', JSON.stringify(payload).slice(0, 1000));
+  const r = await tg(env, 'sendRichMessage', payload);
+  console.log('[sendRich] response:', JSON.stringify(r).slice(0, 800));
+  return r;
 }
 async function sendPlain(env, chatId, replyToId, text, threadId) {
   const payload = {
@@ -216,7 +226,7 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler — reply with just the tag
+// PV media handler
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
@@ -231,13 +241,13 @@ async function handleMediaPV(message, env) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Group commands
+// Commands
 // ═══════════════════════════════════════════════════════════════════════
 async function handleHelp(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
     '<b>🤖 Rich Message Bot</b>\n\n' +
-    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a short tag.\n' +
-    'Use <code>/rich</code> with that tag to convert it into a rich message.\n\n' +
+    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a tag.\n' +
+    'Copy the tag and convert with <code>/rich &lt;tag&gt;</code>.\n\n' +
     '<b>Groups / DMs</b>\n' +
     '<code>/rich</code> reply to HTML, or <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code>\n' +
     '<code>/ping</code> <code>/debug</code> <code>/help</code>',
@@ -254,6 +264,7 @@ async function handleDebug(message, env, update) {
     '<b>🛠 /debug — raw dump</b>',
     `<b>Bot:</b> @${escapeHtml(bot.username || '?')}`,
     `<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code>`,
+    `<b>MEDIA_MAP size:</b> ${MEDIA_MAP.size}`,
     '',
     '<b>── Full update JSON ──</b>',
     `<pre>${escapeHtml(jsonBlock(update, 3600))}</pre>`,
@@ -263,6 +274,7 @@ async function handleDebug(message, env, update) {
     await sendPlain(env, message.chat.id, message.message_id, text.slice(i, i + CHUNK), message.message_thread_id);
   }
 }
+
 async function handleRich(message, env, args, botId) {
   const threadId = message.message_thread_id;
   const replied = message.reply_to_message;
@@ -293,11 +305,23 @@ async function handleRich(message, env, args, botId) {
   const media = await buildMediaArray(html);
   if (media.length) richMessage.media = media;
 
-  if (DEBUG) console.log('rich payload:', JSON.stringify(richMessage).slice(0, 800));
+  console.log('[handleRich] richMessage:', JSON.stringify(richMessage).slice(0, 1000));
 
   const rich = await sendRich(env, message.chat.id, replyToId, richMessage, threadId);
-  if (rich.ok) return;
-  await sendPlain(env, message.chat.id, replyToId, html, threadId);
+
+  if (rich.ok) {
+    console.log('[handleRich] success');
+    return;
+  }
+
+  // Rich failed — tell the user exactly why
+  const errText =
+    `❌ <b>sendRichMessage failed</b>\n` +
+    `description: <code>${escapeHtml((rich.description || 'none').slice(0, 400))}</code>\n` +
+    `error_code: <code>${escapeHtml(rich.error_code ?? '—')}</code>\n\n` +
+    `<b>Payload sent:</b>\n<pre>${escapeHtml(jsonBlock(richMessage, 800))}</pre>`;
+
+  await sendPlain(env, message.chat.id, replyToId, errText, threadId);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -319,8 +343,6 @@ async function handleChannelPost(post, env, isEdit) {
   const media = await buildMediaArray(post.text);
   if (media.length) richMessage.media = media;
 
-  if (DEBUG) console.log('channel rich payload:', JSON.stringify(richMessage).slice(0, 800));
-
   const edit = await tg(env, 'editMessageText', {
     chat_id: chatId,
     message_id: msgId,
@@ -331,7 +353,7 @@ async function handleChannelPost(post, env, isEdit) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Group / DM dispatch
+// Dispatch
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMessage(message, env, update) {
   const bot = await getBotInfo(env);
