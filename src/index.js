@@ -1,7 +1,7 @@
 // src/index.js
 // Rich Message bot.
 //
-//  ▸ PV media        → replies with just the HTML embed in a code block
+//  ▸ PV media         → replies with just the HTML embed tag as a code block
 //  ▸ Channels (admin) → auto-edits HTML posts into rich messages
 //  ▸ Groups / DMs     → /rich, /ping, /debug, /help
 
@@ -69,9 +69,9 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media → HTML embed
+// Media → HTML tag (tg:// deep-link, file_id embedded)
 // ═══════════════════════════════════════════════════════════════════════
-function describeMedia(message) {
+function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
     return `<img src="tg://photo?id=${p.file_id}"/>`;
@@ -130,15 +130,15 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler — just the HTML embed, tap-to-copy
+// PV media handler — reply with just the tag
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
 
-  const embed = describeMedia(message);
-  if (!embed) return false;
+  const tag = mediaTag(message);
+  if (!tag) return false;
 
-  const text = `<code>${escapeHtml(embed)}</code>`;
+  const text = `<code>${escapeHtml(tag)}</code>`;
   const r = await sendPlain(env, message.chat.id, message.message_id, text, message.message_thread_id);
   if (!r.ok) console.error('media send failed:', r.description);
   return true;
@@ -154,7 +154,7 @@ async function handleHelp(message, env) {
     '<b>Groups / DMs</b>\n' +
     '<code>/rich</code> reply to HTML, or <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code>\n' +
     '<code>/ping</code> <code>/debug</code> <code>/help</code>\n\n' +
-    '<b>PV media</b> — send any photo/video/audio/document; the bot replies with its HTML embed.',
+    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with its HTML tag.',
     message.message_thread_id);
 }
 async function handlePing(message, env) {
@@ -242,10 +242,8 @@ async function handleMessage(message, env, update) {
 
   if (DEBUG) console.log('=== msg update ===', JSON.stringify(update).slice(0, 2200));
 
-  // PV media → HTML embed
   if (await handleMediaPV(message, env)) return;
 
-  // Guard: never react to replies to the bot itself
   if (message.reply_to_message?.from?.id === botId) return;
 
   const text = message.text || message.caption || '';
