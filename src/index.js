@@ -1,187 +1,17 @@
 // src/index.js
-// Telegram GUEST BOT: Persian ↔ Tajik Cyrillic transliteration.
-// Update: guest_message. Reply: answerGuestQuery.
-// All Persian values are \u-escaped to prevent Cyrillic lookalike corruption.
+// Rich Message bot — command-driven.
+//
+// Usage in any group (privacy mode ON or OFF):
+//   /rich                        (reply to an HTML message)  → converts it
+//   /rich <b>Hello</b>            (inline HTML)                → converts it
+//   /ping    /debug    /help
+//
+// Commands are ALWAYS delivered to the bot, including their reply_to_message,
+// so this works even when the bot has privacy mode enabled.
 
-// ---------- Cyrillic → Persian letter map ----------
-// (а, и, о are handled positionally in code below)
+const DEBUG = true;
 
-const cyrillicToPersian = {
-  // Vowels
-  'У': '\u0648', 'у': '\u0648',              // و
-  'Ӯ': '\u0648', 'ӯ': '\u0648',              // و
-  'Е': '\u06CC', 'е': '\u06CC',              // ی
-  'Э': '\u06CC', 'э': '\u06CC',              // ی
-  'Ӣ': '\u06CC', 'ӣ': '\u06CC',              // ی
-  'Ё': '\u06CC\u0627', 'ё': '\u06CC\u0627',  // یا
-  'Ю': '\u06CC\u0648', 'ю': '\u06CC\u0648',  // یو
-  'Я': '\u06CC\u0627', 'я': '\u06CC\u0627',  // یا
-
-  // Consonants
-  'Б': '\u0628', 'б': '\u0628',              // ب
-  'В': '\u0648', 'в': '\u0648',              // و
-  'Г': '\u06AF', 'г': '\u06AF',              // گ
-  'Ғ': '\u063A', 'ғ': '\u063A',              // غ
-  'Д': '\u062F', 'д': '\u062F',              // د
-  'Ж': '\u0698', 'ж': '\u0698',              // ژ
-  'З': '\u0632', 'з': '\u0632',              // ز
-  'Й': '\u06CC', 'й': '\u06CC',              // ی
-  'К': '\u06A9', 'к': '\u06A9',              // ک
-  'Қ': '\u0642', 'қ': '\u0642',              // ق
-  'Л': '\u0644', 'л': '\u0644',              // ل
-  'М': '\u0645', 'м': '\u0645',              // م
-  'Н': '\u0646', 'н': '\u0646',              // ن
-  'П': '\u067E', 'п': '\u067E',              // پ
-  'Р': '\u0631', 'р': '\u0631',              // ر
-  'С': '\u0633', 'с': '\u0633',              // س
-  'Т': '\u062A', 'т': '\u062A',              // ت
-  'Ф': '\u0641', 'ф': '\u0641',              // ف
-  'Х': '\u062E', 'х': '\u062E',              // خ
-  'Ҳ': '\u062D', 'ҳ': '\u062D',              // ح
-  'Ч': '\u0686', 'ч': '\u0686',              // چ
-  'Ҷ': '\u062C', 'ҷ': '\u062C',              // ج
-  'Ш': '\u0634', 'ш': '\u0634',              // ش
-  'Ъ': '\u0639', 'ъ': '\u0639',              // ع
-};
-
-// ---------- Persian → Cyrillic letter map ----------
-const persianToCyrillic = {
-  '\u0627': 'а',  // ا
-  '\u0622': 'о',  // آ
-  '\u0623': 'а',  // أ
-  '\u0625': 'и',  // إ
-  '\u0628': 'б',  // ب
-  '\u067E': 'п',  // پ
-  '\u062A': 'т',  // ت
-  '\u062B': 'с',  // ث
-  '\u062C': 'ҷ',  // ج
-  '\u0686': 'ч',  // چ
-  '\u062D': 'ҳ',  // ح
-  '\u062E': 'х',  // خ
-  '\u062F': 'д',  // د
-  '\u0630': 'з',  // ذ
-  '\u0631': 'р',  // ر
-  '\u0632': 'з',  // ز
-  '\u0698': 'ж',  // ژ
-  '\u0633': 'с',  // س
-  '\u0634': 'ш',  // ش
-  '\u0635': 'с',  // ص
-  '\u0636': 'з',  // ض
-  '\u0637': 'т',  // ط
-  '\u0638': 'з',  // ظ
-  '\u0639': 'ъ',  // ع
-  '\u063A': 'ғ',  // غ
-  '\u0641': 'ф',  // ف
-  '\u0642': 'қ',  // ق
-  '\u06A9': 'к',  // ک
-  '\u06AF': 'г',  // گ
-  '\u0644': 'л',  // ل
-  '\u0645': 'м',  // م
-  '\u0646': 'н',  // ن
-  '\u0648': 'в',  // و
-  '\u0647': 'ҳ',  // ه
-  '\u06CC': 'й',  // ی
-  '\u0621': 'ъ',  // ء
-  '\u0624': 'у',  // ؤ
-  '\u0626': 'й',  // ئ
-  '\u0629': 'ҳ',  // ة
-};
-
-// ---------- Punctuation maps ----------
-const latinToPersianPunct = {
-  ',': '\u060C',  // ،
-  ';': '\u061B',  // ؛
-  '?': '\u061F',  // ؟
-};
-
-const persianToLatinPunct = {
-  '\u060C': ',',  // ،
-  '\u061B': ';',  // ؛
-  '\u061F': '?',  // ؟
-};
-
-// ---------- Position-aware Cyrillic → Persian ----------
-function cyrillicToPersianText(text) {
-  const chars = Array.from(text);
-  const isLetter = (c) => c != null && /\p{L}/u.test(c);
-  let out = '';
-
-  for (let i = 0; i < chars.length; i++) {
-    const ch = chars[i];
-    const prev = chars[i - 1];
-    const next = chars[i + 1];
-    const atStart = !isLetter(prev);
-    const atEnd = !isLetter(next);
-
-    if (ch === 'а' || ch === 'А') {
-      // Short /a/: ا at word start, ه at word end, dropped medially
-      out += atStart ? '\u0627' : atEnd ? '\u0647' : '';
-    } else if (ch === 'и' || ch === 'И') {
-      // Tajik и can be either Persian short kasra (unwritten) or long ی.
-      // Heuristic: и before к → ی (Тоҷик → تاجیک, Тоҷикистон → تاجیکستان).
-      // Word-initial → ا; word-final → ی; otherwise dropped.
-      if (next === 'к' || next === 'К') {
-        out += '\u06CC';                 // ی
-      } else if (atStart) {
-        out += '\u0627';                 // ا
-      } else if (atEnd) {
-        out += '\u06CC';                 // ی
-      }
-      // else: dropped
-    } else if (ch === 'о' || ch === 'О') {
-      // /ɔ/: آ at word start, ا otherwise
-      out += atStart ? '\u0622' : '\u0627';
-    } else if (latinToPersianPunct[ch]) {
-      out += latinToPersianPunct[ch];
-    } else {
-      out += cyrillicToPersian[ch] ?? ch;
-    }
-  }
-  return out;
-}
-
-// ---------- Persian → Cyrillic (capitalize at word start) ----------
-function persianToCyrillicText(text) {
-  let out = '';
-  let atWordStart = true;
-  for (const ch of text) {
-    if (persianToLatinPunct[ch]) {
-      out += persianToLatinPunct[ch];
-      atWordStart = true;
-      continue;
-    }
-    if (/[\s\p{P}\p{S}]/u.test(ch)) {
-      out += ch;
-      atWordStart = true;
-      continue;
-    }
-    const mapped = persianToCyrillic[ch];
-    if (mapped === undefined) {
-      out += ch;
-    } else {
-      out += atWordStart ? mapped.toUpperCase() : mapped;
-    }
-    atWordStart = false;
-  }
-  return out;
-}
-
-// ---------- Script detection ----------
-function detectScript(text) {
-  const fa = (text.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g) || []).length;
-  const cy = (text.match(/[\u0400-\u04FF]/g) || []).length;
-  if (!fa && !cy) return 'unknown';
-  return fa > cy ? 'persian' : cy > fa ? 'cyrillic' : 'unknown';
-}
-
-function convert(text) {
-  const s = detectScript(text);
-  if (s === 'persian')  return { converted: persianToCyrillicText(text),  direction: 'Persian → Cyrillic' };
-  if (s === 'cyrillic') return { converted: cyrillicToPersianText(text), direction: 'Cyrillic → Persian' };
-  return null;
-}
-
-// ---------- Telegram helper ----------
+// ---------- Telegram ----------
 async function tg(env, method, payload) {
   const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: 'POST',
@@ -189,86 +19,234 @@ async function tg(env, method, payload) {
     body: JSON.stringify(payload),
   });
   const txt = await res.text();
-  if (!res.ok) console.error(`Telegram ${method} failed: ${res.status} ${txt}`);
-  try { return JSON.parse(txt); } catch { return { ok: false, raw: txt }; }
+  let data;
+  try { data = JSON.parse(txt); } catch { data = { ok: false, raw: txt }; }
+  if (!res.ok || data.ok === false) console.error(`[tg:${method}] ${res.status}:`, txt.slice(0, 800));
+  else if (DEBUG) console.log(`[tg:${method}] ok`);
+  return data;
 }
 
-// ---------- Guest handler ----------
-async function handleGuestMessage(update, env) {
-  const msg = update.guest_message;
-  if (!msg) return;
+let BOT_INFO = null;
+async function getBotInfo(env) {
+  if (BOT_INFO) return BOT_INFO;
+  BOT_INFO = (await tg(env, 'getMe', {}))?.result || {};
+  return BOT_INFO;
+}
 
-  const guestQueryId = msg.guest_query_id;
-  if (!guestQueryId) {
-    console.error('guest_message without guest_query_id:', JSON.stringify(msg));
+// ---------- Helpers ----------
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function jsonBlock(obj, max = 3000) {
+  let s; try { s = JSON.stringify(obj, null, 2); } catch { s = String(obj); }
+  if (s.length > max) s = s.slice(0, max) + `\n…[+${s.length - max}]`;
+  return s;
+}
+function hasRichHtml(t) { return !!t && /<\s*\/?\s*[a-z][^>]*>/i.test(t); }
+
+// ---------- Command parsing ----------
+// Accepts: /rich, /rich@BotUsername, /rich <args...>
+// Rejects commands targeted at other bots.
+function parseCommand(text, botUsername) {
+  if (!text) return null;
+  const m = text.match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+  const [, cmd, target, args] = m;
+  if (target && target.toLowerCase() !== (botUsername || '').toLowerCase()) return null;
+  return { cmd: cmd.toLowerCase(), args: (args || '').trim() };
+}
+
+// ---------- Extract content from any message ----------
+function extractContent(msg) {
+  if (!msg) return { html: '', kind: 'none' };
+  if (typeof msg.text === 'string' && msg.text.length)       return { html: msg.text,    kind: 'text' };
+  if (typeof msg.caption === 'string' && msg.caption.length) return { html: msg.caption, kind: 'caption' };
+  for (const key of ['rich_message', 'rich', 'content', 'html']) {
+    const v = msg[key];
+    if (!v) continue;
+    if (typeof v === 'string') return { html: v, kind: `${key}(string)` };
+    if (typeof v === 'object' && typeof v.html === 'string') return { html: v.html, kind: `${key}.html` };
+    return { html: JSON.stringify(v), kind: `${key}(json)` };
+  }
+  return { html: '', kind: 'none' };
+}
+
+// ---------- Send ----------
+async function sendRich(env, chatId, replyToId, html, threadId) {
+  const payload = {
+    chat_id: chatId,
+    rich_message: { html },
+    reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
+  };
+  if (threadId != null) payload.message_thread_id = threadId;
+
+  let r = await tg(env, 'sendRichMessage', payload);
+  if (r.ok) return r;
+
+  console.warn('sendRichMessage(reply) failed:', r.description);
+  const p2 = { chat_id: chatId, rich_message: { html } };
+  if (threadId != null) p2.message_thread_id = threadId;
+  r = await tg(env, 'sendRichMessage', p2);
+  return r;
+}
+async function sendPlain(env, chatId, replyToId, text, threadId) {
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
+  };
+  if (threadId != null) payload.message_thread_id = threadId;
+  return tg(env, 'sendMessage', payload);
+}
+
+// ---------- Command handlers ----------
+async function handleHelp(message, env) {
+  await sendPlain(env, message.chat.id, message.message_id,
+    '<b>🤖 Rich Message Bot</b>\n\n' +
+    '<b>Commands</b>\n' +
+    '<code>/rich</code> — reply to a message containing HTML, or pass HTML as the argument\n' +
+    '<code>/rich &lt;b&gt;Hello&lt;/b&gt;</code> — convert inline HTML\n' +
+    '<code>/ping</code> — health check\n' +
+    '<code>/debug</code> — dump the raw update\n' +
+    '<code>/help</code> — this message\n\n' +
+    '<b>Supported HTML</b> includes <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;u&gt;</code>, ' +
+    '<code>&lt;s&gt;</code>, <code>&lt;code&gt;</code>, <code>&lt;a href&gt;</code>, ' +
+    '<code>&lt;tg-slideshow&gt;</code>, <code>&lt;tg-collage&gt;</code>, <code>&lt;tg-map&gt;</code>, ' +
+    '<code>&lt;tg-button&gt;</code>, <code>&lt;tg-button-row&gt;</code>, <code>&lt;details&gt;</code>, ' +
+    '<code>&lt;aside&gt;</code>, <code>&lt;tg-emoji&gt;</code>, and more.',
+    message.message_thread_id);
+}
+
+async function handlePing(message, env) {
+  await sendPlain(env, message.chat.id, message.message_id,
+    `🏓 pong\nchat: <code>${escapeHtml(message.chat.id)}</code>\nthread: <code>${escapeHtml(message.message_thread_id ?? '—')}</code>`,
+    message.message_thread_id);
+}
+
+async function handleDebug(message, env, update) {
+  const bot = await getBotInfo(env);
+  const text = [
+    '<b>🛠 /debug — raw dump</b>',
+    `<b>Bot:</b> @${escapeHtml(bot.username || '?')}`,
+    `<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code>`,
+    `<b>thread_id:</b> <code>${escapeHtml(message.message_thread_id ?? '—')}</code>`,
+    '',
+    '<b>── Full update JSON ──</b>',
+    `<pre>${escapeHtml(jsonBlock(update, 3600))}</pre>`,
+  ].join('\n');
+  const CHUNK = 3900;
+  for (let i = 0; i < text.length; i += CHUNK) {
+    await sendPlain(env, message.chat.id, message.message_id, text.slice(i, i + CHUNK), message.message_thread_id);
+  }
+}
+
+// ---------- /rich ----------
+async function handleRich(message, env, args) {
+  const threadId = message.message_thread_id;
+
+  // Source 1: inline HTML after the command
+  // Source 2: the message this command is replying to
+  const replied     = message.reply_to_message;
+  const fromReplied = extractContent(replied);
+
+  let html;
+  let replyToId;
+
+  if (args) {
+    // /rich <html>
+    html = args;
+    replyToId = replied ? replied.message_id : message.message_id;
+  } else if (fromReplied.html) {
+    // /rich as a reply to an HTML message
+    html = fromReplied.html;
+    replyToId = replied.message_id;
+  } else if (replied) {
+    // /rich as a reply to a message with no readable content
+    await sendPlain(env, message.chat.id, replied.message_id,
+      `⚠️ <b>The message you replied to has no readable content.</b>\n` +
+      `extracted kind: <code>${escapeHtml(fromReplied.kind)}</code>\n\n` +
+      `<b>Raw reply_to_message:</b>\n<pre>${escapeHtml(jsonBlock(replied, 2500))}</pre>`,
+      threadId);
+    return;
+  } else {
+    // /rich alone
+    await sendPlain(env, message.chat.id, message.message_id,
+      '⚠️ <b>Nothing to convert.</b>\n\n' +
+      'Either reply to a message containing HTML, or pass the HTML as an argument:\n' +
+      '<code>/rich &lt;b&gt;Hello&lt;/b&gt;</code>',
+      threadId);
     return;
   }
-  console.log('GUEST QUERY ID:', guestQueryId);
 
-  const triggeringText = msg.text || msg.caption || '';
-  const replied = msg.reply_to_message;
-  const sourceText = replied
-    ? (replied.text || replied.caption || '')
-    : triggeringText.replace(/@\w+/g, '').trim();
-
-  if (!sourceText) {
-    return answerGuest(env, guestQueryId,
-      '⚠️ Reply to a message containing Persian or Tajik Cyrillic text, then @mention me.');
+  if (!html.trim()) {
+    await sendPlain(env, message.chat.id, replyToId,
+      '⚠️ Empty input after parsing.',
+      threadId);
+    return;
   }
 
-  const result = convert(sourceText);
-  if (!result) {
-    return answerGuest(env, guestQueryId,
-      '⚠️ Could not detect Persian or Tajik Cyrillic in the referenced message.');
+  if (DEBUG) console.log('rich →', JSON.stringify({ replyToId, threadId, len: html.length }));
+
+  const rich = await sendRich(env, message.chat.id, replyToId, html, threadId);
+  if (rich.ok) {
+    if (DEBUG) console.log(`sendRichMessage ok msg_id=${rich.result?.message_id}`);
+    return;
   }
 
-  return answerGuest(
-    env, guestQueryId,
-    `*${result.direction}*\n\n${result.converted}`,
-    'Markdown'
-  );
+  console.warn('sendRichMessage failed → fallback to plain:', rich.description);
+  const plain = await sendPlain(env, message.chat.id, replyToId, html, threadId);
+  if (!plain.ok) {
+    await sendPlain(env, message.chat.id, replyToId,
+      `<b>❌ All sends failed</b>\n` +
+      `rich: <code>${escapeHtml((rich.description || '').slice(0, 200))}</code>\n` +
+      `plain: <code>${escapeHtml((plain.description || '').slice(0, 200))}</code>`,
+      threadId);
+  }
 }
 
-async function answerGuest(env, guestQueryId, messageText, parseMode) {
-  const inlineResult = {
-    type: 'article',
-    id: `guest-${Date.now()}`,
-    title: 'Transliteration result',
-    input_message_content: {
-      message_text: messageText,
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-    },
-  };
-  const res = await tg(env, 'answerGuestQuery', {
-    guest_query_id: String(guestQueryId),
-    result: inlineResult,
-  });
-  console.log('answerGuestQuery response:', JSON.stringify(res));
-  return res;
+// ---------- Main dispatch ----------
+async function handle(message, env, update) {
+  const bot = await getBotInfo(env);
+  const username = bot.username || '';
+  const text = message.text || message.caption || '';
+
+  if (DEBUG) console.log('=== update ===', JSON.stringify(update).slice(0, 2200));
+
+  const cmd = parseCommand(text, username);
+  if (!cmd) {
+    if (DEBUG) console.log('skip: not a command for this bot');
+    return;
+  }
+
+  switch (cmd.cmd) {
+    case 'start':
+    case 'help': return handleHelp(message, env);
+    case 'ping': return handlePing(message, env);
+    case 'debug': return handleDebug(message, env, update);
+    case 'rich': return handleRich(message, env, cmd.args);
+    default:
+      await sendPlain(env, message.chat.id, message.message_id,
+        `❓ Unknown command <code>/${escapeHtml(cmd.cmd)}</code>. Try /help.`,
+        message.message_thread_id);
+  }
 }
 
 // ---------- Worker ----------
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
-
     if (request.method === 'GET' && url.pathname === '/') {
-      return new Response('✅ Guest Bot is running.', { status: 200 });
-    }
-    if (request.method === 'GET' && url.pathname === '/env') {
-      return Response.json({
-        has_bot_token: Boolean(env.BOT_TOKEN),
-        bot_username: env.BOT_USERNAME || null,
-      });
+      return new Response('✅ Bot running.', { status: 200 });
     }
     if (request.method === 'POST' && url.pathname === '/webhook') {
       let update;
       try { update = await request.json(); }
       catch { return new Response('Bad JSON', { status: 400 }); }
-
-      console.log('RAW UPDATE:', JSON.stringify(update));
-      try { await handleGuestMessage(update, env); }
-      catch (e) { console.error('handleGuestMessage error:', e && e.stack || e); }
+      try {
+        const msg = update.message || update.edited_message;
+        if (msg) await handle(msg, env, update);
+      } catch (e) { console.error('handler error:', e && e.stack || e); }
       return new Response('OK', { status: 200 });
     }
     return new Response('Not Found', { status: 404 });
