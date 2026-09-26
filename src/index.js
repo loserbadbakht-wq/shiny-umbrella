@@ -2,8 +2,7 @@
 // Rich Message bot.
 //
 //  ▸ Channels (bot admin + Edit messages right):
-//      Auto-converts posts containing HTML into rich messages.
-//      Tries editMessageText(rich) first, falls back to delete+resend.
+//      Auto-converts posts containing HTML into rich messages via editMessageText.
 //
 //  ▸ Groups / DMs:
 //      /rich, /ping, /debug, /help
@@ -170,7 +169,7 @@ async function handleRich(message, env, args, botId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Channel auto-convert (with diagnostics)
+// Channel auto-convert (edit only)
 // ═══════════════════════════════════════════════════════════════════════
 async function handleChannelPost(post, env, isEdit) {
   const chatId = post.chat.id;
@@ -180,47 +179,21 @@ async function handleChannelPost(post, env, isEdit) {
     `from=${post.from?.id ?? '?'} is_bot=${!!post.from?.is_bot} ` +
     `has_text=${!!post.text} has_rich=${!!post.rich_message}`);
 
-  if (post.rich_message) { console.log('[channel] skip: already rich'); return; }
-  if (post.from?.is_bot) { console.log('[channel] skip: authored by bot'); return; }
-  if (!post.text)        { console.log('[channel] skip: no text (media caption?)'); return; }
-  if (!hasHtmlTag(post.text)) { console.log('[channel] skip: no HTML tag in text'); return; }
+  if (post.rich_message)          { console.log('[channel] skip: already rich'); return; }
+  if (post.from?.is_bot)          { console.log('[channel] skip: authored by bot'); return; }
+  if (!post.text)                 { console.log('[channel] skip: no text'); return; }
+  if (!hasHtmlTag(post.text))     { console.log('[channel] skip: no HTML tag'); return; }
 
   console.log('[channel] attempting rich edit for', chatId, msgId);
 
-  // Attempt 1: editMessageText with rich_message
   const edit = await tg(env, 'editMessageText', {
     chat_id: chatId,
     message_id: msgId,
     rich_message: { html: post.text },
   });
 
-  if (edit.ok) {
-    console.log('[channel] rich edit ok');
-    return;
-  }
-
-  console.warn('[channel] editMessageText(rich) failed →', edit.description);
-
-  // Attempt 2: delete original + resend as rich
-  // Requires the bot to have Delete Messages right in the channel.
-  const del = await tg(env, 'deleteMessage', {
-    chat_id: chatId,
-    message_id: msgId,
-  });
-  if (!del.ok) {
-    console.error('[channel] delete failed:', del.description);
-    return;
-  }
-
-  const send = await tg(env, 'sendRichMessage', {
-    chat_id: chatId,
-    rich_message: { html: post.text },
-  });
-  if (!send.ok) {
-    console.error('[channel] resend rich failed:', send.description);
-  } else {
-    console.log('[channel] delete+resend fallback ok → new msg', send.result?.message_id);
-  }
+  if (edit.ok) console.log('[channel] rich edit ok');
+  else         console.error('[channel] edit failed:', edit.description);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -268,8 +241,8 @@ export default {
       catch { return new Response('Bad JSON', { status: 400 }); }
 
       try {
-        if (update.channel_post)               await handleChannelPost(update.channel_post, env, false);
-        else if (update.edited_channel_post)   await handleChannelPost(update.edited_channel_post, env, true);
+        if (update.channel_post)             await handleChannelPost(update.channel_post, env, false);
+        else if (update.edited_channel_post) await handleChannelPost(update.edited_channel_post, env, true);
         else if (update.message || update.edited_message)
           await handleMessage(update.message || update.edited_message, env, update);
       } catch (e) {
