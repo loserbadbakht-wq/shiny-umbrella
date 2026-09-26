@@ -1,5 +1,6 @@
 // src/index.js
-// Robust stateless bot — always replies, always logs, falls back if rich isn't supported.
+// Rich-message bot. Converts HTML → Rich Message.
+// Silent on plain chatter. Reports exact errors instead of silently echoing.
 
 async function tg(env, method, payload) {
   const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
@@ -19,8 +20,7 @@ async function tg(env, method, payload) {
 let BOT_INFO = null;
 async function getBotInfo(env) {
   if (BOT_INFO) return BOT_INFO;
-  const r = await tg(env, 'getMe', {});
-  BOT_INFO = r?.result || {};
+  BOT_INFO = (await tg(env, 'getMe', {}))?.result || {};
   return BOT_INFO;
 }
 
@@ -39,9 +39,18 @@ function isCmd(message, username, cmd) {
   return re.test(raw);
 }
 
+// Does the text look like a rich-HTML post rather than plain chatter?
+// We only auto-convert messages that actually contain markup.
+function hasRichHtml(text) {
+  if (!text) return false;
+  return /<\/?(?:tg-[a-z0-9-]+|[a-z]+(?:\s+[a-z-]+=|\s*>))/i.test(text) ||
+         /<[a-z]+[^>]*>/i.test(text);
+}
+
 function resolveTarget(message, username) {
   const incoming = message.text || message.caption || '';
   const replied = message.reply_to_message;
+
   if (replied) {
     const repliedText = replied.text || replied.caption || '';
     if (repliedText.trim()) {
@@ -49,38 +58,34 @@ function resolveTarget(message, username) {
       return {
         html: extra ? `${repliedText}\n\n${extra}` : repliedText,
         replyToMessageId: replied.message_id,
+        reason: 'reply',
       };
     }
   }
+
+  const cleaned = stripBotMention(incoming, username);
   return {
-    html: stripBotMention(incoming, username),
+    html: cleaned,
     replyToMessageId: message.message_id,
+    reason: hasRichHtml(cleaned) ? 'has-html' : 'plain',
   };
-}
-
-// Try rich first, fall back to plain HTML message. Always replies to the SOURCE.
-async function sendReply(env, chatId, replyToMessageId, html) {
-  // 1) Try Rich Message
-  const rich = await tg(env, 'sendRichMessage', {
-    chat_id: chatId,
-    rich_message: { html },
-    reply_parameters: { message_id: replyToMessageId },
-  });
-  if (rich.ok) return { via: 'sendRichMessage', message_id: rich.result?.message_id };
-
-  // 2) Fall back to plain sendMessage with HTML parse mode
-  console.warn('sendRichMessage failed, falling back to sendMessage:', JSON.stringify(rich).slice(0, 300));
-  const plain = await tg(env, 'sendMessage', {
-    chat_id: chatId,
-    text: html,
-    parse_mode: 'HTML',
-    reply_parameters: { message_id: replyToMessageId },
-  });
-  return { via: 'sendMessage(fallback)', message_id: plain.result?.message_id, fallback: rich };
 }
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Send a short plain diagnostic to the chat (never rich, always visible)
+async function reportError(env, chatId, replyToId, title, detail) {
+  const text =
+    `<b>${escapeHtml(title)}</b>\n` +
+    `<pre>${escapeHtml(String(detail).slice(0, 900))}</pre>`;
+  await tg(env, 'sendMessage', {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    reply_parameters: { message_id: replyToId },
+  });
 }
 
 async function handlePing(message, env) {
@@ -97,29 +102,35 @@ async function handleDebug(message, env, update) {
   const username = bot.username || '';
   const target = resolveTarget(message, username);
 
-  const richTest = await tg(env, 'sendRichMessage', {
+  const probe = await tg(env, 'sendRichMessage', {
     chat_id: message.chat.id,
     rich_message: { html: target.html || '<b>debug</b>' },
     reply_parameters: { message_id: target.replyToMessageId },
   });
 
+  const probeLine = probe.ok
+    ? `✅ ok — reply id <code>${escapeHtml(probe.result?.message_id)}</code>`
+    : `❌ <code>${escapeHtml((probe.description || probe.raw || 'unknown').slice(0, 500))}</code>`;
+
   const lines = [
     '<b>🛠 /debug</b>',
-    `<b>Bot:</b> <code>@${escapeHtml(username)}</code> (id <code>${escapeHtml(bot.id)}</code>)`,
-    `<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`,
-    `<b>Message id:</b> <code>${escapeHtml(message.message_id)}</code>`,
+    `<b>Bot:</b> <code>@${escapeHtml(username)}</code>`,
+    `<b>Chat id:</b> <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`,
+    `<b>Msg id:</b> <code>${escapeHtml(message.message_id)}</code>`,
     `<b>Replied to:</b> <code>${escapeHtml(message.reply_to_message?.message_id ?? '—')}</code>`,
     `<b>Reply target:</b> <code>${escapeHtml(target.replyToMessageId)}</code>`,
+    `<b>Reason:</b> ${escapeHtml(target.reason)}`,
+    `<b>Has rich HTML:</b> ${hasRichHtml(target.html)}`,
     `<b>HTML length:</b> ${target.html.length}`,
     `<b>Update keys:</b> <code>${escapeHtml(Object.keys(update).join(', '))}</code>`,
     '',
-    `<b>sendRichMessage probe:</b>`,
-    richTest.ok
-      ? `✅ ok — reply id <code>${escapeHtml(richTest.result?.message_id)}</code>`
-      : `❌ failed — <code>${escapeHtml((richTest.description || richTest.raw || 'unknown').slice(0, 400))}</code>`,
+    '<b>sendRichMessage probe:</b>',
+    probeLine,
+    '',
+    '<b>Resolved HTML (first 500 chars):</b>',
+    `<pre>${escapeHtml(target.html.slice(0, 500))}</pre>`,
   ];
 
-  // /debug always uses plain sendMessage so you SEE output even if rich is broken
   await tg(env, 'sendMessage', {
     chat_id: message.chat.id,
     text: lines.join('\n'),
@@ -132,13 +143,34 @@ async function handle(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
 
-  if (isCmd(message, username, 'ping')) return handlePing(message, env);
+  if (isCmd(message, username, 'ping'))  return handlePing(message, env);
   if (isCmd(message, username, 'debug')) return handleDebug(message, env, update);
 
   const target = resolveTarget(message, username);
   if (!target.html) return;
 
-  await sendReply(env, message.chat.id, target.replyToMessageId, target.html);
+  // ── The key filter ────────────────────────────────────────────────
+  // Reply to a message → always convert the replied HTML.
+  // Standalone message → only convert if it actually contains markup.
+  // Plain chatter → stay silent. No echo.
+  if (target.reason === 'plain') return;
+
+  const rich = await tg(env, 'sendRichMessage', {
+    chat_id: message.chat.id,
+    rich_message: { html: target.html },
+    reply_parameters: { message_id: target.replyToMessageId },
+  });
+
+  if (!rich.ok) {
+    // Do NOT silently echo. Show the exact failure so it's debuggable.
+    await reportError(
+      env,
+      message.chat.id,
+      target.replyToMessageId,
+      '❌ sendRichMessage failed',
+      rich.description || rich.raw || JSON.stringify(rich).slice(0, 800)
+    );
+  }
 }
 
 export default {
