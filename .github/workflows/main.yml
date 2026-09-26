@@ -42,7 +42,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{
               \"url\": \"${WORKER_URL}\",
-              \"allowed_updates\": [\"message\", \"edited_message\", \"guest_message\", \"inline_query\"]
+              \"allowed_updates\": [\"message\", \"edited_message\"]
             }" | tee webhook.json
            
           grep -q '"ok":true' webhook.json || (echo "Webhook set failed" && exit 1)
