@@ -1,17 +1,6 @@
 // src/index.js
-// Rich Message bot — privacy-mode friendly.
-//
-// Sources of HTML (in priority order, per message):
-//   message.text          → normal text / caption
-//   message.rich_message  → a rich message (bot or user posted with parse_mode rich)
-//
-// Trigger flows:
-//   [user]  HTML text or rich message
-//   [user]  reply to it with @botusername        → rich reply attached to the source
-//   [user]  @botusername <html>                  → rich reply attached to the user's msg
-//   /ping, /debug                                → plain reports only
-//
-// Silent on bare chatter. No visible probe from /debug.
+// Diagnostic build — dumps the ENTIRE update as raw JSON so we can see
+// exactly which fields Telegram sends, especially inside reply_to_message.
 
 const DEBUG = true;
 
@@ -25,11 +14,7 @@ async function tg(env, method, payload) {
   const txt = await res.text();
   let data;
   try { data = JSON.parse(txt); } catch { data = { ok: false, raw: txt }; }
-  if (!res.ok || data.ok === false) {
-    console.error(`[tg:${method}] HTTP ${res.status} →`, txt.slice(0, 600));
-  } else if (DEBUG) {
-    console.log(`[tg:${method}] ok`);
-  }
+  if (!res.ok || data.ok === false) console.error(`[tg:${method}] ${res.status}:`, txt.slice(0, 600));
   return data;
 }
 
@@ -40,79 +25,15 @@ async function getBotInfo(env) {
   return BOT_INFO;
 }
 
-// ---------- Pull HTML out of ANY message object ----------
-// Telegram exposes content in different fields depending on how it was sent.
-function extractContent(msg) {
-  if (!msg) return { html: '', kind: 'none' };
-  if (typeof msg.text === 'string' && msg.text.length)        return { html: msg.text,    kind: 'text' };
-  if (typeof msg.caption === 'string' && msg.caption.length)  return { html: msg.caption, kind: 'caption' };
-  if (msg.rich_message) {
-    if (typeof msg.rich_message.html === 'string')            return { html: msg.rich_message.html, kind: 'rich_message.html' };
-    if (typeof msg.rich_message === 'string')                 return { html: msg.rich_message,      kind: 'rich_message(string)' };
-    return { html: JSON.stringify(msg.rich_message), kind: 'rich_message(json)' };
-  }
-  return { html: '', kind: 'none' };
-}
-
-// ---------- Text helpers ----------
-function stripBotMention(text, username) {
-  if (!text) return '';
-  if (!username) return text.trim();
-  const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return text.replace(new RegExp(`@${esc}\\b`, 'gi'), '').trim();
-}
-function isCmd(message, username, cmd) {
-  const raw = (message.text || message.caption || '').trim();
-  if (!raw) return false;
-  const esc = username ? username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : null;
-  const re = esc
-    ? new RegExp(`^/${cmd}(?:@${esc})?(?:\\s|$)`, 'i')
-    : new RegExp(`^/${cmd}(?:\\s|$)`, 'i');
-  return re.test(raw);
-}
-function hasRichHtml(text) {
-  return !!text && /<\s*\/?\s*[a-z][^>]*>/i.test(text);
+// ---------- Dump helpers ----------
+function jsonBlock(obj, max = 3500) {
+  let s;
+  try { s = JSON.stringify(obj, null, 2); } catch { s = String(obj); }
+  if (s.length > max) s = s.slice(0, max) + `\n…[truncated ${s.length - max} chars]`;
+  return s;
 }
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// ---------- Resolve source + reply target ----------
-function resolveTarget(message, username) {
-  const incoming       = extractContent(message);                 // what the user typed
-  const incomingStripped = stripBotMention(incoming.html, username);
-  const repliedMsg     = message.reply_to_message;
-  const replied        = extractContent(repliedMsg);              // the replied-to message
-
-  if (repliedMsg) {
-    // Combine replied content + (stripped) own content
-    let html;
-    if (replied.html && incomingStripped) html = `${replied.html}\n\n${incomingStripped}`;
-    else if (replied.html)                html = replied.html;
-    else                                  html = incomingStripped;
-
-    let reason;
-    if (replied.html)                                reason = 'reply';
-    else if (incomingStripped && hasRichHtml(incomingStripped)) reason = 'reply-own-html';
-    else if (incomingStripped)                       reason = 'reply-own-plain';
-    else                                             reason = 'reply-empty';
-
-    return {
-      html,
-      replyToMessageId: repliedMsg.message_id,
-      reason,
-      repliedKind: replied.kind,
-      incomingKind: incoming.kind,
-    };
-  }
-
-  return {
-    html: incomingStripped,
-    replyToMessageId: message.message_id,
-    reason: hasRichHtml(incomingStripped) ? 'has-html' : 'plain',
-    repliedKind: '—',
-    incomingKind: incoming.kind,
-  };
 }
 
 // ---------- Send helpers ----------
@@ -135,67 +56,98 @@ function sendPlain(env, chatId, replyToId, text) {
 // ---------- Commands ----------
 async function handlePing(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
-    `🏓 pong\nchat: <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`);
+    `🏓 pong\nchat: <code>${escapeHtml(message.chat.id)}</code>`);
 }
 
+// /debug — dumps EVERYTHING raw
 async function handleDebug(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
-  const target = resolveTarget(message, username);
 
-  const repliedMsg = message.reply_to_message;
-  const repliedContent = extractContent(repliedMsg);
-  const incomingContent = extractContent(message);
+  const parts = [];
+  parts.push('<b>🛠 /debug — raw dump</b>');
+  parts.push(`<b>Bot:</b> @${escapeHtml(username)} (id <code>${escapeHtml(bot.id)}</code>)`);
+  parts.push(`<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`);
+  parts.push('');
+  parts.push('<b>── Full update JSON ──</b>');
+  parts.push(`<pre>${escapeHtml(jsonBlock(update, 3800))}</pre>`);
+  parts.push('');
+  parts.push('<b>── message keys ──</b>');
+  parts.push(`<code>${escapeHtml(Object.keys(message).join(', '))}</code>`);
+  if (message.reply_to_message) {
+    parts.push('');
+    parts.push('<b>── reply_to_message keys ──</b>');
+    parts.push(`<code>${escapeHtml(Object.keys(message.reply_to_message).join(', '))}</code>`);
+  }
 
-  // Which keys are visible on the replied-to message (helps diagnose "no text")
-  const repliedKeys = repliedMsg ? Object.keys(repliedMsg).filter(k =>
-    ['text','caption','rich_message','photo','video','sticker','audio','voice','document','animation','poll','location','venue','contact','dice'].includes(k)
-  ) : [];
-
-  const lines = [
-    '<b>🛠 /debug</b>',
-    `<b>Bot:</b> @${escapeHtml(username)} (id <code>${escapeHtml(bot.id)}</code>)`,
-    `<b>Chat:</b> <code>${escapeHtml(message.chat.id)}</code> (${escapeHtml(message.chat.type)})`,
-    '',
-    '<b>Incoming</b>',
-    `msg_id: <code>${escapeHtml(message.message_id)}</code>`,
-    `kind: <code>${escapeHtml(incomingContent.kind)}</code>`,
-    `text: <pre>${escapeHtml((message.text || message.caption || '').slice(0, 200))}</pre>`,
-    '',
-    '<b>Replied-to message</b>',
-    `id: <code>${escapeHtml(repliedMsg?.message_id ?? '—')}</code>`,
-    `content kind: <code>${escapeHtml(repliedContent.kind)}</code>`,
-    `content keys present: <code>${escapeHtml(repliedKeys.join(', ') || '—')}</code>`,
-    `extracted html: <pre>${escapeHtml(repliedContent.html.slice(0, 300) || '—')}</pre>`,
-    '',
-    '<b>Resolved target</b>',
-    `reply_to_message_id: <code>${escapeHtml(target.replyToMessageId)}</code>`,
-    `reason: <b>${escapeHtml(target.reason)}</b>`,
-    `html length: ${target.html.length}`,
-    `html: <pre>${escapeHtml(target.html.slice(0, 400) || '—')}</pre>`,
-    '',
-    `<b>Update keys:</b> <code>${escapeHtml(Object.keys(update).join(', '))}</code>`,
-    '',
-    '<b>What the bot will do</b>',
-    renderDecision(target),
-  ];
-
-  await sendPlain(env, message.chat.id, message.message_id, lines.join('\n'));
+  // Telegram caps message text at 4096. Split if needed.
+  const text = parts.join('\n');
+  const CHUNK = 3900;
+  for (let i = 0; i < text.length; i += CHUNK) {
+    const slice = text.slice(i, i + CHUNK);
+    await sendPlain(env, message.chat.id, message.message_id, slice);
+  }
 }
 
-function renderDecision(target) {
-  if (!target.html || !target.html.trim()) {
-    return `⚠️ nothing to convert (reason: ${target.reason})`;
+// ---------- Extract content (no whitelist — tries everything) ----------
+function extractContent(msg) {
+  if (!msg) return { html: '', kind: 'none' };
+  if (typeof msg.text === 'string' && msg.text.length)       return { html: msg.text,    kind: 'text' };
+  if (typeof msg.caption === 'string' && msg.caption.length) return { html: msg.caption, kind: 'caption' };
+
+  // Any object that could carry rich content
+  for (const key of ['rich_message', 'rich', 'content', 'html']) {
+    const v = msg[key];
+    if (!v) continue;
+    if (typeof v === 'string') return { html: v, kind: `${key}(string)` };
+    if (typeof v === 'object' && typeof v.html === 'string') return { html: v.html, kind: `${key}.html` };
+    return { html: JSON.stringify(v), kind: `${key}(json)` };
   }
-  switch (target.reason) {
-    case 'plain':           return '🔇 silent (plain chatter, no HTML)';
-    case 'reply-empty':     return '⚠️ replied-to message has NO readable content — nothing to convert';
-    case 'reply-own-plain': return '🔇 silent (own text after mention is plain, not HTML)';
-    case 'reply-own-html':  return `✅ sendRichMessage (own HTML) → reply to ${target.replyToMessageId}`;
-    case 'reply':           return `✅ sendRichMessage (from replied msg) → reply to ${target.replyToMessageId}`;
-    case 'has-html':        return `✅ sendRichMessage → reply to ${target.replyToMessageId}`;
-    default:                return `? unknown reason ${target.reason}`;
+  return { html: '', kind: 'none' };
+}
+
+function stripBotMention(text, username) {
+  if (!text) return '';
+  if (!username) return text.trim();
+  const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return text.replace(new RegExp(`@${esc}\\b`, 'gi'), '').trim();
+}
+function isCmd(message, username, cmd) {
+  const raw = (message.text || message.caption || '').trim();
+  if (!raw) return false;
+  const esc = username ? username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : null;
+  const re = esc
+    ? new RegExp(`^/${cmd}(?:@${esc})?(?:\\s|$)`, 'i')
+    : new RegExp(`^/${cmd}(?:\\s|$)`, 'i');
+  return re.test(raw);
+}
+function hasRichHtml(text) {
+  return !!text && /<\s*\/?\s*[a-z][^>]*>/i.test(text);
+}
+
+function resolveTarget(message, username) {
+  const incoming = extractContent(message);
+  const own      = stripBotMention(incoming.html, username);
+  const replied  = message.reply_to_message;
+  const fromReplied = extractContent(replied);
+
+  if (replied) {
+    const html = fromReplied.html && own
+      ? `${fromReplied.html}\n\n${own}`
+      : fromReplied.html || own;
+    const reason = fromReplied.html ? 'reply'
+                 : own && hasRichHtml(own) ? 'reply-own-html'
+                 : own ? 'reply-own-plain'
+                 : 'reply-empty';
+    return { html, replyToMessageId: replied.message_id, reason, repliedKind: fromReplied.kind };
   }
+
+  return {
+    html: own,
+    replyToMessageId: message.message_id,
+    reason: hasRichHtml(own) ? 'has-html' : 'plain',
+    repliedKind: '—',
+  };
 }
 
 // ---------- Main ----------
@@ -203,18 +155,7 @@ async function handle(message, env, update) {
   const bot = await getBotInfo(env);
   const username = bot.username || '';
 
-  if (DEBUG) {
-    console.log('incoming:', JSON.stringify({
-      msg_id: message.message_id,
-      chat_id: message.chat.id,
-      chat_type: message.chat.type,
-      text: (message.text || message.caption || '').slice(0, 120),
-      has_rich: !!message.rich_message,
-      reply_to_id: message.reply_to_message?.message_id,
-      reply_to_text: (message.reply_to_message?.text || '').slice(0, 120),
-      reply_to_has_rich: !!message.reply_to_message?.rich_message,
-    }));
-  }
+  if (DEBUG) console.log('=== update ===', JSON.stringify(update).slice(0, 2000));
 
   if (isCmd(message, username, 'ping'))  return handlePing(message, env);
   if (isCmd(message, username, 'debug')) return handleDebug(message, env, update);
@@ -223,34 +164,22 @@ async function handle(message, env, update) {
 
   if (target.reason === 'reply-empty') {
     await sendPlain(env, message.chat.id, target.replyToMessageId,
-      '⚠️ The message you replied to has no readable content (photo/sticker with no caption, or a service message).\n\n' +
-      'Reply to a <b>text message</b> or a <b>rich message</b>, or put HTML in the same message after the mention:\n' +
-      `<code>@${escapeHtml(username)} &lt;b&gt;Hello&lt;/b&gt;</code>`);
+      '⚠️ Replied-to message has no readable content from my side. ' +
+      'Send /debug replying to it and I\'ll dump the raw JSON.');
     return;
   }
-  if (target.reason === 'plain') {
-    if (DEBUG) console.log('skip: plain chatter');
-    return;
-  }
+  if (target.reason === 'plain') return;
   if (target.reason === 'reply-own-plain') {
     await sendPlain(env, message.chat.id, target.replyToMessageId,
-      '⚠️ I don\'t see HTML in your message. Include markup like <code>&lt;b&gt;Hello&lt;/b&gt;</code>, or reply to a message that contains HTML.');
+      '⚠️ No HTML detected. Try <code>&lt;b&gt;Hello&lt;/b&gt;</code>.');
     return;
   }
-  if (!target.html || !target.html.trim()) {
-    if (DEBUG) console.log('skip: empty html');
-    return;
-  }
+  if (!target.html || !target.html.trim()) return;
 
   const rich = await sendRich(env, message.chat.id, target.replyToMessageId, target.html);
   if (!rich.ok) {
     await sendPlain(env, message.chat.id, target.replyToMessageId,
       `<b>❌ sendRichMessage failed</b>\n<pre>${escapeHtml((rich.description || rich.raw || '').slice(0, 700))}</pre>`);
-    return;
-  }
-  if (DEBUG) {
-    const attached = rich?.result?.reply_to_message?.message_id ?? null;
-    console.log(`sendRichMessage: attached=${attached} expected=${target.replyToMessageId}`);
   }
 }
 
@@ -262,13 +191,10 @@ export default {
     if (request.method === 'GET' && url.pathname === '/') {
       return new Response('✅ Bot running.', { status: 200 });
     }
-
     if (request.method === 'POST' && url.pathname === '/webhook') {
       let update;
       try { update = await request.json(); }
       catch { return new Response('Bad JSON', { status: 400 }); }
-
-      console.log('=== update ===', JSON.stringify(update).slice(0, 1200));
 
       try {
         const msg = update.message || update.edited_message;
@@ -278,7 +204,6 @@ export default {
       }
       return new Response('OK', { status: 200 });
     }
-
     return new Response('Not Found', { status: 404 });
   },
 };
