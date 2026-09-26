@@ -1,7 +1,9 @@
 // src/index.js
 // Rich Message bot.
 //
-//  ▸ PV media        → replies with file_id + tg:// link + HTML embed tag
+//  ▸ PV media        → replies with a REGULAR message containing file_id,
+//                       tg:// link, and the HTML embed, each in <code>
+//                       blocks so a tap copies them.
 //  ▸ Channels (admin) → auto-edits HTML posts into rich messages
 //  ▸ Groups / DMs     → /rich, /ping, /debug, /help
 
@@ -69,119 +71,103 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media description (file_id + tg:// link + HTML embed)
+// Media description
 // ═══════════════════════════════════════════════════════════════════════
 function describeMedia(message) {
-  // Photo — pick the largest size
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
     return {
       emoji: '📷', type: 'Photo',
       fileId: p.file_id, uniqueId: p.file_unique_id,
-      meta: { width: p.width, height: p.height, file_size: p.file_size },
+      meta: [['width', p.width], ['height', p.height], ['file_size', p.file_size]],
       tgLink: `tg://photo?id=${p.file_id}`,
       embed: `<img src="tg://photo?id=${p.file_id}"/>`,
     };
   }
-
-  // Video
   if (message.video) {
     const v = message.video;
     return {
       emoji: '🎥', type: 'Video',
       fileId: v.file_id, uniqueId: v.file_unique_id,
-      meta: {
-        width: v.width, height: v.height, duration: v.duration,
-        mime_type: v.mime_type, file_name: v.file_name, file_size: v.file_size,
-      },
+      meta: [
+        ['width', v.width], ['height', v.height], ['duration', v.duration],
+        ['mime_type', v.mime_type], ['file_name', v.file_name], ['file_size', v.file_size],
+      ],
       tgLink: `tg://video?id=${v.file_id}`,
       embed: `<video src="tg://video?id=${v.file_id}"/>`,
     };
   }
-
-  // Animation (GIF / MP4 stickers)
   if (message.animation) {
     const a = message.animation;
     return {
       emoji: '🎞', type: 'Animation',
       fileId: a.file_id, uniqueId: a.file_unique_id,
-      meta: {
-        width: a.width, height: a.height, duration: a.duration,
-        mime_type: a.mime_type, file_name: a.file_name, file_size: a.file_size,
-      },
+      meta: [
+        ['width', a.width], ['height', a.height], ['duration', a.duration],
+        ['mime_type', a.mime_type], ['file_name', a.file_name], ['file_size', a.file_size],
+      ],
       tgLink: `tg://video?id=${a.file_id}`,
       embed: `<video src="tg://video?id=${a.file_id}"/>`,
     };
   }
-
-  // Video note (round video)
   if (message.video_note) {
     const vn = message.video_note;
     return {
       emoji: '⭕', type: 'Video note',
       fileId: vn.file_id, uniqueId: vn.file_unique_id,
-      meta: { length: vn.length, duration: vn.duration, file_size: vn.file_size },
+      meta: [['length', vn.length], ['duration', vn.duration], ['file_size', vn.file_size]],
       tgLink: `tg://video?id=${vn.file_id}`,
       embed: `<video src="tg://video?id=${vn.file_id}"/>`,
     };
   }
-
-  // Document
   if (message.document) {
     const d = message.document;
     const label = d.file_name || 'document';
     return {
       emoji: '📄', type: 'Document',
       fileId: d.file_id, uniqueId: d.file_unique_id,
-      meta: { file_name: d.file_name, mime_type: d.mime_type, file_size: d.file_size },
+      meta: [['file_name', d.file_name], ['mime_type', d.mime_type], ['file_size', d.file_size]],
       tgLink: `tg://document?id=${d.file_id}`,
       embed: `<a href="tg://document?id=${d.file_id}">${escapeHtml(label)}</a>`,
     };
   }
-
-  // Audio (music)
   if (message.audio) {
     const a = message.audio;
     return {
       emoji: '🎵', type: 'Audio',
       fileId: a.file_id, uniqueId: a.file_unique_id,
-      meta: {
-        duration: a.duration, performer: a.performer, title: a.title,
-        mime_type: a.mime_type, file_name: a.file_name, file_size: a.file_size,
-      },
+      meta: [
+        ['duration', a.duration], ['performer', a.performer], ['title', a.title],
+        ['mime_type', a.mime_type], ['file_name', a.file_name], ['file_size', a.file_size],
+      ],
       tgLink: `tg://audio?id=${a.file_id}`,
       embed: `<audio src="tg://audio?id=${a.file_id}"/>`,
     };
   }
-
-  // Voice message
   if (message.voice) {
     const v = message.voice;
     return {
       emoji: '🎤', type: 'Voice',
       fileId: v.file_id, uniqueId: v.file_unique_id,
-      meta: { duration: v.duration, mime_type: v.mime_type, file_size: v.file_size },
+      meta: [['duration', v.duration], ['mime_type', v.mime_type], ['file_size', v.file_size]],
       tgLink: `tg://audio?id=${v.file_id}`,
       embed: `<audio src="tg://audio?id=${v.file_id}"/>`,
     };
   }
-
-  // Sticker
   if (message.sticker) {
     const s = message.sticker;
     return {
       emoji: '🏷', type: 'Sticker',
       fileId: s.file_id, uniqueId: s.file_unique_id,
-      meta: {
-        type: s.type, width: s.width, height: s.height, emoji: s.emoji,
-        set_name: s.set_name, is_animated: s.is_animated,
-        is_video: s.is_video, file_size: s.file_size,
-      },
+      meta: [
+        ['type', s.type], ['width', s.width], ['height', s.height],
+        ['emoji', s.emoji], ['set_name', s.set_name],
+        ['is_animated', s.is_animated], ['is_video', s.is_video], ['file_size', s.file_size],
+      ],
       tgLink: `tg://sticker?id=${s.file_id}`,
       embed: `<img src="tg://sticker?id=${s.file_id}"/>`,
     };
   }
-
   return null;
 }
 
@@ -213,7 +199,7 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler
+// PV media handler — REGULAR message, tap-to-copy code blocks
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
@@ -222,7 +208,7 @@ async function handleMediaPV(message, env) {
   if (!m) return false;
 
   const lines = [];
-  lines.push(`<b>${m.emoji} ${m.type}</b>`);
+  lines.push(`${m.emoji} <b>${m.type}</b>`);
   lines.push('');
   lines.push('<b>file_id</b>');
   lines.push(`<code>${escapeHtml(m.fileId)}</code>`);
@@ -230,11 +216,13 @@ async function handleMediaPV(message, env) {
   lines.push('<b>file_unique_id</b>');
   lines.push(`<code>${escapeHtml(m.uniqueId)}</code>`);
 
-  const meta = Object.entries(m.meta).filter(([, v]) => v !== undefined && v !== null);
+  const meta = m.meta.filter(([, v]) => v !== undefined && v !== null && v !== '');
   if (meta.length) {
     lines.push('');
     lines.push('<b>meta</b>');
-    for (const [k, v] of meta) lines.push(`${escapeHtml(k)}: <code>${escapeHtml(v)}</code>`);
+    for (const [k, v] of meta) {
+      lines.push(`${escapeHtml(k)}: <code>${escapeHtml(v)}</code>`);
+    }
   }
 
   lines.push('');
@@ -242,15 +230,13 @@ async function handleMediaPV(message, env) {
   lines.push(`<code>${escapeHtml(m.tgLink)}</code>`);
   lines.push('');
   lines.push('<b>HTML embed</b>');
-  lines.push(`<pre>${escapeHtml(m.embed)}</pre>`);
+  lines.push(`<code>${escapeHtml(m.embed)}</code>`);
 
-  const html = lines.join('\n');
+  const text = lines.join('\n');
 
-  const rich = await sendRich(env, message.chat.id, message.message_id, html, message.message_thread_id);
-  if (rich.ok) return true;
-
-  console.warn('media rich failed → plain fallback:', rich.description);
-  await sendPlain(env, message.chat.id, message.message_id, html, message.message_thread_id);
+  // Always a regular message now — no rich send.
+  const r = await sendPlain(env, message.chat.id, message.message_id, text, message.message_thread_id);
+  if (!r.ok) console.error('media send failed:', r.description);
   return true;
 }
 
@@ -263,7 +249,8 @@ async function handleHelp(message, env) {
     '<b>Channels</b> — post HTML, bot edits it into a rich message.\n\n' +
     '<b>Groups / DMs</b>\n' +
     '<code>/rich</code> reply to HTML, or <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code>\n' +
-    '<code>/ping</code> <code>/debug</code> <code>/help</code>',
+    '<code>/ping</code> <code>/debug</code> <code>/help</code>\n\n' +
+    '<b>PV media</b> — send any photo/video/audio/document; the bot replies with its file_id, tg:// link, and HTML embed.',
     message.message_thread_id);
 }
 async function handlePing(message, env) {
@@ -318,7 +305,7 @@ async function handleRich(message, env, args, botId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Channel auto-convert (edit only)
+// Channel auto-convert
 // ═══════════════════════════════════════════════════════════════════════
 async function handleChannelPost(post, env, isEdit) {
   const chatId = post.chat.id;
@@ -351,7 +338,7 @@ async function handleMessage(message, env, update) {
 
   if (DEBUG) console.log('=== msg update ===', JSON.stringify(update).slice(0, 2200));
 
-  // PV media → file_id report
+  // PV media → file_id report as a plain message
   if (await handleMediaPV(message, env)) return;
 
   // Guard: never react to replies to the bot itself
