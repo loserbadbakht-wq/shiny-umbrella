@@ -4,7 +4,7 @@
 //  ▸ PV media         → replies with a tag (full file_id)
 //  ▸ /rich <tag>       → shortens ids, builds media array, sends rich message
 //  ▸ Channels (admin) → auto-edits HTML posts into rich messages
-//  ▸ /send             → interactive help with switchable sections
+//  ▸ /send             → interactive help with switchable sections + code samples
 //  ▸ /ping /debug /help
 
 const DEBUG = true;
@@ -110,7 +110,7 @@ function shortenAndBuildMedia(html) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media → tag (full file_id — shortening deferred)
+// Media → tag
 // ═══════════════════════════════════════════════════════════════════════
 function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
@@ -141,8 +141,7 @@ async function sendRich(env, chatId, replyToId, richMessage, threadId) {
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
   };
   if (threadId != null) payload.message_thread_id = threadId;
-  const r = await tg(env, 'sendRichMessage', payload);
-  return r;
+  return tg(env, 'sendRichMessage', payload);
 }
 async function sendPlain(env, chatId, replyToId, text, threadId) {
   const payload = {
@@ -156,99 +155,144 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// /send — interactive help pages
+// /send — interactive help with code samples
 // ═══════════════════════════════════════════════════════════════════════
+// Small helper for building a code sample inside the help page.
+function sample(code, lang) {
+  const cls = lang ? ` class="language-${lang}"` : '';
+  return `<pre><code${cls}>${escapeHtml(code)}</code></pre>`;
+}
+
 const HELP_SECTIONS = {
   overview: {
     label: '🏠 خانه',
     body:
       '<h1>🤖 ربات پیام غنی</h1>\n' +
-      '<p>این ربات HTML و تگ‌های تلگرامی را به <b>پیام غنی</b> تبدیل می‌کند.</p>\n' +
-      '<p>با دکمه‌های زیر بخش‌های مختلف را ببینید. هر بخش را می‌توانید مستقل باز کنید و پیام بزرگ نمی‌شود.</p>',
+      '<p>HTML و تگ‌های تلگرامی را به <b>پیام غنی</b> تبدیل می‌کنم.</p>\n' +
+      '<p>هر بخش را با دکمه‌های زیر ببینید. بخش‌ها جدا هستند تا پیام بزرگ نشود.</p>\n' +
+      '<aside>نمونه‌ها به‌صورت بلوک کد نمایش داده می‌شوند تا مستقیم کپی کنید.<cite>راهنما</cite></aside>',
   },
+
   text: {
     label: '📝 متن',
     body:
       '<h2>📝 قالب‌بندی درون‌خطی</h2>\n' +
-      '<p><b>بولد</b> · <i>ایتالیک</i> · <u>زیرخط</u> · <s>خط‌خورده</s> · <code>کد</code></p>\n' +
-      '<p><mark>هایلایت</mark> · <sub>زیرنویس</sub> · <sup>بالانویس</sup> · <tg-spoiler>اسپویلر</tg-spoiler></p>\n' +
-      '<p><b>مثال:</b></p>\n' +
-      '<pre><code>&lt;b&gt;بولد&lt;/b&gt; &lt;i&gt;ایتالیک&lt;/i&gt; &lt;u&gt;زیرخط&lt;/u&gt;</code></pre>',
+      '<p><b>بولد</b> · <i>ایتالیک</i> · <u>زیرخط</u> · <s>خط‌خورده</s> · <code>کد</code> · <mark>هایلایت</mark> · <sub>زیرنویس</sub> · <sup>بالانویس</sup> · <tg-spoiler>اسپویلر</tg-spoiler></p>\n' +
+      '<p><b>کد منبع:</b></p>\n' +
+      sample(
+        '<b>بولد</b> <i>ایتالیک</i> <u>زیرخط</u>\n' +
+        '<s>خط‌خورده</s> <mark>هایلایت</mark>\n' +
+        '<sub>زیرنویس</sub> <sup>بالانویس</sup>\n' +
+        '<tg-spoiler>اسپویلر</tg-spoiler>'
+      ),
   },
+
   blocks: {
     label: '🧱 بلوک‌ها',
     body:
       '<h2>🧱 عناصر بلوکی</h2>\n' +
-      '<ul>\n' +
-      '<li><b>سرتیتر:</b> <code>&lt;h1&gt;</code> تا <code>&lt;h6&gt;</code></li>\n' +
-      '<li><b>پاراگراف:</b> <code>&lt;p&gt;</code></li>\n' +
-      '<li><b>کد چندخطی:</b> <code>&lt;pre&gt;</code> و <code>&lt;pre&gt;&lt;code&gt;</code></li>\n' +
-      '<li><b>نقل‌قول:</b> <code>&lt;blockquote&gt;</code> و <code>&lt;aside&gt;</code></li>\n' +
-      '<li><b>جداکننده:</b> <code>&lt;hr/&gt;</code></li>\n' +
-      '<li><b>پاورقی:</b> <code>&lt;footer&gt;</code></li>\n' +
-      '</ul>\n' +
-      '<aside>هر بلوک در خط جداگانه‌ای نمایش داده می‌شود.<cite>نکته</cite></aside>',
+      '<h3>سرتیتر</h3>\n' +
+      sample('<h1>سرتیتر ۱</h1>\n<h2>سرتیتر ۲</h2>\n<h3>سرتیتر ۳</h3>') +
+      '<h3>پاراگراف و نقل‌قول</h3>\n' +
+      sample(
+        '<p>یک پاراگراف متن.</p>\n' +
+        '<blockquote>نقل‌قول<cite>نویسنده</cite></blockquote>\n' +
+        '<aside>نقل‌قول کششی</aside>'
+      ) +
+      '<h3>کد و پاورقی</h3>\n' +
+      sample(
+        '<pre><code class="language-python">print("hi")</code></pre>\n' +
+        '<hr/>\n' +
+        '<footer>پاورقی</footer>'
+      ),
   },
+
   lists: {
     label: '📋 لیست و جدول',
     body:
-      '<h2>📋 لیست‌ها و جداول</h2>\n' +
-      '<p><b>لیست نامرتب:</b></p>\n' +
-      '<ul><li>آیتم اول</li><li>آیتم دوم</li></ul>\n' +
-      '<p><b>لیست مرتب با شماره‌گذاری سفارشی:</b></p>\n' +
-      '<ol type="a" start="3"><li>حرف c</li><li>حرف d</li></ol>\n' +
-      '<p><b>لیست وظایف:</b></p>\n' +
-      '<ul><li><input type="checkbox" checked>انجام‌شده</li><li><input type="checkbox">در انتظار</li></ul>\n' +
-      '<p><b>جدول:</b></p>\n' +
-      '<table bordered striped>\n' +
-      '<tr><th>ستون ۱</th><th>ستون ۲</th></tr>\n' +
-      '<tr><td>مقدار</td><td>مقدار</td></tr>\n' +
-      '</table>',
+      '<h2>📋 لیست‌ها</h2>\n' +
+      '<h3>لیست نامرتب و مرتب</h3>\n' +
+      sample(
+        '<ul>\n  <li>آیتم الف</li>\n  <li>آیتم ب</li>\n</ul>\n\n' +
+        '<ol type="a" start="3">\n  <li>c</li>\n  <li>d</li>\n</ol>'
+      ) +
+      '<h3>لیست وظایف</h3>\n' +
+      sample(
+        '<ul>\n' +
+        '  <li><input type="checkbox" checked>انجام شد</li>\n' +
+        '  <li><input type="checkbox">در انتظار</li>\n' +
+        '</ul>'
+      ) +
+      '<h3>جدول</h3>\n' +
+      sample(
+        '<table bordered striped>\n' +
+        '  <tr><th>نام</th><th>سن</th></tr>\n' +
+        '  <tr><td>علی</td><td>۳۰</td></tr>\n' +
+        '</table>'
+      ),
   },
+
   details: {
     label: '🔽 تاشو',
     body:
       '<h2>🔽 بخش‌های تاشو</h2>\n' +
-      '<p><b>بسته (پیش‌فرض):</b> <code>&lt;details&gt;</code> — کاربر باید باز کند.</p>\n' +
-      '<p><b>باز (پیش‌فرض):</b> <code>&lt;details open&gt;</code> — کاربر می‌تواند ببندد.</p>\n' +
-      '<p>نمونه‌ی زنده:</p>\n' +
-      '<details><summary>برای دیدن کلیک کنید</summary>این محتوا پنهان بود و حالا دیده می‌شود!</details>\n' +
-      '<details open><summary>از ابتدا باز</summary>این یکی از اول دیده می‌شود.</details>',
+      '<h3>حالت بسته (پیش‌فرض)</h3>\n' +
+      sample('<details><summary>عنوان</summary>محتوای پنهان</details>') +
+      '<h3>حالت باز (پیش‌فرض)</h3>\n' +
+      sample('<details open><summary>عنوان</summary>محتوای نمایان</details>') +
+      '<h3>نمونه‌ی زنده</h3>\n' +
+      '<details><summary>برای باز کردن کلیک کنید</summary>حالا این متن را می‌بینید.</details>\n' +
+      '<details open><summary>از ابتدا باز</summary>این یکی از اول باز است.</details>',
   },
+
   media: {
     label: '🖼 مدیا',
     body:
       '<h2>🖼 تگ‌های مدیا</h2>\n' +
-      '<p><b>استاندارد (با URL عمومی):</b></p>\n' +
-      '<ul>\n' +
-      '<li><code>&lt;img src="…"/&gt;</code></li>\n' +
-      '<li><code>&lt;video src="…"/&gt;</code></li>\n' +
-      '<li><code>&lt;audio src="…"/&gt;</code></li>\n' +
-      '</ul>\n' +
-      '<p><b>ترکیبی:</b></p>\n' +
-      '<ul>\n' +
-      '<li><code>&lt;tg-collage&gt;</code> — چند تصویر کنار هم</li>\n' +
-      '<li><code>&lt;tg-slideshow&gt;</code> — کاروسل قابل سوایپ</li>\n' +
-      '<li><code>&lt;figcaption&gt;</code> — عنوان زیر مدیاها</li>\n' +
-      '</ul>\n' +
-      '<aside>فایل تلگرامی خودتان را در چت خصوصی بفرستید تا تگ آن را بگیرید.</aside>',
+      '<h3>استاندارد (نیاز به URL عمومی)</h3>\n' +
+      sample(
+        '<img src="https://example.com/photo.jpg"/>\n' +
+        '<video src="https://example.com/clip.mp4"/>\n' +
+        '<audio src="https://example.com/song.mp3"/>'
+      ) +
+      '<h3>ترکیبی</h3>\n' +
+      sample(
+        '<tg-collage>\n' +
+        '  <img src="https://example.com/a.jpg"/>\n' +
+        '  <img src="https://example.com/b.jpg"/>\n' +
+        '  <figcaption>عنوان<cite>منبع</cite></figcaption>\n' +
+        '</tg-collage>\n\n' +
+        '<tg-slideshow>\n' +
+        '  <img src="https://example.com/1.jpg"/>\n' +
+        '  <video src="https://example.com/2.mp4"/>\n' +
+        '  <figcaption>اسلایدشو</figcaption>\n' +
+        '</tg-slideshow>'
+      ) +
+      '<h3>نقشه</h3>\n' +
+      sample('<tg-map lat="35.6892" long="51.3890" zoom="12"/>') +
+      '<aside>فایل تلگرامی خودتان را در چت خصوصی بفرستید تا تگ آن را بگیرید.<cite>نکته</cite></aside>',
   },
+
   usage: {
     label: '⚙️ استفاده',
     body:
       '<h2>⚙️ نحوه استفاده</h2>\n' +
-      '<ol>\n' +
-      '<li>فایل تلگرامی را به ربات در چت خصوصی بفرستید → تگ می‌گیرید</li>\n' +
-      '<li>تگ را در هر چتی با <code>/rich</code> بفرستید</li>\n' +
-      '<li>در کانال (اگر ادمین باشد)، ربات خودکار پست‌های HTML را تبدیل می‌کند</li>\n' +
-      '</ol>\n' +
-      '<p><b>دستورات:</b></p>\n' +
+      '<h3>۱. فایل تلگرامی → تگ</h3>\n' +
+      '<p>عکس یا ویدیو را به ربات در چت خصوصی بفرستید. تگ می‌گیرید:</p>\n' +
+      sample('<img src="tg://photo?id=AgACAgQAAxkBAAM…"/>') +
+      '<h3>۲. تگ → پیام غنی</h3>\n' +
+      '<p>تگ را با <code>/rich</code> بفرستید:</p>\n' +
+      sample('/rich <img src="tg://photo?id=AgACAgQAAxkBAAM…"/>') +
+      '<h3>۳. کانال (اختیاری)</h3>\n' +
+      '<p>اگر ربات در کانال ادمین باشد، فقط تگ را به‌عنوان پست بنویسید:</p>\n' +
+      sample('<h2>عنوان</h2>\n<img src="tg://photo?id=AgACAgQAAxkBAAM…"/>\n<footer>پاورقی</footer>') +
+      '<h3>دستورات</h3>\n' +
       '<table bordered striped>\n' +
-      '<tr><td><code>/send</code></td><td>این راهنما</td></tr>\n' +
-      '<tr><td><code>/rich</code></td><td>تبدیل HTML به پیام غنی</td></tr>\n' +
-      '<tr><td><code>/ping</code></td><td>بررسی اتصال</td></tr>\n' +
-      '<tr><td><code>/debug</code></td><td>نمایش JSON خام</td></tr>\n' +
-      '<tr><td><code>/help</code></td><td>راهنمای کوتاه</td></tr>\n' +
+      '  <tr><td><code>/send</code></td><td>این راهنما</td></tr>\n' +
+      '  <tr><td><code>/rich</code></td><td>تبدیل HTML</td></tr>\n' +
+      '  <tr><td><code>/ping</code></td><td>بررسی اتصال</td></tr>\n' +
+      '  <tr><td><code>/debug</code></td><td>نمایش JSON خام</td></tr>\n' +
+      '  <tr><td><code>/help</code></td><td>راهنمای کوتاه</td></tr>\n' +
       '</table>',
   },
 };
@@ -259,7 +303,6 @@ function buildHelpPage(sectionKey) {
   const key = HELP_SECTIONS[sectionKey] ? sectionKey : 'overview';
   const section = HELP_SECTIONS[key];
 
-  // Split buttons into 2 rows so they fit nicely.
   const row1Keys = HELP_ORDER.slice(0, 4);
   const row2Keys = HELP_ORDER.slice(4);
 
@@ -287,33 +330,26 @@ async function handleSend(message, env) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Callback query (button taps)
+// Callback query
 // ═══════════════════════════════════════════════════════════════════════
 async function handleCallbackQuery(cq, env) {
   const data = cq.data || '';
   const m = data.match(/^send:([a-z_]+)$/);
 
-  // Always ack the tap to stop the spinner
   await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id });
-
   if (!m) return;
 
-  const sectionKey = m[1];
-  const rich = buildHelpPage(sectionKey);
-
+  const rich = buildHelpPage(m[1]);
   const edit = await tg(env, 'editMessageText', {
     chat_id: cq.message.chat.id,
     message_id: cq.message.message_id,
     rich_message: rich,
   });
-
-  if (!edit.ok) {
-    console.error('[callback] edit failed:', edit.description);
-  }
+  if (!edit.ok) console.error('[callback] edit failed:', edit.description);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler
+// PV media
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
