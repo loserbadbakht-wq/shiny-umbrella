@@ -1,12 +1,11 @@
 // src/index.js
-// Rich Message bot — id shortening happens at send time.
+// Rich Message bot.
 //
-//  ▸ PV media         → replies with a tag carrying the FULL file_id
+//  ▸ PV media         → replies with a tag (full file_id)
 //  ▸ /rich <tag>       → shortens ids, builds media array, sends rich message
-//  ▸ Channels (admin) → shortens ids, builds media array, edits post into rich
-//
-// No KV, no cache, no Map. The long file_id is the portable part;
-// shortening is a pure function applied right before the rich send.
+//  ▸ Channels (admin) → auto-edits HTML posts into rich messages
+//  ▸ /send             → interactive help with switchable sections
+//  ▸ /ping /debug /help
 
 const DEBUG = true;
 
@@ -72,7 +71,7 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Short id (FNV-1a 32-bit, base36) — deterministic from file_id
+// Short id + media array
 // ═══════════════════════════════════════════════════════════════════════
 function shortIdFor(fileId) {
   let h = 0x811c9dc5;
@@ -83,27 +82,17 @@ function shortIdFor(fileId) {
   return 'm' + h.toString(36);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Rewrite tg:// links: long file_id → short id, build media array.
-// Returns { html, media } — media is [] if no links found.
-// ═══════════════════════════════════════════════════════════════════════
 function shortenAndBuildMedia(html) {
   const media = [];
-  const seen = new Map();   // fileId → shortId
+  const seen = new Map();
 
   const newHtml = html.replace(
     /tg:\/\/(photo|video|audio|document)\?id=([^"'\s&<>]+)/g,
     (match, kind, rawId) => {
       const fileId = decodeURIComponent(rawId);
 
-      // If it's already short (≤64 chars, valid chars only), leave it as-is.
       if (fileId.length <= 64 && /^[A-Za-z0-9_-]+$/.test(fileId) && fileId.startsWith('m')) {
-        // Looks like an already-shortened id — pass through, but we can't
-        // rebuild media for it, so we still register it as its own media.
-        media.push({
-          id: fileId,
-          media: { type: kind, media: fileId },
-        });
+        media.push({ id: fileId, media: { type: kind, media: fileId } });
         return match;
       }
 
@@ -111,10 +100,7 @@ function shortenAndBuildMedia(html) {
       if (!shortId) {
         shortId = shortIdFor(fileId);
         seen.set(fileId, shortId);
-        media.push({
-          id: shortId,
-          media: { type: kind, media: fileId },
-        });
+        media.push({ id: shortId, media: { type: kind, media: fileId } });
       }
       return `tg://${kind}?id=${shortId}`;
     }
@@ -124,36 +110,24 @@ function shortenAndBuildMedia(html) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media → tag (uses full file_id — shortening is deferred)
+// Media → tag (full file_id — shortening deferred)
 // ═══════════════════════════════════════════════════════════════════════
 function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
     return `<img src="tg://photo?id=${p.file_id}"/>`;
   }
-  if (message.video) {
-    return `<video src="tg://video?id=${message.video.file_id}"/>`;
-  }
-  if (message.animation) {
-    return `<video src="tg://video?id=${message.animation.file_id}"/>`;
-  }
-  if (message.video_note) {
-    return `<video src="tg://video?id=${message.video_note.file_id}"/>`;
-  }
+  if (message.video) return `<video src="tg://video?id=${message.video.file_id}"/>`;
+  if (message.animation) return `<video src="tg://video?id=${message.animation.file_id}"/>`;
+  if (message.video_note) return `<video src="tg://video?id=${message.video_note.file_id}"/>`;
   if (message.document) {
     const d = message.document;
     const label = d.file_name || 'document';
     return `<a href="tg://document?id=${d.file_id}">${escapeHtml(label)}</a>`;
   }
-  if (message.audio) {
-    return `<audio src="tg://audio?id=${message.audio.file_id}"/>`;
-  }
-  if (message.voice) {
-    return `<audio src="tg://audio?id=${message.voice.file_id}"/>`;
-  }
-  if (message.sticker) {
-    return `<img src="tg://photo?id=${message.sticker.file_id}"/>`;
-  }
+  if (message.audio) return `<audio src="tg://audio?id=${message.audio.file_id}"/>`;
+  if (message.voice) return `<audio src="tg://audio?id=${message.voice.file_id}"/>`;
+  if (message.sticker) return `<img src="tg://photo?id=${message.sticker.file_id}"/>`;
   return null;
 }
 
@@ -167,8 +141,6 @@ async function sendRich(env, chatId, replyToId, richMessage, threadId) {
     reply_parameters: { message_id: replyToId, allow_sending_without_reply: true },
   };
   if (threadId != null) payload.message_thread_id = threadId;
-
-  if (DEBUG) console.log('[sendRich] request:', JSON.stringify(payload).slice(0, 1200));
   const r = await tg(env, 'sendRichMessage', payload);
   return r;
 }
@@ -184,11 +156,167 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler — replies with the LONG id tag
+// /send — interactive help pages
+// ═══════════════════════════════════════════════════════════════════════
+const HELP_SECTIONS = {
+  overview: {
+    label: '🏠 خانه',
+    body:
+      '<h1>🤖 ربات پیام غنی</h1>\n' +
+      '<p>این ربات HTML و تگ‌های تلگرامی را به <b>پیام غنی</b> تبدیل می‌کند.</p>\n' +
+      '<p>با دکمه‌های زیر بخش‌های مختلف را ببینید. هر بخش را می‌توانید مستقل باز کنید و پیام بزرگ نمی‌شود.</p>',
+  },
+  text: {
+    label: '📝 متن',
+    body:
+      '<h2>📝 قالب‌بندی درون‌خطی</h2>\n' +
+      '<p><b>بولد</b> · <i>ایتالیک</i> · <u>زیرخط</u> · <s>خط‌خورده</s> · <code>کد</code></p>\n' +
+      '<p><mark>هایلایت</mark> · <sub>زیرنویس</sub> · <sup>بالانویس</sup> · <tg-spoiler>اسپویلر</tg-spoiler></p>\n' +
+      '<p><b>مثال:</b></p>\n' +
+      '<pre><code>&lt;b&gt;بولد&lt;/b&gt; &lt;i&gt;ایتالیک&lt;/i&gt; &lt;u&gt;زیرخط&lt;/u&gt;</code></pre>',
+  },
+  blocks: {
+    label: '🧱 بلوک‌ها',
+    body:
+      '<h2>🧱 عناصر بلوکی</h2>\n' +
+      '<ul>\n' +
+      '<li><b>سرتیتر:</b> <code>&lt;h1&gt;</code> تا <code>&lt;h6&gt;</code></li>\n' +
+      '<li><b>پاراگراف:</b> <code>&lt;p&gt;</code></li>\n' +
+      '<li><b>کد چندخطی:</b> <code>&lt;pre&gt;</code> و <code>&lt;pre&gt;&lt;code&gt;</code></li>\n' +
+      '<li><b>نقل‌قول:</b> <code>&lt;blockquote&gt;</code> و <code>&lt;aside&gt;</code></li>\n' +
+      '<li><b>جداکننده:</b> <code>&lt;hr/&gt;</code></li>\n' +
+      '<li><b>پاورقی:</b> <code>&lt;footer&gt;</code></li>\n' +
+      '</ul>\n' +
+      '<aside>هر بلوک در خط جداگانه‌ای نمایش داده می‌شود.<cite>نکته</cite></aside>',
+  },
+  lists: {
+    label: '📋 لیست و جدول',
+    body:
+      '<h2>📋 لیست‌ها و جداول</h2>\n' +
+      '<p><b>لیست نامرتب:</b></p>\n' +
+      '<ul><li>آیتم اول</li><li>آیتم دوم</li></ul>\n' +
+      '<p><b>لیست مرتب با شماره‌گذاری سفارشی:</b></p>\n' +
+      '<ol type="a" start="3"><li>حرف c</li><li>حرف d</li></ol>\n' +
+      '<p><b>لیست وظایف:</b></p>\n' +
+      '<ul><li><input type="checkbox" checked>انجام‌شده</li><li><input type="checkbox">در انتظار</li></ul>\n' +
+      '<p><b>جدول:</b></p>\n' +
+      '<table bordered striped>\n' +
+      '<tr><th>ستون ۱</th><th>ستون ۲</th></tr>\n' +
+      '<tr><td>مقدار</td><td>مقدار</td></tr>\n' +
+      '</table>',
+  },
+  details: {
+    label: '🔽 تاشو',
+    body:
+      '<h2>🔽 بخش‌های تاشو</h2>\n' +
+      '<p><b>بسته (پیش‌فرض):</b> <code>&lt;details&gt;</code> — کاربر باید باز کند.</p>\n' +
+      '<p><b>باز (پیش‌فرض):</b> <code>&lt;details open&gt;</code> — کاربر می‌تواند ببندد.</p>\n' +
+      '<p>نمونه‌ی زنده:</p>\n' +
+      '<details><summary>برای دیدن کلیک کنید</summary>این محتوا پنهان بود و حالا دیده می‌شود!</details>\n' +
+      '<details open><summary>از ابتدا باز</summary>این یکی از اول دیده می‌شود.</details>',
+  },
+  media: {
+    label: '🖼 مدیا',
+    body:
+      '<h2>🖼 تگ‌های مدیا</h2>\n' +
+      '<p><b>استاندارد (با URL عمومی):</b></p>\n' +
+      '<ul>\n' +
+      '<li><code>&lt;img src="…"/&gt;</code></li>\n' +
+      '<li><code>&lt;video src="…"/&gt;</code></li>\n' +
+      '<li><code>&lt;audio src="…"/&gt;</code></li>\n' +
+      '</ul>\n' +
+      '<p><b>ترکیبی:</b></p>\n' +
+      '<ul>\n' +
+      '<li><code>&lt;tg-collage&gt;</code> — چند تصویر کنار هم</li>\n' +
+      '<li><code>&lt;tg-slideshow&gt;</code> — کاروسل قابل سوایپ</li>\n' +
+      '<li><code>&lt;figcaption&gt;</code> — عنوان زیر مدیاها</li>\n' +
+      '</ul>\n' +
+      '<aside>فایل تلگرامی خودتان را در چت خصوصی بفرستید تا تگ آن را بگیرید.</aside>',
+  },
+  usage: {
+    label: '⚙️ استفاده',
+    body:
+      '<h2>⚙️ نحوه استفاده</h2>\n' +
+      '<ol>\n' +
+      '<li>فایل تلگرامی را به ربات در چت خصوصی بفرستید → تگ می‌گیرید</li>\n' +
+      '<li>تگ را در هر چتی با <code>/rich</code> بفرستید</li>\n' +
+      '<li>در کانال (اگر ادمین باشد)، ربات خودکار پست‌های HTML را تبدیل می‌کند</li>\n' +
+      '</ol>\n' +
+      '<p><b>دستورات:</b></p>\n' +
+      '<table bordered striped>\n' +
+      '<tr><td><code>/send</code></td><td>این راهنما</td></tr>\n' +
+      '<tr><td><code>/rich</code></td><td>تبدیل HTML به پیام غنی</td></tr>\n' +
+      '<tr><td><code>/ping</code></td><td>بررسی اتصال</td></tr>\n' +
+      '<tr><td><code>/debug</code></td><td>نمایش JSON خام</td></tr>\n' +
+      '<tr><td><code>/help</code></td><td>راهنمای کوتاه</td></tr>\n' +
+      '</table>',
+  },
+};
+
+const HELP_ORDER = ['overview', 'text', 'blocks', 'lists', 'details', 'media', 'usage'];
+
+function buildHelpPage(sectionKey) {
+  const key = HELP_SECTIONS[sectionKey] ? sectionKey : 'overview';
+  const section = HELP_SECTIONS[key];
+
+  // Split buttons into 2 rows so they fit nicely.
+  const row1Keys = HELP_ORDER.slice(0, 4);
+  const row2Keys = HELP_ORDER.slice(4);
+
+  function btnRow(keys) {
+    const buttons = keys.map(k => {
+      const s = HELP_SECTIONS[k];
+      const style = k === key ? ' style="primary"' : '';
+      return `<tg-button type="callback_data"${style} data="send:${k}">${escapeHtml(s.label)}</tg-button>`;
+    });
+    return `<tg-button-row align="center">${buttons.join('')}</tg-button-row>`;
+  }
+
+  const html = `${section.body}\n\n${btnRow(row1Keys)}\n${btnRow(row2Keys)}`;
+  return { html };
+}
+
+async function handleSend(message, env) {
+  const rich = buildHelpPage('overview');
+  const r = await sendRich(env, message.chat.id, message.message_id, rich, message.message_thread_id);
+  if (!r.ok) {
+    await sendPlain(env, message.chat.id, message.message_id,
+      `<b>❌ sendRichMessage failed</b>\n<pre>${escapeHtml((r.description || '').slice(0, 400))}</pre>`,
+      message.message_thread_id);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Callback query (button taps)
+// ═══════════════════════════════════════════════════════════════════════
+async function handleCallbackQuery(cq, env) {
+  const data = cq.data || '';
+  const m = data.match(/^send:([a-z_]+)$/);
+
+  // Always ack the tap to stop the spinner
+  await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id });
+
+  if (!m) return;
+
+  const sectionKey = m[1];
+  const rich = buildHelpPage(sectionKey);
+
+  const edit = await tg(env, 'editMessageText', {
+    chat_id: cq.message.chat.id,
+    message_id: cq.message.message_id,
+    rich_message: rich,
+  });
+
+  if (!edit.ok) {
+    console.error('[callback] edit failed:', edit.description);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PV media handler
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
-
   const tag = mediaTag(message);
   if (!tag) return false;
 
@@ -204,11 +332,9 @@ async function handleMediaPV(message, env) {
 async function handleHelp(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
     '<b>🤖 Rich Message Bot</b>\n\n' +
-    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a tag.\n' +
-    'Copy the tag into any message, then convert with <code>/rich &lt;tag&gt;</code>.\n\n' +
-    '<b>Channels</b> — post the tag as text; the bot edits it into a rich message.\n\n' +
-    '<b>Groups / DMs</b>\n' +
-    '<code>/rich</code> <code>/ping</code> <code>/debug</code> <code>/help</code>',
+    '<code>/send</code> — راهنمای تعاملی\n' +
+    '<code>/rich</code> — تبدیل HTML\n' +
+    '<code>/ping</code> · <code>/debug</code> · <code>/help</code>',
     message.message_thread_id);
 }
 async function handlePing(message, env) {
@@ -231,7 +357,6 @@ async function handleDebug(message, env, update) {
     await sendPlain(env, message.chat.id, message.message_id, text.slice(i, i + CHUNK), message.message_thread_id);
   }
 }
-
 async function handleRich(message, env, args, botId) {
   const threadId = message.message_thread_id;
   const replied = message.reply_to_message;
@@ -258,46 +383,32 @@ async function handleRich(message, env, args, botId) {
   }
   if (!html.trim()) return;
 
-  // ── Shorten ids and build the media array right here ──
   const { html: shortHtml, media } = shortenAndBuildMedia(html);
-  const richMessage = media.length
-    ? { html: shortHtml, media }
-    : { html };
-
-  if (DEBUG) console.log('[handleRich] payload:', JSON.stringify(richMessage).slice(0, 1200));
+  const richMessage = media.length ? { html: shortHtml, media } : { html };
 
   const rich = await sendRich(env, message.chat.id, replyToId, richMessage, threadId);
   if (rich.ok) return;
 
-  // Show the exact API rejection
   await sendPlain(env, message.chat.id, replyToId,
     `❌ <b>sendRichMessage failed</b>\n` +
-    `description: <code>${escapeHtml((rich.description || 'none').slice(0, 400))}</code>\n\n` +
-    `<b>Payload:</b>\n<pre>${escapeHtml(jsonBlock(richMessage, 900))}</pre>`,
+    `description: <code>${escapeHtml((rich.description || 'none').slice(0, 400))}</code>`,
     threadId);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Channel auto-convert — shortens ids before editing
+// Channel auto-convert
 // ═══════════════════════════════════════════════════════════════════════
 async function handleChannelPost(post, env, isEdit) {
   const chatId = post.chat.id;
   const msgId  = post.message_id;
 
-  console.log(`[channel] ${isEdit ? 'EDIT' : 'POST'} chat=${chatId} msg=${msgId} ` +
-    `is_bot=${!!post.from?.is_bot} has_text=${!!post.text} has_rich=${!!post.rich_message}`);
-
-  if (post.rich_message)      { console.log('[channel] skip: already rich'); return; }
-  if (post.from?.is_bot)      { console.log('[channel] skip: authored by bot'); return; }
-  if (!post.text)             { console.log('[channel] skip: no text'); return; }
-  if (!hasHtmlTag(post.text)) { console.log('[channel] skip: no HTML tag'); return; }
+  if (post.rich_message)      return;
+  if (post.from?.is_bot)      return;
+  if (!post.text)             return;
+  if (!hasHtmlTag(post.text)) return;
 
   const { html: shortHtml, media } = shortenAndBuildMedia(post.text);
-  const richMessage = media.length
-    ? { html: shortHtml, media }
-    : { html: post.text };
-
-  if (DEBUG) console.log('[channel] payload:', JSON.stringify(richMessage).slice(0, 1200));
+  const richMessage = media.length ? { html: shortHtml, media } : { html: post.text };
 
   const edit = await tg(env, 'editMessageText', {
     chat_id: chatId,
@@ -316,8 +427,6 @@ async function handleMessage(message, env, update) {
   const botId = bot.id;
   const username = bot.username || '';
 
-  if (DEBUG) console.log('=== msg update ===', JSON.stringify(update).slice(0, 2200));
-
   if (await handleMediaPV(message, env)) return;
 
   if (message.reply_to_message?.from?.id === botId) return;
@@ -329,6 +438,7 @@ async function handleMessage(message, env, update) {
   switch (cmd.cmd) {
     case 'start':
     case 'help': return handleHelp(message, env);
+    case 'send': return handleSend(message, env);
     case 'ping': return handlePing(message, env);
     case 'debug': return handleDebug(message, env, update);
     case 'rich': return handleRich(message, env, cmd.args, botId);
@@ -356,7 +466,8 @@ export default {
       catch { return new Response('Bad JSON', { status: 400 }); }
 
       try {
-        if (update.channel_post)             await handleChannelPost(update.channel_post, env, false);
+        if (update.callback_query)           await handleCallbackQuery(update.callback_query, env);
+        else if (update.channel_post)        await handleChannelPost(update.channel_post, env, false);
         else if (update.edited_channel_post) await handleChannelPost(update.edited_channel_post, env, true);
         else if (update.message || update.edited_message)
           await handleMessage(update.message || update.edited_message, env, update);
