@@ -1,5 +1,7 @@
-name = "shiny-cyrillic"
-main = "src/index.js"
-compatibility_date = "2024-09-23"
+name = "shiny-meta"
+main = "src/worker.js"
+compatibility_date = "2024-04-01"
 
-# BOT_TOKEN and DB_ENCRYPTION_KEY are injected by the workflow via --var
+[vars]
+# BOT_TOKEN and DB_ENCRYPTION_KEY are injected via GitHub Actions
+# Do NOT hardcode secrets here
