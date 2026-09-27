@@ -1,11 +1,12 @@
 // src/index.js
-// Rich Message bot — no cache, no Map.
+// Rich Message bot — id shortening happens at send time.
 //
-//  ▸ PV media         → replies with a tag using the raw file_id
-//  ▸ /rich with tag    → parses tag, builds media array, sends rich
-//  ▸ Channels (admin) → auto-edits HTML posts into rich messages
+//  ▸ PV media         → replies with a tag carrying the FULL file_id
+//  ▸ /rich <tag>       → shortens ids, builds media array, sends rich message
+//  ▸ Channels (admin) → shortens ids, builds media array, edits post into rich
 //
-// The tag carries everything needed. No id↔file_id mapping anywhere.
+// No KV, no cache, no Map. The long file_id is the portable part;
+// shortening is a pure function applied right before the rich send.
 
 const DEBUG = true;
 
@@ -71,59 +72,87 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Parse tg:// links → media array (id IS the file_id)
+// Short id (FNV-1a 32-bit, base36) — deterministic from file_id
 // ═══════════════════════════════════════════════════════════════════════
-function buildMediaArray(html) {
-  const media = [];
-  const seen = new Set();
-
-  // Grab `tg://<kind>?id=<value>` — value is the file_id (URL-encoded)
-  const re = /tg:\/\/(photo|video|audio|document)\?id=([^"'\s&<>]+)/g;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const kind = m[1];
-    const fileId = decodeURIComponent(m[2]);
-    if (seen.has(fileId)) continue;
-    seen.add(fileId);
-
-    media.push({
-      id: fileId,                                     // used in the tg:// tag
-      media: { type: kind, media: fileId },           // same value = the file
-    });
+function shortIdFor(fileId) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < fileId.length; i++) {
+    h ^= fileId.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
   }
-  return media;
+  return 'm' + h.toString(36);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Media → tag (file_id is the id — no mapping layer)
+// Rewrite tg:// links: long file_id → short id, build media array.
+// Returns { html, media } — media is [] if no links found.
+// ═══════════════════════════════════════════════════════════════════════
+function shortenAndBuildMedia(html) {
+  const media = [];
+  const seen = new Map();   // fileId → shortId
+
+  const newHtml = html.replace(
+    /tg:\/\/(photo|video|audio|document)\?id=([^"'\s&<>]+)/g,
+    (match, kind, rawId) => {
+      const fileId = decodeURIComponent(rawId);
+
+      // If it's already short (≤64 chars, valid chars only), leave it as-is.
+      if (fileId.length <= 64 && /^[A-Za-z0-9_-]+$/.test(fileId) && fileId.startsWith('m')) {
+        // Looks like an already-shortened id — pass through, but we can't
+        // rebuild media for it, so we still register it as its own media.
+        media.push({
+          id: fileId,
+          media: { type: kind, media: fileId },
+        });
+        return match;
+      }
+
+      let shortId = seen.get(fileId);
+      if (!shortId) {
+        shortId = shortIdFor(fileId);
+        seen.set(fileId, shortId);
+        media.push({
+          id: shortId,
+          media: { type: kind, media: fileId },
+        });
+      }
+      return `tg://${kind}?id=${shortId}`;
+    }
+  );
+
+  return { html: newHtml, media };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Media → tag (uses full file_id — shortening is deferred)
 // ═══════════════════════════════════════════════════════════════════════
 function mediaTag(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
-    return `<img src="tg://photo?id=${encodeURIComponent(p.file_id)}"/>`;
+    return `<img src="tg://photo?id=${p.file_id}"/>`;
   }
   if (message.video) {
-    return `<video src="tg://video?id=${encodeURIComponent(message.video.file_id)}"/>`;
+    return `<video src="tg://video?id=${message.video.file_id}"/>`;
   }
   if (message.animation) {
-    return `<video src="tg://video?id=${encodeURIComponent(message.animation.file_id)}"/>`;
+    return `<video src="tg://video?id=${message.animation.file_id}"/>`;
   }
   if (message.video_note) {
-    return `<video src="tg://video?id=${encodeURIComponent(message.video_note.file_id)}"/>`;
+    return `<video src="tg://video?id=${message.video_note.file_id}"/>`;
   }
   if (message.document) {
     const d = message.document;
     const label = d.file_name || 'document';
-    return `<a href="tg://document?id=${encodeURIComponent(d.file_id)}">${escapeHtml(label)}</a>`;
+    return `<a href="tg://document?id=${d.file_id}">${escapeHtml(label)}</a>`;
   }
   if (message.audio) {
-    return `<audio src="tg://audio?id=${encodeURIComponent(message.audio.file_id)}"/>`;
+    return `<audio src="tg://audio?id=${message.audio.file_id}"/>`;
   }
   if (message.voice) {
-    return `<audio src="tg://audio?id=${encodeURIComponent(message.voice.file_id)}"/>`;
+    return `<audio src="tg://audio?id=${message.voice.file_id}"/>`;
   }
   if (message.sticker) {
-    return `<img src="tg://photo?id=${encodeURIComponent(message.sticker.file_id)}"/>`;
+    return `<img src="tg://photo?id=${message.sticker.file_id}"/>`;
   }
   return null;
 }
@@ -139,9 +168,8 @@ async function sendRich(env, chatId, replyToId, richMessage, threadId) {
   };
   if (threadId != null) payload.message_thread_id = threadId;
 
-  console.log('[sendRich] request:', JSON.stringify(payload).slice(0, 1200));
+  if (DEBUG) console.log('[sendRich] request:', JSON.stringify(payload).slice(0, 1200));
   const r = await tg(env, 'sendRichMessage', payload);
-  console.log('[sendRich] response:', JSON.stringify(r).slice(0, 800));
   return r;
 }
 async function sendPlain(env, chatId, replyToId, text, threadId) {
@@ -156,7 +184,7 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV media handler
+// PV media handler — replies with the LONG id tag
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
@@ -176,11 +204,11 @@ async function handleMediaPV(message, env) {
 async function handleHelp(message, env) {
   await sendPlain(env, message.chat.id, message.message_id,
     '<b>🤖 Rich Message Bot</b>\n\n' +
-    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a self-contained tag.\n' +
-    'Convert it with <code>/rich &lt;tag&gt;</code>, no lookup needed.\n\n' +
+    '<b>PV media</b> — send a photo/video/audio/document; the bot replies with a tag.\n' +
+    'Copy the tag into any message, then convert with <code>/rich &lt;tag&gt;</code>.\n\n' +
+    '<b>Channels</b> — post the tag as text; the bot edits it into a rich message.\n\n' +
     '<b>Groups / DMs</b>\n' +
-    '<code>/rich</code> reply to HTML, or <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code>\n' +
-    '<code>/ping</code> <code>/debug</code> <code>/help</code>',
+    '<code>/rich</code> <code>/ping</code> <code>/debug</code> <code>/help</code>',
     message.message_thread_id);
 }
 async function handlePing(message, env) {
@@ -230,30 +258,27 @@ async function handleRich(message, env, args, botId) {
   }
   if (!html.trim()) return;
 
-  const richMessage = { html };
-  const media = buildMediaArray(html);
-  if (media.length) richMessage.media = media;
+  // ── Shorten ids and build the media array right here ──
+  const { html: shortHtml, media } = shortenAndBuildMedia(html);
+  const richMessage = media.length
+    ? { html: shortHtml, media }
+    : { html };
 
-  console.log('[handleRich] richMessage:', JSON.stringify(richMessage).slice(0, 1200));
+  if (DEBUG) console.log('[handleRich] payload:', JSON.stringify(richMessage).slice(0, 1200));
 
   const rich = await sendRich(env, message.chat.id, replyToId, richMessage, threadId);
-  if (rich.ok) {
-    console.log('[handleRich] success');
-    return;
-  }
+  if (rich.ok) return;
 
-  // Rich failed — show exactly why
-  const errText =
+  // Show the exact API rejection
+  await sendPlain(env, message.chat.id, replyToId,
     `❌ <b>sendRichMessage failed</b>\n` +
-    `description: <code>${escapeHtml((rich.description || 'none').slice(0, 400))}</code>\n` +
-    `error_code: <code>${escapeHtml(rich.error_code ?? '—')}</code>\n\n` +
-    `<b>Payload sent:</b>\n<pre>${escapeHtml(jsonBlock(richMessage, 900))}</pre>`;
-
-  await sendPlain(env, message.chat.id, replyToId, errText, threadId);
+    `description: <code>${escapeHtml((rich.description || 'none').slice(0, 400))}</code>\n\n` +
+    `<b>Payload:</b>\n<pre>${escapeHtml(jsonBlock(richMessage, 900))}</pre>`,
+    threadId);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Channel auto-convert
+// Channel auto-convert — shortens ids before editing
 // ═══════════════════════════════════════════════════════════════════════
 async function handleChannelPost(post, env, isEdit) {
   const chatId = post.chat.id;
@@ -267,9 +292,12 @@ async function handleChannelPost(post, env, isEdit) {
   if (!post.text)             { console.log('[channel] skip: no text'); return; }
   if (!hasHtmlTag(post.text)) { console.log('[channel] skip: no HTML tag'); return; }
 
-  const richMessage = { html: post.text };
-  const media = buildMediaArray(post.text);
-  if (media.length) richMessage.media = media;
+  const { html: shortHtml, media } = shortenAndBuildMedia(post.text);
+  const richMessage = media.length
+    ? { html: shortHtml, media }
+    : { html: post.text };
+
+  if (DEBUG) console.log('[channel] payload:', JSON.stringify(richMessage).slice(0, 1200));
 
   const edit = await tg(env, 'editMessageText', {
     chat_id: chatId,
