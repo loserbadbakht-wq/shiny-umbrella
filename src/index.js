@@ -85,6 +85,13 @@ function buildBlockedFilter() {
   return ' ' + BLOCKED_TAGS.map(t => `-${t}`).join(' ');
 }
 
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 // ---------- Gelbooru ----------
 async function fetchPosts(tag, limit, apiKey, userId) {
   const params = new URLSearchParams({
@@ -215,7 +222,6 @@ async function handleProxy(request, targetUrlStr) {
     'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
   );
   headers.set('Accept-Language', 'en-US,en;q=0.9');
-  // ← the header that defeats hotlink protection
   headers.set('Referer', `${targetUrl.origin}/`);
 
   const range = request.headers.get('Range');
@@ -263,7 +269,6 @@ async function handleProxy(request, targetUrlStr) {
 }
 
 // ---------- Build the plain proxy URL Telegram will fetch ----------
-//   https://<worker>/https://img4.gelbooru.com//samples/40/a0/sample_xxx.jpg
 function buildProxyUrl(workerUrl, targetUrl) {
   const base = workerUrl.replace(/\/+$/, '');
   return `${base}/${targetUrl}`;
@@ -276,6 +281,13 @@ async function resolveWorkerUrl(env) {
   const fromKv = (await getSavedWorkerUrl(env.GELBOORU_KV) || '').trim().replace(/\/+$/, '');
   return fromKv;
 }
+
+// ---------- Inline keyboard with ❤️ button ----------
+const LIKE_KEYBOARD = {
+  inline_keyboard: [
+    [{ text: '❤️', callback_data: 'like' }],
+  ],
+};
 
 // ---------- Send a post ----------
 async function sendPost(env, chatId, post) {
@@ -295,6 +307,7 @@ async function sendPost(env, chatId, post) {
         photo: proxyUrl,
         caption: text.slice(0, 1024),
         parse_mode: 'HTML',
+        reply_markup: LIKE_KEYBOARD,
       });
 
       if (r.ok) {
@@ -318,6 +331,7 @@ async function sendPost(env, chatId, post) {
     text: `<b>${title}</b>\n\n${text}`,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
+    reply_markup: LIKE_KEYBOARD,
   });
   return !!r.ok;
 }
@@ -333,6 +347,63 @@ async function sendLatestPost(env, chatId) {
     return;
   }
   await sendPost(env, chatId, posts[0]);
+}
+
+// ---------- Handle ❤️ button press → edit the post caption ----------
+async function handleCallbackQuery(env, cq) {
+  // Always acknowledge the callback so Telegram stops the loading spinner.
+  await tg(env.BOT_TOKEN, 'answerCallbackQuery', {
+    callback_query_id: cq.id,
+  });
+
+  if (cq.data !== 'like') return;
+
+  const msg = cq.message;
+  if (!msg) return;
+
+  const from = cq.from || {};
+  const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Someone';
+  const likeLine = `${escapeHtml(name)} liked this art!`;
+  const LIKE_SUFFIX = ' liked this art!';
+
+  const currentCaption = msg.caption || msg.text || '';
+  let newCaption = currentCaption ? `${currentCaption}\n\n${likeLine}` : likeLine;
+
+  // Telegram caption limit is 1024 chars; drop the oldest like-lines if needed.
+  const MAX = 1024;
+  if (newCaption.length > MAX) {
+    const lines = newCaption.split('\n\n');
+    const header = [];
+    const likes = [];
+    for (const l of lines) {
+      if (l.endsWith(LIKE_SUFFIX)) likes.push(l);
+      else header.push(l);
+    }
+    let rebuilt = header.join('\n\n');
+    for (let i = likes.length - 1; i >= 0; i--) {
+      const candidate = `${rebuilt}\n\n${likes[i]}`;
+      if (candidate.length > MAX) break;
+      rebuilt = candidate;
+    }
+    newCaption = rebuilt;
+  }
+
+  const editPayload = {
+    chat_id: msg.chat.id,
+    message_id: msg.message_id,
+    reply_markup: LIKE_KEYBOARD,
+  };
+
+  if (msg.caption !== undefined || msg.photo) {
+    editPayload.caption = newCaption;
+    editPayload.parse_mode = 'HTML';
+    await tg(env.BOT_TOKEN, 'editMessageCaption', editPayload);
+  } else {
+    editPayload.text = newCaption;
+    editPayload.parse_mode = 'HTML';
+    editPayload.disable_web_page_preview = true;
+    await tg(env.BOT_TOKEN, 'editMessageText', editPayload);
+  }
 }
 
 // ---------- Handlers ----------
@@ -381,6 +452,14 @@ async function handleWebhook(request, env) {
 
   try {
     const update = await request.json();
+
+    // ---- ❤️ inline button press ----
+    if (update.callback_query) {
+      await handleCallbackQuery(env, update.callback_query);
+      return new Response('ok');
+    }
+
+    // ---- Regular messages ----
     const msg = update.message || update.edited_message;
 
     if (msg?.text) {
@@ -442,10 +521,7 @@ export default {
       return handleDebug(env);
     }
 
-    // ---------------------------------------------------------
-    // Proxy route — the whole target URL is appended to the path:
-    //   /https://img4.gelbooru.com//samples/40/a0/sample_xxx.jpg
-    // ---------------------------------------------------------
+    // Proxy route: /https://img4.gelbooru.com//samples/...
     if (
       url.pathname.startsWith('/http://') ||
       url.pathname.startsWith('/https://')
