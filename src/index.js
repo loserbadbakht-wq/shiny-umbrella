@@ -148,6 +148,10 @@ function buildDescription(post) {
   let   tagsStr      = other.length       ? other.join(' ')       : 'None';
   if (tagsStr.length > 1000) tagsStr = tagsStr.slice(0, 1000) + '...';
 
+  const sourceLine = post.source
+    ? `\n\n<b>Source:</b> <a href="${post.source}">${post.source}</a>`
+    : '';
+
   return {
     title: allTags.slice(0, 3).join(' ') || `Image ${post.id}`,
     text:
@@ -155,7 +159,8 @@ function buildDescription(post) {
       `<b>Character(s):</b> ${characterStr}\n\n` +
       `<b>Orientation:</b> ${orientStr}\n\n` +
       `<b>Tags:</b> ${tagsStr}\n\n` +
-      `<a href="${post.file_url}">original size</a>`,
+      `<a href="${post.file_url}">original size</a>` +
+      sourceLine,
   };
 }
 
@@ -445,8 +450,6 @@ export default {
       url.pathname.startsWith('/http://') ||
       url.pathname.startsWith('/https://')
     ) {
-      // slice(1) removes the leading slash, restoring the full URL.
-      // Keep the query string too — some sample URLs have one.
       const target = url.pathname.slice(1) + (url.search || '');
       return handleProxy(request, target);
     }
