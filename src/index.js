@@ -149,7 +149,7 @@ function buildDescription(post) {
   if (tagsStr.length > 1000) tagsStr = tagsStr.slice(0, 1000) + '...';
 
   const sourceLine = post.source
-    ? `\n\n<b>Source:</b> <a href="${post.source}">${post.source}</a>`
+    ? `\n\n<a href="${post.source}">Source</a>`
     : '';
 
   return {
