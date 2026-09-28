@@ -164,51 +164,97 @@ async function tg(token, method, body) {
   return res.json();
 }
 
-// ---------- Download image bytes inside the Worker ----------
-async function downloadImage(url) {
-  if (!url) return null;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Referer': 'https://gelbooru.com/',
-      'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8',
-    },
-    redirect: 'follow',
-  });
-  if (!res.ok) {
-    console.log(`⚠️ Image download failed (${res.status}): ${url}`);
-    return null;
+// ============================================================
+// STREAMING PROXY  →  used so Telegram can fetch hotlink-
+// protected images through us instead of downloading+uploading
+// ============================================================
+const PROXY_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36';
+
+async function handleProxy(request, targetUrlStr) {
+  let targetUrl;
+  try {
+    targetUrl = new URL(targetUrlStr);
+  } catch {
+    return new Response('Invalid target URL', { status: 400 });
   }
-  return {
-    buf: await res.arrayBuffer(),
-    contentType: res.headers.get('content-type') || 'image/jpeg',
-  };
-}
 
-// ---------- Multipart upload to Telegram ----------
-async function tgSendPhotoUpload(token, chatId, fileBuf, contentType, caption) {
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append('parse_mode', 'HTML');
-  form.append('caption', caption.slice(0, 1024));
-  form.append('photo', new Blob([fileBuf], { type: contentType }), 'image.jpg');
+  if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
+    return new Response('Invalid protocol', { status: 400 });
+  }
 
-  const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
-    method: 'POST',
-    body: form,
+  const headers = new Headers();
+  headers.set('User-Agent', PROXY_UA);
+  headers.set('Accept', 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
+  headers.set('Accept-Language', 'en-US,en;q=0.9');
+  headers.set('Sec-Fetch-Dest', 'image');
+  headers.set('Sec-Fetch-Mode', 'no-cors');
+  headers.set('Sec-Fetch-Site', 'same-origin');
+  // The magic header that defeats Gelbooru's hotlink protection
+  headers.set('Referer', `${targetUrl.origin}/`);
+
+  const range = request.headers.get('Range');
+  if (range) headers.set('Range', range);
+
+  let upstream;
+  try {
+    upstream = await fetch(targetUrl.href, {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+    });
+  } catch (e) {
+    return new Response(`Proxy fetch failed: ${e.message}`, { status: 502 });
+  }
+
+  const responseHeaders = new Headers();
+  for (const h of [
+    'content-type',
+    'content-length',
+    'content-range',
+    'accept-ranges',
+    'last-modified',
+    'etag',
+  ]) {
+    const v = upstream.headers.get(h);
+    if (v) responseHeaders.set(h, v);
+  }
+  responseHeaders.set('access-control-allow-origin', '*');
+  responseHeaders.set('cache-control', 'public, max-age=86400');
+  responseHeaders.set('x-proxied-by', 'shiny-art-worker');
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: responseHeaders,
   });
-  return res.json();
 }
 
-async function sendPost(token, chatId, post) {
-  const { text, title } = buildDescription(post);
-  const img = await downloadImage(post.sample_url);
+// ---------- Build a proxy URL for a given image ----------
+function buildProxyUrl(env, targetUrl) {
+  const base = (env.WORKER_URL || '').replace(/\/+$/, '');
+  return `${base}/proxy/${encodeURIComponent(targetUrl)}`;
+}
 
-  if (img) {
-    const r = await tgSendPhotoUpload(token, chatId, img.buf, img.contentType, text);
+// ---------- Send a post to Telegram ----------
+async function sendPost(env, chatId, post) {
+  const { text, title } = buildDescription(post);
+
+  // Primary path: give Telegram a proxy URL; it fetches the image itself.
+  if (post.sample_url && env.WORKER_URL) {
+    const proxyUrl = buildProxyUrl(env, post.sample_url);
+
+    const r = await tg(env.BOT_TOKEN, 'sendPhoto', {
+      chat_id: chatId,
+      photo: proxyUrl,
+      caption: text.slice(0, 1024),
+      parse_mode: 'HTML',
+    });
+
     if (r.ok) {
       if (text.length > 1024) {
-        await tg(token, 'sendMessage', {
+        await tg(env.BOT_TOKEN, 'sendMessage', {
           chat_id: chatId,
           text: `<b>${title}</b>\n\n${text}`,
           parse_mode: 'HTML',
@@ -217,10 +263,11 @@ async function sendPost(token, chatId, post) {
       }
       return true;
     }
-    console.log('sendPhoto(upload) failed:', r.description);
+    console.log('sendPhoto(proxy) failed:', r.description);
   }
 
-  const r = await tg(token, 'sendMessage', {
+  // Fallback: text-only message.
+  const r = await tg(env.BOT_TOKEN, 'sendMessage', {
     chat_id: chatId,
     text: `<b>${title}</b>\n\n${text}`,
     parse_mode: 'HTML',
@@ -239,7 +286,7 @@ async function sendLatestPost(env, chatId) {
     });
     return;
   }
-  await sendPost(env.BOT_TOKEN, chatId, posts[0]);
+  await sendPost(env, chatId, posts[0]);
 }
 
 // ---------- Handlers ----------
@@ -248,6 +295,10 @@ async function handleCron(env) {
 
   if (!env.KEY || !env.ID) {
     console.log('❌ Missing KEY or ID env vars.');
+    return;
+  }
+  if (!env.WORKER_URL) {
+    console.log('❌ Missing WORKER_URL env var.');
     return;
   }
 
@@ -265,7 +316,7 @@ async function handleCron(env) {
 
   for (const post of newPosts) {
     try {
-      await sendPost(env.BOT_TOKEN, chatId, post);
+      await sendPost(env, chatId, post);
       await saveLastId(env.GELBOORU_KV, post.id);
     } catch (e) {
       console.error(`❌ Failed to send post ${post.id}:`, e);
@@ -319,6 +370,19 @@ export default {
     ctx.waitUntil(handleCron(env));
   },
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // /proxy/<encoded-target-url>
+    if (url.pathname.startsWith('/proxy/')) {
+      let target;
+      try {
+        target = decodeURIComponent(url.pathname.slice('/proxy/'.length));
+      } catch {
+        return new Response('Bad proxy path', { status: 400 });
+      }
+      return handleProxy(request, target + url.search);
+    }
+
     return handleWebhook(request, env);
   },
 };
