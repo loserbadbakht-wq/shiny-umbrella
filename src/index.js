@@ -3,7 +3,9 @@ import tagsConfig from './tags_config.json';
 const { ORIENTATION, COPYRIGHT_TAGS, CHARACTER_TAGS } = tagsConfig;
 
 const GELBOORU_API = 'https://gelbooru.com/index.php';
-const BLOCKED_TAGS = ['mahou_shoujo_madoka_magica'];
+const BLOCKED_TAGS = ["guro", "snuff", "scat", "bestiality", "rape",
+    "loli", "shota", "incest", "mind_break", "netorare",
+    "mahou_shoujo_madoka_magica",];
 
 // ============= ENCRYPTION HELPERS =============
 let ENCRYPTION_KEY = 'default-key-please-change-me';
