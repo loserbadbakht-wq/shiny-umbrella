@@ -1,8 +1,13 @@
-name = "shiny-umbrella"
+name = "shiny-art"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-09-01"
 
-# Add KV binding for persistent storage
+[triggers]
+crons = ["*/10 * * * *"]   # every 10 minutes
+
+# Create the KV namespace with:
+#   wrangler kv:namespace create GELBOORU_KV
+# Then paste the id below.
 [[kv_namespaces]]
-binding = "KV"
-id = "0bd35f692baa4013b69a6e477dc6e881"  # ← Replace with your actual KV Namespace ID
+binding = "GELBOORU_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
