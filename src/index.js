@@ -105,7 +105,6 @@ function reconstructHtml(text, entities) {
   if (!text) return '';
   if (!entities || !entities.length) return text;
 
-  // Process from the end so earlier offsets stay valid.
   const sorted = [...entities].sort((a, b) => b.offset - a.offset);
   let result = text;
 
@@ -227,7 +226,6 @@ async function tg(token, method, body) {
 
 // ============================================================
 // STREAMING PROXY
-// URL shape:  https://<worker>/https://img4.gelbooru.com//samples/...
 // ============================================================
 const PROXY_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -369,7 +367,6 @@ async function sendPost(env, chatId, post) {
     }
   }
 
-  // Text-only fallback
   const r = await tg(env.BOT_TOKEN, 'sendMessage', {
     chat_id: chatId,
     text: `<b>${title}</b>\n\n${text}`,
@@ -395,26 +392,42 @@ async function sendLatestPost(env, chatId) {
 
 // ---------- Handle ❤️ button press → edit the post caption ----------
 async function handleCallbackQuery(env, cq) {
-  // Always acknowledge the callback so Telegram stops the loading spinner.
-  await tg(env.BOT_TOKEN, 'answerCallbackQuery', {
-    callback_query_id: cq.id,
-  });
-
-  if (cq.data !== 'like') return;
+  // Not a like → just ack and bail.
+  if (cq.data !== 'like') {
+    await tg(env.BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: cq.id });
+    return;
+  }
 
   const msg = cq.message;
-  if (!msg) return;
+  if (!msg) {
+    await tg(env.BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: cq.id });
+    return;
+  }
 
   const from = cq.from || {};
   const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Someone';
   const likeLine = `${escapeHtml(name)} liked this art!`;
   const LIKE_SUFFIX = ' liked this art!';
 
-  // ⚠️  Telegram returns the caption as PLAIN TEXT + a separate entities array.
-  //     We must rebuild the HTML before appending, or all formatting/links die.
+  // Telegram returns plain text + a separate entities array.
+  // Rebuild the HTML first, or all links/formatting die.
   const plainCaption = msg.caption || msg.text || '';
   const entities = msg.caption_entities || msg.entities || [];
   const htmlCaption = reconstructHtml(plainCaption, entities);
+
+  // Same user can only like once — dedup by their exact like line.
+  if (htmlCaption.includes(likeLine)) {
+    await tg(env.BOT_TOKEN, 'answerCallbackQuery', {
+      callback_query_id: cq.id,
+      text: 'You already liked this!',
+      show_alert: false,
+    });
+    return;
+  }
+
+  await tg(env.BOT_TOKEN, 'answerCallbackQuery', {
+    callback_query_id: cq.id,
+  });
 
   let newCaption = htmlCaption ? `${htmlCaption}\n\n${likeLine}` : likeLine;
 
@@ -502,13 +515,11 @@ async function handleWebhook(request, env) {
   try {
     const update = await request.json();
 
-    // ---- ❤️ inline button press ----
     if (update.callback_query) {
       await handleCallbackQuery(env, update.callback_query);
       return new Response('ok');
     }
 
-    // ---- Regular messages ----
     const msg = update.message || update.edited_message;
 
     if (msg?.text) {
@@ -570,7 +581,6 @@ export default {
       return handleDebug(env);
     }
 
-    // Proxy route: /https://img4.gelbooru.com//samples/...
     if (
       url.pathname.startsWith('/http://') ||
       url.pathname.startsWith('/https://')
