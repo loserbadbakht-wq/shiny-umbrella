@@ -10,4 +10,4 @@ crons = ["*/10 * * * *"]   # every 10 minutes
 # Then paste the id below.
 [[kv_namespaces]]
 binding = "GELBOORU_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "b3989f56de05498d9aa7a6c965c9e492"
