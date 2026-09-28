@@ -9,35 +9,35 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      
+
       - name: Install dependencies
         run: npm install
-      
+
       - name: Install Wrangler
         run: npm install -g wrangler
-      
+
       - name: Deploy to Cloudflare Workers
         run: |
           wrangler deploy \
             --var BOT_TOKEN:${{ secrets.TEN_BOT_TOKEN }} \
-            --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }}
+            --var KEY:${{ secrets.KEY }} \
+            --var ID:${{ secrets.ID }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      
+
       - name: Set Webhook
         run: |
           WORKER_URL="https://shiny-art.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
           curl -X POST "https://api.telegram.org/bot${{ secrets.TEN_BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
-      
+
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
