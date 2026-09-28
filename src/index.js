@@ -92,6 +92,50 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;');
 }
 
+function escapeAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Rebuild HTML from plain caption + Telegram's caption_entities array.
+function reconstructHtml(text, entities) {
+  if (!text) return '';
+  if (!entities || !entities.length) return text;
+
+  // Process from the end so earlier offsets stay valid.
+  const sorted = [...entities].sort((a, b) => b.offset - a.offset);
+  let result = text;
+
+  for (const ent of sorted) {
+    const start = ent.offset;
+    const end = ent.offset + ent.length;
+    if (start < 0 || end > result.length) continue;
+
+    const inner = result.slice(start, end);
+    let wrapped;
+    switch (ent.type) {
+      case 'bold':          wrapped = `<b>${inner}</b>`; break;
+      case 'italic':        wrapped = `<i>${inner}</i>`; break;
+      case 'underline':     wrapped = `<u>${inner}</u>`; break;
+      case 'strikethrough': wrapped = `<s>${inner}</s>`; break;
+      case 'spoiler':       wrapped = `<tg-spoiler>${inner}</tg-spoiler>`; break;
+      case 'code':          wrapped = `<code>${inner}</code>`; break;
+      case 'pre':           wrapped = `<pre>${inner}</pre>`; break;
+      case 'blockquote':    wrapped = `<blockquote>${inner}</blockquote>`; break;
+      case 'text_link':     wrapped = `<a href="${escapeAttr(ent.url || '')}">${inner}</a>`; break;
+      case 'text_mention':  wrapped = `<a href="tg://user?id=${ent.user?.id}">${inner}</a>`; break;
+      case 'url':           wrapped = `<a href="${escapeAttr(inner)}">${inner}</a>`; break;
+      default:              wrapped = inner;
+    }
+    result = result.slice(0, start) + wrapped + result.slice(end);
+  }
+
+  return result;
+}
+
 // ---------- Gelbooru ----------
 async function fetchPosts(tag, limit, apiKey, userId) {
   const params = new URLSearchParams({
@@ -156,7 +200,7 @@ function buildDescription(post) {
   if (tagsStr.length > 1000) tagsStr = tagsStr.slice(0, 1000) + '...';
 
   const sourceLine = post.source
-    ? `\n\n<a href="${post.source}">Source</a>`
+    ? `\n\n<a href="${escapeAttr(post.source)}">Source</a>`
     : '';
 
   return {
@@ -166,7 +210,7 @@ function buildDescription(post) {
       `<b>Character(s):</b> ${characterStr}\n\n` +
       `<b>Orientation:</b> ${orientStr}\n\n` +
       `<b>Tags:</b> ${tagsStr}\n\n` +
-      `<a href="${post.file_url}">original size</a>` +
+      `<a href="${escapeAttr(post.file_url)}">original size</a>` +
       sourceLine,
   };
 }
@@ -366,8 +410,13 @@ async function handleCallbackQuery(env, cq) {
   const likeLine = `${escapeHtml(name)} liked this art!`;
   const LIKE_SUFFIX = ' liked this art!';
 
-  const currentCaption = msg.caption || msg.text || '';
-  let newCaption = currentCaption ? `${currentCaption}\n\n${likeLine}` : likeLine;
+  // ⚠️  Telegram returns the caption as PLAIN TEXT + a separate entities array.
+  //     We must rebuild the HTML before appending, or all formatting/links die.
+  const plainCaption = msg.caption || msg.text || '';
+  const entities = msg.caption_entities || msg.entities || [];
+  const htmlCaption = reconstructHtml(plainCaption, entities);
+
+  let newCaption = htmlCaption ? `${htmlCaption}\n\n${likeLine}` : likeLine;
 
   // Telegram caption limit is 1024 chars; drop the oldest like-lines if needed.
   const MAX = 1024;
