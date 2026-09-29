@@ -4,7 +4,7 @@ const { ORIENTATION, COPYRIGHT_TAGS, CHARACTER_TAGS } = tagsConfig;
 
 const GELBOORU_API = 'https://gelbooru.com/index.php';
 const BLOCKED_TAGS = ["guro", "snuff", "scat", "bestiality", "rape",
-    "loli", "one-loli", "shota", "incest", "mind_break", "netorare",
+    "loli", "onee-loli", "shota", "incest", "mind_break", "netorare",
     "mahou_shoujo_madoka_magica",];
 
 // ============= ENCRYPTION HELPERS =============
