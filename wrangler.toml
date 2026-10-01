@@ -15,12 +15,16 @@ id = "d97a738c46a74230bc7bbb597956bee5"
 [[durable_objects.bindings]]
 name = "BTN_COUNTER"
 class_name = "ButtonCounter"
+
+[[durable_objects.bindings]]
 name = "GAME_COUNTER"
 class_name = "GameCounter"
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ButtonCounter"]
+
+[[migrations]]
 tag = "v2"
 new_sqlite_classes = ["GameCounter"]
 
