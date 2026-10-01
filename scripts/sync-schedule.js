@@ -1,10 +1,12 @@
 // ============================================================
 // Fetches AniList airing schedule and writes it to Cloudflare KV.
-// Runs from GitHub Actions — AniList doesn't block GitHub's IPs.
+// Skips writes when the data hasn't meaningfully changed, so we
+// don't burn through the 1000 writes/day free tier.
 // ============================================================
 
 const ANILIST_API = 'https://graphql.anilist.co';
 const CF_API = 'https://api.cloudflare.com/client/v4';
+const crypto = require('crypto');
 
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
 const CF_KV_NAMESPACE_ID = process.env.CF_KV_NAMESPACE_ID;
@@ -16,7 +18,8 @@ if (!CF_ACCOUNT_ID || !CF_KV_NAMESPACE_ID || !CF_API_TOKEN) {
 }
 
 const KV_KEY = 'sched:anilist:v5:week';
-const KV_TTL = 86400; // 24 hours — schedule refreshes every 15 min anyway
+const KV_TTL = 86400;         // 24 hours
+const FORCE_WRITE_AFTER_MS = 6 * 60 * 60 * 1000;  // rewrite at least every 6h
 const JST = 'Asia/Tokyo';
 
 const ANILIST_QUERY = `
@@ -51,7 +54,6 @@ async function anilistFetch(variables, attempt = 1) {
       },
       body: JSON.stringify({ query: ANILIST_QUERY, variables }),
     });
-
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (json.errors) throw new Error(`GraphQL: ${JSON.stringify(json.errors)}`);
@@ -127,6 +129,21 @@ async function buildWeek() {
   return week;
 }
 
+async function readKV(key) {
+  const url = `${CF_API}/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    console.warn(`KV read failed: HTTP ${res.status}`);
+    return null;
+  }
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return text; }
+}
+
 async function writeToKV(key, value, ttl) {
   const url = `${CF_API}/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${encodeURIComponent(key)}?expiration_ttl=${ttl}`;
   const res = await fetch(url, {
@@ -141,19 +158,54 @@ async function writeToKV(key, value, ttl) {
   if (!res.ok || json.success === false) {
     throw new Error(`KV write failed: HTTP ${res.status} ${JSON.stringify(json).slice(0, 300)}`);
   }
-  console.log(`KV write OK: ${key}`);
+}
+
+/**
+ * Compute a stable fingerprint of just the parts that matter for
+ * scheduling. We deliberately ignore ts and jstTime, because those
+ * change every run without affecting airing logic.
+ */
+function fingerprint(week) {
+  const basis = {};
+  for (const day of Object.keys(week).sort()) {
+    basis[day] = week[day].map((e) => ({
+      id: e.anilist_id,
+      ep: e.episode,
+      at: e.airingAt,
+      total: e.episodes,
+    }));
+  }
+  return crypto.createHash('sha1').update(JSON.stringify(basis)).digest('hex');
 }
 
 (async () => {
   try {
+    // 1. Read existing KV
+    const existing = await readKV(KV_KEY);
+    const existingFp = existing?.week ? fingerprint(existing.week) : null;
+    const existingAge = existing?.ts ? Date.now() - existing.ts : Infinity;
+
+    // 2. Fetch fresh data
     const week = await buildWeek();
-    const payload = { ts: Date.now(), week };
-    await writeToKV(KV_KEY, payload, KV_TTL);
+    const newFp = fingerprint(week);
 
     const summary = Object.entries(week)
       .map(([d, list]) => `${d}: ${list.length}`)
       .join(', ');
-    console.log(`Wrote week cache. ${summary}`);
+    console.log(`Fetched: ${summary}`);
+    console.log(`Old fingerprint: ${existingFp || '(none)'}`);
+    console.log(`New fingerprint: ${newFp}`);
+
+    // 3. Skip write if nothing changed (unless the entry is very old)
+    if (existingFp === newFp && existingAge < FORCE_WRITE_AFTER_MS) {
+      console.log(`✅ No change detected (age ${Math.round(existingAge / 60000)}m). Skipping KV write to save quota.`);
+      process.exit(0);
+    }
+
+    // 4. Write
+    const payload = { ts: Date.now(), week };
+    await writeToKV(KV_KEY, payload, KV_TTL);
+    console.log(`✅ KV write OK (${Object.values(week).flat().length} entries)`);
     process.exit(0);
   } catch (e) {
     console.error('FAILED:', e.message);
