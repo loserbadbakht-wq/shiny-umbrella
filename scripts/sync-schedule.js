@@ -4,9 +4,10 @@
 // don't burn through the 1000 writes/day free tier.
 // ============================================================
 
+import crypto from 'crypto';
+
 const ANILIST_API = 'https://graphql.anilist.co';
 const CF_API = 'https://api.cloudflare.com/client/v4';
-const crypto = require('crypto');
 
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
 const CF_KV_NAMESPACE_ID = process.env.CF_KV_NAMESPACE_ID;
@@ -162,8 +163,7 @@ async function writeToKV(key, value, ttl) {
 
 /**
  * Compute a stable fingerprint of just the parts that matter for
- * scheduling. We deliberately ignore ts and jstTime, because those
- * change every run without affecting airing logic.
+ * scheduling. Ignores ts and jstTime, which change every run.
  */
 function fingerprint(week) {
   const basis = {};
@@ -180,12 +180,10 @@ function fingerprint(week) {
 
 (async () => {
   try {
-    // 1. Read existing KV
     const existing = await readKV(KV_KEY);
     const existingFp = existing?.week ? fingerprint(existing.week) : null;
     const existingAge = existing?.ts ? Date.now() - existing.ts : Infinity;
 
-    // 2. Fetch fresh data
     const week = await buildWeek();
     const newFp = fingerprint(week);
 
@@ -196,13 +194,11 @@ function fingerprint(week) {
     console.log(`Old fingerprint: ${existingFp || '(none)'}`);
     console.log(`New fingerprint: ${newFp}`);
 
-    // 3. Skip write if nothing changed (unless the entry is very old)
     if (existingFp === newFp && existingAge < FORCE_WRITE_AFTER_MS) {
       console.log(`✅ No change detected (age ${Math.round(existingAge / 60000)}m). Skipping KV write to save quota.`);
       process.exit(0);
     }
 
-    // 4. Write
     const payload = { ts: Date.now(), week };
     await writeToKV(KV_KEY, payload, KV_TTL);
     console.log(`✅ KV write OK (${Object.values(week).flat().length} entries)`);
