@@ -1,6 +1,27 @@
 name: Sync AniList Schedule to KV
 
 on:
+  schedule:
     # Runs every 15 minutes. GitHub's minimum granularity for cron is 5 min,
     # but schedules sometimes run late — 15 min gives reliable coverage.
+    - cron: '*/15 * * * *'
   workflow_dispatch:  # manual trigger from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Sync schedule to Cloudflare KV
+        run: node scripts/sync-schedule.js
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
