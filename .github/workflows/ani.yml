@@ -2,10 +2,8 @@ name: Sync AniList Schedule to KV
 
 on:
   schedule:
-    # Runs every 15 minutes. GitHub's minimum granularity for cron is 5 min,
-    # but schedules sometimes run late — 15 min gives reliable coverage.
     - cron: '*/15 * * * *'
-  workflow_dispatch:  # manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   sync:
