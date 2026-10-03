@@ -50,4 +50,4 @@ jobs:
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-tm.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "🔗 Worker URL: https://shiny-rs.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
