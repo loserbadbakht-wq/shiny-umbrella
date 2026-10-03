@@ -1,4 +1,4 @@
-name = "shiny-tm"
+name = "shiny-rs"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 
