@@ -1,3 +1,7 @@
 name = "shiny-chatr"
-main = "src/index.js"
-compatibility_date = "2026-01-01"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "TAG_LIST"
+id = "243ae7a5b9244f589b43feb5a4a00562"
