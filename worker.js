@@ -128,7 +128,7 @@ async function handleMessage(message, env) {
   // ---- /taglist (must be checked before /tag) ----
   if (text.startsWith('/taglist')) {
     const users = await getTagList(env, chatId);
-    const listText = users.map((u) => u.name).join('\n');
+    const listText = users.map((u) => u.name).join(', ');
     const fullText =
       'کیا پایه اومدن به لیست تگ هستن؟' + (listText ? '\n' + listText : '');
 
@@ -153,7 +153,7 @@ async function handleMessage(message, env) {
 
     const mentionText = users
       .map((u) => `<a href="tg://user?id=${u.id}">${htmlEsc(u.name)}</a>`)
-      .join('\n');
+      .join(', ');
 
     await sendMessage(env, chatId, mentionText, null, 'HTML');
     return;
@@ -188,7 +188,7 @@ async function handleCallbackQuery(callbackQuery, env) {
   // ---- /taglist join button ----
   if (callbackQuery.data === 'taglist_join') {
     const users = await addToTagList(env, chatId, { id: user.id, name: fullName });
-    const listText = users.map((u) => u.name).join('\n');
+    const listText = users.map((u) => u.name).join(', ');
     const fullText =
       'کیا پایه اومدن به لیست تگ هستن؟' + (listText ? '\n' + listText : '');
 
@@ -240,4 +240,4 @@ async function answerCallbackQuery(env, callbackQueryId) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ callback_query_id: callbackQueryId }),
   });
-                                }
+  }
