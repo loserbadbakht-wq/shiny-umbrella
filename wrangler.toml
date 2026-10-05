@@ -17,8 +17,3 @@ new_sqlite_classes = ["GameRoom"]
 [[rules]]
 type = "CompiledWasm"
 globs = ["**/*.wasm"]
-
-# Language preferences per chat
-[[kv_namespaces]]
-binding = "BOT_KV"
-id = "6557edccf1b0459d883e5fe815b619ce"
