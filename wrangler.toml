@@ -1,30 +1,24 @@
-name = "shiny-scam"
+name = "shiny-rss"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
 
-[triggers]
-crons = ["30 20 * * *", "30 * * * *", "*/5 * * * *"]
-
-[observability]
-enabled = true
-
+# ─── KV namespace for subscriptions, errors, telemetry ───
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "d97a738c46a74230bc7bbb597956bee5"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
-[[durable_objects.bindings]]
-name = "BTN_COUNTER"
-class_name = "ButtonCounter"
+# ─── Cron: check every feed every 5 minutes ───
+[triggers]
+crons = ["*/5 * * * *"]
 
-[[durable_objects.bindings]]
-name = "GAME_COUNTER"
-class_name = "GameCounter"
+# ─── Non-secret config ───
+[vars]
+# Telegram user id that receives error DMs and can use /debug & /errors.
+# Put your numeric user id here.
+OWNER_ID = "302287170"
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["ButtonCounter"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["GameCounter"]
-
+# ─── Observability ───
+[observability]
+enabled = true
+head_sampling_rate = 1
