@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 # ─── KV namespace for subscriptions, errors, telemetry ───
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "62f527eb75de40f5b0f49384b3d741ea"
 
 # ─── Cron: check every feed every 5 minutes ───
 [triggers]
