@@ -29,7 +29,7 @@ jobs:
         run: |
           wrangler deploy \
             --var BOT_TOKEN:${{ secrets.TWELVE_BOT_TOKEN }} \
-            --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }}
+            --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }} \
             --var KEY:${{ secrets.KEY }} \
             --var ID:${{ secrets.ID }}
         env:
