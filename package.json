@@ -1,5 +1,5 @@
 {
-  "name": "shiny-umbrella",
+  "name": "shiny-rss",
   "version": "1.0.0",
   "description": "Telegram bot running on Cloudflare Workers",
   "main": "src/index.js",
