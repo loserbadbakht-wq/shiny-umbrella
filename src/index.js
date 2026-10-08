@@ -25,7 +25,9 @@ const CRON_FIRED_FLAG_KEY = 'cron:fired_once';
 
 // ============= CONFIG (Gelbooru) =============
 const GELBOORU_API = 'https://gelbooru.com/index.php';
-const BLOCKED_TAGS = ['mahou_shoujo_madoka_magica'];
+const BLOCKED_TAGS = ["guro", "snuff", "scat", "bestiality", "rape",
+    "loli", "onee-loli", "shota", "onii-shota", "incest", "mind_break", "netorare",
+    "mahou_shoujo_madoka_magica",];
 const GELBOORU_FETCH_LIMIT = 5;
 
 // ============= ENCRYPTION =============
