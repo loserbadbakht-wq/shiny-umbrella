@@ -1,13 +1,14 @@
 {
-  "name": "shiny-umbrella",
+  "name": "shiny-scam",
   "version": "1.0.0",
-  "description": "Telegram bot running on Cloudflare Workers",
-  "main": "src/index.js",
+  "private": true,
   "type": "module",
-  "dependencies": {
-    "grammy": "^1.26.0"
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
   },
-  "devDependencies": {
-    "wrangler": "^3.78.0"
+  "dependencies": {
+    "minecraftstatuspinger": "^1.2.2"
   }
 }
