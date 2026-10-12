@@ -3,8 +3,8 @@
 //
 //  ▸ PV single media  → replies with a tg:// tag (full file_id), tap-to-copy
 //  ▸ PV album         → replies with one tg:// tag per media
-//  ▸ /rich <html>     → converts <img>/<video>/<audio>/<a> tags to ONE media message
-//  ▸ Channels (admin) → auto-converts HTML posts into ONE media message (text → caption)
+//  ▸ /rich <html>     → tries edit-in-place, else sends ONE media message
+//  ▸ Channels (admin) → tries edit-in-place, else delete + send ONE media message
 //  ▸ /start /ping /debug
 
 const DEBUG = true;
@@ -73,7 +73,7 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// RTL detection (kept for reference; not needed for regular messages)
+// RTL detection (kept for reference)
 // ═══════════════════════════════════════════════════════════════════════
 const RTL_CHAR_RE = /[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0750-\u077F\u0780-\u07BF\u07C0-\u07FF\u0800-\u083F\u0840-\u085F\u0860-\u086F\u0870-\u089F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
 const LTR_CHAR_RE = /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]/;
@@ -143,9 +143,9 @@ function extractMediaParts(html) {
     const lower = tagName.toLowerCase();
     let src = null, kind = null, label = null;
 
-    if (lower === 'img')      { src = attrVal(attrs, 'src'); if (src) kind = 'photo'; }
-    else if (lower === 'video')  { src = attrVal(attrs, 'src'); if (src) kind = 'video'; }
-    else if (lower === 'audio')  { src = attrVal(attrs, 'src'); if (src) kind = 'audio'; }
+    if (lower === 'img')        { src = attrVal(attrs, 'src'); if (src) kind = 'photo'; }
+    else if (lower === 'video') { src = attrVal(attrs, 'src'); if (src) kind = 'video'; }
+    else if (lower === 'audio') { src = attrVal(attrs, 'src'); if (src) kind = 'audio'; }
     else if (lower === 'a') {
       const href = attrVal(attrs, 'href');
       if (href) {
@@ -270,50 +270,23 @@ async function sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId) 
   return firstResult;
 }
 
-/**
- * Send parsed parts as ONE regular Telegram message when possible:
- *   • no media    → plain formatted text message
- *   • 1 media     → that media with the text as its caption
- *   • N media(>1) → album (media group) with the text as the caption of the first item
- * If the text exceeds Telegram's 1024-char caption limit, it is sent first
- * as a separate text message and the media follow without a caption.
- */
-async function sendAsSingleMessage(env, chatId, parts, threadId, replyToId) {
-  const mediaParts = parts.filter(p => p.type === 'media');
-  const textParts  = parts.filter(p => p.type === 'text');
-  let combinedText = simplifyHtml(textParts.map(p => p.html).join('\n\n'));
-
-  // Fallback caption: label from <a href="tg://document?id=...">label</a>
-  if (!combinedText && mediaParts.length === 1 && mediaParts[0].label) {
-    combinedText = mediaParts[0].label;
+// ═══════════════════════════════════════════════════════════════════════
+// Try to edit a TEXT message INTO a media message, in place.
+// Mirrors what rich_message could do. Returns true on success.
+// ═══════════════════════════════════════════════════════════════════════
+async function tryEditTextToMedia(env, chatId, msgId, mediaPart, caption) {
+  const fileId = resolveFileId(mediaPart.src);
+  const ref = fileId || mediaPart.src;
+  const media = { type: mediaPart.kind, media: ref };
+  const payload = { chat_id: chatId, message_id: msgId, media };
+  if (caption) {
+    payload.caption = caption;
+    payload.parse_mode = 'HTML';
   }
-
-  if (mediaParts.length === 0) {
-    if (!combinedText) return null;
-    const payload = { chat_id: chatId, text: combinedText, parse_mode: 'HTML' };
-    if (replyToId != null) payload.reply_parameters = { message_id: replyToId, allow_sending_without_reply: true };
-    if (threadId != null) payload.message_thread_id = threadId;
-    const r = await tg(env, 'sendMessage', payload);
-    if (!r.ok) console.error('[send] text failed:', r.description);
-    return r;
-  }
-
-  const captionTooLong = combinedText.length > 1024;
-
-  if (captionTooLong && combinedText) {
-    const payload = { chat_id: chatId, text: combinedText, parse_mode: 'HTML' };
-    if (replyToId != null) payload.reply_parameters = { message_id: replyToId, allow_sending_without_reply: true };
-    if (threadId != null) payload.message_thread_id = threadId;
-    const r = await tg(env, 'sendMessage', payload);
-    if (!r.ok) console.error('[send] text failed:', r.description);
-  }
-
-  const caption = captionTooLong ? null : (combinedText || null);
-
-  if (mediaParts.length === 1) {
-    return sendSingleMedia(env, chatId, mediaParts[0], caption, threadId, replyToId);
-  }
-  return sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId);
+  const r = await tg(env, 'editMessageMedia', payload);
+  if (r.ok) return true;
+  console.error('[edit] editMessageMedia refused:', r.description);
+  return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -364,7 +337,7 @@ function scheduleAlbumProcessing(message, env, ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// /start /ping /debug /rich
+// /start /ping /debug
 // ═══════════════════════════════════════════════════════════════════════
 async function handleStart(message, env) {
   const text =
@@ -379,8 +352,8 @@ async function handleStart(message, env) {
     '  • <code>&lt;video src="URL"/&gt;</code>\n' +
     '  • <code>&lt;audio src="URL"/&gt;</code>\n' +
     '  • <code>&lt;a href="tg://document?id=…"&gt;نام&lt;/a&gt;</code>\n' +
-    'یک مدیا → یک پیام با کپشن. چند مدیا → آلبوم (یک پیام) با کپشن روی آیتم اول.\n\n' +
-    '<b>📢 کانال:</b> پست‌های HTML به‌صورت خودکار به یک پیام مدیای واحد تبدیل می‌شوند.';
+    'یک مدیا → یک پیام با کپشن. چند مدیا → آلبوم (یک پیام).\n\n' +
+    '<b>📢 کانال:</b> پست‌های HTML به‌صورت خودکار به یک پیام مدیای واحد تبدیل می‌شوند (در صورت پشتیبانی API، درجا ادیت می‌شوند).';
   await sendPlain(env, message.chat.id, message.message_id, text, message.message_thread_id);
 }
 
@@ -406,6 +379,9 @@ async function handleDebug(message, env, update) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// /rich — try edit-in-place, else send as one message
+// ═══════════════════════════════════════════════════════════════════════
 async function handleRich(message, env, args, botId) {
   const threadId = message.message_thread_id;
   const replied = message.reply_to_message;
@@ -433,7 +409,42 @@ async function handleRich(message, env, args, botId) {
   if (!html.trim()) return;
 
   const parts = extractMediaParts(html);
-  await sendAsSingleMessage(env, message.chat.id, parts, threadId, replyToId);
+  const mediaParts = parts.filter(p => p.type === 'media');
+
+  // No media → just a formatted text message.
+  if (mediaParts.length === 0) {
+    const text = simplifyHtml(parts.map(p => p.html).join('\n\n'));
+    if (!text) return;
+    await sendPlain(env, message.chat.id, replyToId, text, threadId);
+    return;
+  }
+
+  const textParts = parts.filter(p => p.type === 'text');
+  let combinedText = simplifyHtml(textParts.map(p => p.html).join('\n\n'));
+  if (!combinedText && mediaParts.length === 1 && mediaParts[0].label) {
+    combinedText = mediaParts[0].label;
+  }
+  const captionTooLong = combinedText.length > 1024;
+  const caption = captionTooLong ? null : (combinedText || null);
+
+  // Single media + replied-to text message in this chat → try edit-in-place.
+  if (replied && mediaParts.length === 1 && !captionTooLong) {
+    const ok = await tryEditTextToMedia(env, message.chat.id, replied.message_id, mediaParts[0], caption);
+    if (ok) {
+      if (DEBUG) console.log('[/rich] edited replied text → media in place ✅');
+      return;
+    }
+  }
+
+  // Fallback: send fresh message(s).
+  if (captionTooLong && combinedText) {
+    await sendPlain(env, message.chat.id, replyToId, combinedText, threadId);
+  }
+  if (mediaParts.length === 1) {
+    await sendSingleMedia(env, message.chat.id, mediaParts[0], caption, threadId, replyToId);
+  } else {
+    await sendAlbum(env, message.chat.id, mediaParts, caption, threadId, replyToId);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -450,7 +461,7 @@ async function handleMediaPV(message, env) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Channel auto-convert → ONE media message (text becomes the caption)
+// Channel auto-convert → prefer edit-in-place, fall back to delete+resend
 // ═══════════════════════════════════════════════════════════════════════
 async function handleChannelPost(post, env, _isEdit) {
   const chatId = post.chat.id;
@@ -469,21 +480,26 @@ async function handleChannelPost(post, env, _isEdit) {
   if (!combinedText && mediaParts.length === 1 && mediaParts[0].label) {
     combinedText = mediaParts[0].label;
   }
+  const captionTooLong = combinedText.length > 1024;
+  const caption = captionTooLong ? null : (combinedText || null);
 
-  // A text message can't be turned into a media message via edit. To get ONE
-  // message out of it, we must delete the original text post first, then send
-  // the media (with the text as caption).
+  // Single media → try to edit the text post into a media message in place.
+  if (mediaParts.length === 1 && !captionTooLong) {
+    const ok = await tryEditTextToMedia(env, chatId, msgId, mediaParts[0], caption);
+    if (ok) {
+      if (DEBUG) console.log('[channel] edited text → media in place ✅');
+      return;
+    }
+  }
+
+  // Fallback: delete original, send fresh media message(s).
   const del = await tg(env, 'deleteMessage', { chat_id: chatId, message_id: msgId });
   if (!del.ok) console.error('[channel] delete failed:', del.description);
-
-  const captionTooLong = combinedText.length > 1024;
 
   if (captionTooLong && combinedText) {
     const r = await tg(env, 'sendMessage', { chat_id: chatId, text: combinedText, parse_mode: 'HTML' });
     if (!r.ok) console.error('[channel] text failed:', r.description);
   }
-
-  const caption = captionTooLong ? null : (combinedText || null);
 
   if (mediaParts.length === 1) {
     await sendSingleMedia(env, chatId, mediaParts[0], caption, null, null);
