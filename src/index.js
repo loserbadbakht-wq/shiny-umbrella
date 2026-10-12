@@ -73,7 +73,7 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// RTL detection (kept for reference)
+// RTL detection
 // ═══════════════════════════════════════════════════════════════════════
 const RTL_CHAR_RE = /[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0750-\u077F\u0780-\u07BF\u07C0-\u07FF\u0800-\u083F\u0840-\u085F\u0860-\u086F\u0870-\u089F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
 const LTR_CHAR_RE = /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]/;
@@ -243,7 +243,6 @@ async function sendSingleMedia(env, chatId, part, caption, threadId, replyToId) 
 }
 
 async function sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId) {
-  // Telegram albums allow max 10 items.
   const chunks = [];
   for (let i = 0; i < mediaParts.length; i += 10) chunks.push(mediaParts.slice(i, i + 10));
   let isFirstChunk = true;
@@ -272,17 +271,22 @@ async function sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId) 
 
 // ═══════════════════════════════════════════════════════════════════════
 // Try to edit a TEXT message INTO a media message, in place.
-// Mirrors what rich_message could do. Returns true on success.
+//
+// IMPORTANT: for editMessageMedia, the caption belongs INSIDE the media
+// object (unlike sendPhoto/editMessageCaption where it's top-level).
+// Putting it top-level silently drops it → text disappears.
 // ═══════════════════════════════════════════════════════════════════════
 async function tryEditTextToMedia(env, chatId, msgId, mediaPart, caption) {
   const fileId = resolveFileId(mediaPart.src);
   const ref = fileId || mediaPart.src;
+
   const media = { type: mediaPart.kind, media: ref };
-  const payload = { chat_id: chatId, message_id: msgId, media };
   if (caption) {
-    payload.caption = caption;
-    payload.parse_mode = 'HTML';
+    media.caption = caption;
+    media.parse_mode = 'HTML';
   }
+
+  const payload = { chat_id: chatId, message_id: msgId, media };
   const r = await tg(env, 'editMessageMedia', payload);
   if (r.ok) return true;
   console.error('[edit] editMessageMedia refused:', r.description);
@@ -380,7 +384,7 @@ async function handleDebug(message, env, update) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// /rich — try edit-in-place, else send as one message
+// /rich
 // ═══════════════════════════════════════════════════════════════════════
 async function handleRich(message, env, args, botId) {
   const threadId = message.message_thread_id;
@@ -411,7 +415,6 @@ async function handleRich(message, env, args, botId) {
   const parts = extractMediaParts(html);
   const mediaParts = parts.filter(p => p.type === 'media');
 
-  // No media → just a formatted text message.
   if (mediaParts.length === 0) {
     const text = simplifyHtml(parts.map(p => p.html).join('\n\n'));
     if (!text) return;
@@ -427,7 +430,6 @@ async function handleRich(message, env, args, botId) {
   const captionTooLong = combinedText.length > 1024;
   const caption = captionTooLong ? null : (combinedText || null);
 
-  // Single media + replied-to text message in this chat → try edit-in-place.
   if (replied && mediaParts.length === 1 && !captionTooLong) {
     const ok = await tryEditTextToMedia(env, message.chat.id, replied.message_id, mediaParts[0], caption);
     if (ok) {
@@ -436,7 +438,6 @@ async function handleRich(message, env, args, botId) {
     }
   }
 
-  // Fallback: send fresh message(s).
   if (captionTooLong && combinedText) {
     await sendPlain(env, message.chat.id, replyToId, combinedText, threadId);
   }
@@ -461,7 +462,7 @@ async function handleMediaPV(message, env) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Channel auto-convert → prefer edit-in-place, fall back to delete+resend
+// Channel auto-convert
 // ═══════════════════════════════════════════════════════════════════════
 async function handleChannelPost(post, env, _isEdit) {
   const chatId = post.chat.id;
@@ -516,14 +517,12 @@ async function handleMessage(message, env, update, ctx) {
   const botId = bot.id;
   const username = bot.username || '';
 
-  // Album (multiple media) in PV → reply with all tg:// tags
   if (message.chat.type === 'private' && message.media_group_id) {
     if (DEBUG) console.log('[album] queued msg', message.message_id, 'group', message.media_group_id);
     scheduleAlbumProcessing(message, env, ctx);
     return;
   }
 
-  // Single PV media → tg:// tag
   if (await handleMediaPV(message, env)) return;
 
   if (message.reply_to_message?.from?.id === botId) return;
