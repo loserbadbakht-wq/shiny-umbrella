@@ -1,10 +1,10 @@
 // src/index.js
 // Media URL → real media message bot (regular messages, NOT rich messages).
 //
-//  ▸ PV single media  → replies with a tg:// tag (full file_id), tap-to-copy
-//  ▸ PV album         → replies with one tg:// tag per media
-//  ▸ /rich <html>     → tries edit-in-place, else sends ONE media message
-//  ▸ Channels (admin) → tries edit-in-place, else delete + send ONE media message
+//  ▸ PV single media  → replies with a bare tg:// URL, tap-to-copy
+//  ▸ PV album         → replies with one bare tg:// URL per media
+//  ▸ /rich <text>     → detects bare tg:// URLs, tries edit-in-place, else sends ONE media message
+//  ▸ Channels (admin) → detects bare tg:// URLs, tries edit-in-place, else delete + send ONE media message
 //  ▸ /start /ping /debug
 
 const DEBUG = true;
@@ -34,7 +34,7 @@ async function getBotInfo(env) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Helpers
+// Basic helpers
 // ═══════════════════════════════════════════════════════════════════════
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -50,6 +50,14 @@ const HTML_TAG_RE = /<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^>]*)?\/?>/;
 function hasHtmlTag(text) {
   return typeof text === 'string' && HTML_TAG_RE.test(text);
 }
+const TG_MEDIA_URL_RE = /tg:\/\/(?:photo|video|audio|document)\?id=[A-Za-z0-9_-]+/i;
+function hasTgMediaUrl(text) {
+  return typeof text === 'string' && TG_MEDIA_URL_RE.test(text);
+}
+function isTgMediaSrc(src) {
+  return /^tg:\/\/(photo|video|audio|document)\?id=[A-Za-z0-9_-]+/i.test(String(src));
+}
+
 function parseCommand(text, botUsername) {
   if (!text) return null;
   const m = text.match(/^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/);
@@ -58,10 +66,85 @@ function parseCommand(text, botUsername) {
   if (target && target.toLowerCase() !== (botUsername || '').toLowerCase()) return null;
   return { cmd: cmd.toLowerCase(), args: (args || '').trim() };
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Entities → HTML  (preserves links & styling)
+// ═══════════════════════════════════════════════════════════════════════
+function entityToTags(ent) {
+  switch (ent.type) {
+    case 'bold':        return ['<b>', '</b>'];
+    case 'italic':      return ['<i>', '</i>'];
+    case 'underline':   return ['<u>', '</u>'];
+    case 'strikethrough': return ['<s>', '</s>'];
+    case 'spoiler':     return ['<tg-spoiler>', '</tg-spoiler>'];
+    case 'code':        return ['<code>', '</code>'];
+    case 'pre': {
+      const lang = ent.language;
+      if (lang) return [`<pre><code class="language-${escapeHtml(lang)}">`, '</code></pre>'];
+      return ['<pre>', '</pre>'];
+    }
+    case 'text_link':
+      return [`<a href="${escapeHtml(ent.url || '')}">`, '</a>'];
+    case 'text_mention':
+      return ent.user?.id
+        ? [`<a href="tg://user?id=${ent.user.id}">`, '</a>']
+        : null;
+    case 'blockquote':            return ['<blockquote>', '</blockquote>'];
+    case 'expandable_blockquote': return ['<blockquote expandable>', '</blockquote>'];
+    default:
+      return null;
+  }
+}
+
+function entitiesToHtml(text, entities) {
+  if (!entities || !entities.length) return escapeHtml(text);
+
+  const opens = new Map();
+  const closes = new Map();
+  const sorted = [...entities]
+    .filter(e => entityToTags(e))
+    .sort((a, b) => a.offset - b.offset || b.length - a.length);
+
+  for (const ent of sorted) {
+    const tags = entityToTags(ent);
+    if (!tags) continue;
+    const start = ent.offset;
+    const end = ent.offset + ent.length;
+    if (start < 0 || end > text.length || start >= end) continue;
+    if (!opens.has(start)) opens.set(start, []);
+    opens.get(start).push(tags[0]);
+    if (!closes.has(end)) closes.set(end, []);
+    closes.get(end).unshift(tags[1]);
+  }
+
+  let result = '';
+  const len = text.length;
+  for (let i = 0; i <= len; i++) {
+    const c = closes.get(i); if (c) result += c.join('');
+    const o = opens.get(i);  if (o) result += o.join('');
+    if (i < len) result += escapeHtml(text[i]);
+  }
+  return result;
+}
+
+// If raw text already contains literal HTML, trust it as-is.
+// Otherwise, rebuild HTML from entities so styling survives.
+function getStyledHtml(text, entities) {
+  const raw = typeof text === 'string' ? text : '';
+  if (!raw) return '';
+  if (hasHtmlTag(raw)) return raw;
+  if (!entities || !entities.length) return escapeHtml(raw);
+  return entitiesToHtml(raw, entities);
+}
+
 function extractContent(msg) {
   if (!msg) return { html: '', kind: 'none' };
-  if (typeof msg.text === 'string' && msg.text.length)       return { html: msg.text,    kind: 'text' };
-  if (typeof msg.caption === 'string' && msg.caption.length) return { html: msg.caption, kind: 'caption' };
+  if (typeof msg.text === 'string' && msg.text.length) {
+    return { html: getStyledHtml(msg.text, msg.entities), kind: 'text' };
+  }
+  if (typeof msg.caption === 'string' && msg.caption.length) {
+    return { html: getStyledHtml(msg.caption, msg.caption_entities), kind: 'caption' };
+  }
   for (const key of ['rich_message', 'rich', 'content', 'html']) {
     const v = msg[key];
     if (!v) continue;
@@ -73,15 +156,12 @@ function extractContent(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// RTL detection
+// RTL detection (harmless)
 // ═══════════════════════════════════════════════════════════════════════
 const RTL_CHAR_RE = /[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0750-\u077F\u0780-\u07BF\u07C0-\u07FF\u0800-\u083F\u0840-\u085F\u0860-\u086F\u0870-\u089F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
 const LTR_CHAR_RE = /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]/;
 function isRTL(html) {
-  const text = String(html)
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&#\d+;/g, ' ')
-    .replace(/&[a-z]+;/gi, ' ');
+  const text = String(html).replace(/<[^>]+>/g, ' ').replace(/&#\d+;/g, ' ').replace(/&[a-z]+;/gi, ' ');
   let rtl = 0, ltr = 0;
   for (const ch of text) {
     if (RTL_CHAR_RE.test(ch)) rtl++;
@@ -91,93 +171,52 @@ function isRTL(html) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV: media → tg:// tag
+// PV: media → bare tg:// URL (no HTML wrapper)
 // ═══════════════════════════════════════════════════════════════════════
-function mediaTypeLabel(message) {
-  if (Array.isArray(message.photo) && message.photo.length) return 'تصویر';
-  if (message.video)        return 'ویدئو';
-  if (message.animation)    return 'گیف';
-  if (message.video_note)   return 'ویدئوی گرد';
-  if (message.document)     return 'سند';
-  if (message.audio)        return 'صوت';
-  if (message.voice)        return 'پیام صوتی';
-  if (message.sticker)      return 'استیکر';
-  return 'مدیا';
-}
-
 function fullTagFor(message) {
   if (Array.isArray(message.photo) && message.photo.length) {
     const p = message.photo[message.photo.length - 1];
-    return { tag: `<img src="tg://photo?id=${p.file_id}"/>`, fileId: p.file_id, kind: 'photo' };
+    return { tag: `tg://photo?id=${p.file_id}`, fileId: p.file_id, kind: 'photo' };
   }
-  if (message.video)      return { tag: `<video src="tg://video?id=${message.video.file_id}"/>`, fileId: message.video.file_id, kind: 'video' };
-  if (message.animation)  return { tag: `<video src="tg://video?id=${message.animation.file_id}"/>`, fileId: message.animation.file_id, kind: 'video' };
-  if (message.video_note) return { tag: `<video src="tg://video?id=${message.video_note.file_id}"/>`, fileId: message.video_note.file_id, kind: 'video' };
-  if (message.document) {
-    const d = message.document;
-    const label = d.file_name || 'document';
-    return { tag: `<a href="tg://document?id=${d.file_id}">${escapeHtml(label)}</a>`, fileId: d.file_id, kind: 'document' };
-  }
-  if (message.audio)      return { tag: `<audio src="tg://audio?id=${message.audio.file_id}"/>`, fileId: message.audio.file_id, kind: 'audio' };
-  if (message.voice)      return { tag: `<audio src="tg://audio?id=${message.voice.file_id}"/>`, fileId: message.voice.file_id, kind: 'audio' };
-  if (message.sticker)    return { tag: `<img src="tg://photo?id=${message.sticker.file_id}"/>`, fileId: message.sticker.file_id, kind: 'photo' };
+  if (message.video)      return { tag: `tg://video?id=${message.video.file_id}`, fileId: message.video.file_id, kind: 'video' };
+  if (message.animation)  return { tag: `tg://video?id=${message.animation.file_id}`, fileId: message.animation.file_id, kind: 'video' };
+  if (message.video_note) return { tag: `tg://video?id=${message.video_note.file_id}`, fileId: message.video_note.file_id, kind: 'video' };
+  if (message.document)   return { tag: `tg://document?id=${message.document.file_id}`, fileId: message.document.file_id, kind: 'document' };
+  if (message.audio)      return { tag: `tg://audio?id=${message.audio.file_id}`, fileId: message.audio.file_id, kind: 'audio' };
+  if (message.voice)      return { tag: `tg://audio?id=${message.voice.file_id}`, fileId: message.voice.file_id, kind: 'audio' };
+  if (message.sticker)    return { tag: `tg://photo?id=${message.sticker.file_id}`, fileId: message.sticker.file_id, kind: 'photo' };
   return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// HTML → parts (text + media)
+// Text → parts (text + media). Matches ONLY bare tg://…id=… URLs.
 // ═══════════════════════════════════════════════════════════════════════
-function attrVal(attrs, name) {
-  const re = new RegExp('\\b' + name + '\\s*=\\s*["\']([^"\']*)["\']', 'i');
-  const m = String(attrs).match(re);
-  return m ? m[1] : null;
-}
-
-function extractMediaParts(html) {
+function extractMediaParts(text) {
   const parts = [];
-  let pos = 0;
-  const re = /<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*)\/?>(?:([\s\S]*?)<\/\1>)?/g;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const [full, tagName, attrs, inner] = m;
-    const lower = tagName.toLowerCase();
-    let src = null, kind = null, label = null;
-
-    if (lower === 'img')        { src = attrVal(attrs, 'src'); if (src) kind = 'photo'; }
-    else if (lower === 'video') { src = attrVal(attrs, 'src'); if (src) kind = 'video'; }
-    else if (lower === 'audio') { src = attrVal(attrs, 'src'); if (src) kind = 'audio'; }
-    else if (lower === 'a') {
-      const href = attrVal(attrs, 'href');
-      if (href) {
-        const sm = href.match(/^tg:\/\/(photo|video|audio|document)\?/i);
-        if (sm) {
-          src = href;
-          kind = sm[1].toLowerCase();
-          label = inner ? stripHtml(inner).trim() : null;
-        }
-      }
+  const re = /tg:\/\/(photo|video|audio|document)\?id=[A-Za-z0-9_-]+/gi;
+  let pos = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > pos) {
+      const t = text.slice(pos, m.index);
+      if (t.trim()) parts.push({ type: 'text', html: t });
     }
-
-    if (kind && src) {
-      if (m.index > pos) {
-        const t = html.slice(pos, m.index);
-        if (t.trim()) parts.push({ type: 'text', html: t });
-      }
-      parts.push({ type: 'media', kind, src, label });
-      pos = m.index + full.length;
-    }
+    parts.push({ type: 'media', kind: m[1].toLowerCase(), src: m[0], label: null });
+    pos = m.index + m[0].length;
   }
-  if (pos < html.length) {
-    const t = html.slice(pos);
+  if (pos < text.length) {
+    const t = text.slice(pos);
     if (t.trim()) parts.push({ type: 'text', html: t });
   }
   return parts;
 }
 
-// Tags Telegram's sendMessage (parse_mode=HTML) understands.
+// ═══════════════════════════════════════════════════════════════════════
+// Simplify HTML for captions / messages, keeping supported styling.
+// ═══════════════════════════════════════════════════════════════════════
 const SENDMESSAGE_SUPPORTED = new Set([
   'b','strong','i','em','u','ins','s','strike','del','code','pre','a','tg-spoiler','blockquote',
 ]);
+
 function simplifyHtml(html) {
   return String(html)
     .replace(/<br\s*\/?>/gi, '\n')
@@ -215,20 +254,17 @@ async function sendPlain(env, chatId, replyToId, text, threadId) {
 
 function buildSingleMediaPayload(chatId, part, caption, threadId, replyToId) {
   const fileId = resolveFileId(part.src);
-  const ref = fileId || part.src;
+  if (!fileId) return null;
   const payload = { chat_id: chatId };
   let method;
   switch (part.kind) {
-    case 'photo':    method = 'sendPhoto';    payload.photo    = ref; break;
-    case 'video':    method = 'sendVideo';    payload.video    = ref; break;
-    case 'audio':    method = 'sendAudio';    payload.audio    = ref; break;
-    case 'document': method = 'sendDocument'; payload.document = ref; break;
+    case 'photo':    method = 'sendPhoto';    payload.photo    = fileId; break;
+    case 'video':    method = 'sendVideo';    payload.video    = fileId; break;
+    case 'audio':    method = 'sendAudio';    payload.audio    = fileId; break;
+    case 'document': method = 'sendDocument'; payload.document = fileId; break;
     default: return null;
   }
-  if (caption) {
-    payload.caption = caption;
-    payload.parse_mode = 'HTML';
-  }
+  if (caption) { payload.caption = caption; payload.parse_mode = 'HTML'; }
   if (replyToId != null) payload.reply_parameters = { message_id: replyToId, allow_sending_without_reply: true };
   if (threadId != null) payload.message_thread_id = threadId;
   return { method, payload };
@@ -248,16 +284,19 @@ async function sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId) 
   let isFirstChunk = true;
   let firstResult = null;
   for (const chunk of chunks) {
-    const media = chunk.map((part, idx) => {
+    const media = [];
+    for (let idx = 0; idx < chunk.length; idx++) {
+      const part = chunk[idx];
       const fileId = resolveFileId(part.src);
-      const ref = fileId || part.src;
-      const entry = { type: part.kind, media: ref };
+      if (!fileId) continue;
+      const entry = { type: part.kind, media: fileId };
       if (isFirstChunk && idx === 0 && caption) {
         entry.caption = caption;
         entry.parse_mode = 'HTML';
       }
-      return entry;
-    });
+      media.push(entry);
+    }
+    if (!media.length) { isFirstChunk = false; continue; }
     const payload = { chat_id: chatId, media };
     if (isFirstChunk && replyToId != null) payload.reply_parameters = { message_id: replyToId, allow_sending_without_reply: true };
     if (threadId != null) payload.message_thread_id = threadId;
@@ -270,21 +309,15 @@ async function sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId) 
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Try to edit a TEXT message INTO a media message, in place.
-//
-// IMPORTANT: for editMessageMedia, the caption belongs INSIDE the media
-// object (unlike sendPhoto/editMessageCaption where it's top-level).
-// Putting it top-level silently drops it → text disappears.
+// In-place edit — only for tg:// sources. Caption inside the media object.
 // ═══════════════════════════════════════════════════════════════════════
 async function tryEditTextToMedia(env, chatId, msgId, mediaPart, caption) {
+  if (!isTgMediaSrc(mediaPart.src)) return false;
   const fileId = resolveFileId(mediaPart.src);
-  const ref = fileId || mediaPart.src;
+  if (!fileId) return false;
 
-  const media = { type: mediaPart.kind, media: ref };
-  if (caption) {
-    media.caption = caption;
-    media.parse_mode = 'HTML';
-  }
+  const media = { type: mediaPart.kind, media: fileId };
+  if (caption) { media.caption = caption; media.parse_mode = 'HTML'; }
 
   const payload = { chat_id: chatId, message_id: msgId, media };
   const r = await tg(env, 'editMessageMedia', payload);
@@ -294,7 +327,7 @@ async function tryEditTextToMedia(env, chatId, msgId, mediaPart, caption) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV album batching → replies with one tg:// tag per media
+// PV album batching → one bare tg:// URL per media
 // ═══════════════════════════════════════════════════════════════════════
 const ALBUM_MAP = new Map();
 
@@ -317,13 +350,7 @@ function scheduleAlbumProcessing(message, env, ctx) {
   const groupId = message.media_group_id;
   let entry = ALBUM_MAP.get(groupId);
   if (!entry) {
-    entry = {
-      messages: [],
-      chatId: message.chat.id,
-      threadId: message.message_thread_id,
-      env,
-      scheduled: false,
-    };
+    entry = { messages: [], chatId: message.chat.id, threadId: message.message_thread_id, env, scheduled: false };
     ALBUM_MAP.set(groupId, entry);
   }
   entry.messages.push(message);
@@ -347,17 +374,13 @@ async function handleStart(message, env) {
   const text =
     '<b>🤖 Media URL → Media bot</b>\n\n' +
     '<b>🔒 در چت خصوصی:</b>\n' +
-    'هر مدیای تلگرامی (عکس، ویدیو، گیف، سند، صوت، استیکر) بفرستید — ربات لینک <code>tg://</code> قابل کپی جواب می‌دهد.\n' +
+    'هر مدیای تلگرامی بفرستید — ربات لینک <code>tg://…id=…</code> قابل کپی جواب می‌دهد.\n' +
     'آلبوم → همه لینک‌ها یک‌جا.\n\n' +
-    '<b>📝 تبدیل HTML به مدیای واقعی (یک پیام):</b>\n' +
-    'روی یک پیام HTML ریپلای کنید و <code>/rich</code> بزنید.\n' +
-    'تگ‌های مدیا:\n' +
-    '  • <code>&lt;img src="URL"/&gt;</code>\n' +
-    '  • <code>&lt;video src="URL"/&gt;</code>\n' +
-    '  • <code>&lt;audio src="URL"/&gt;</code>\n' +
-    '  • <code>&lt;a href="tg://document?id=…"&gt;نام&lt;/a&gt;</code>\n' +
-    'یک مدیا → یک پیام با کپشن. چند مدیا → آلبوم (یک پیام).\n\n' +
-    '<b>📢 کانال:</b> پست‌های HTML به‌صورت خودکار به یک پیام مدیای واحد تبدیل می‌شوند (در صورت پشتیبانی API، درجا ادیت می‌شوند).';
+    '<b>📝 تبدیل به مدیای واقعی (یک پیام):</b>\n' +
+    'یک <code>tg://…id=…</code> را در کانال/چت بفرستید یا روی پیام ریپلای کنید و <code>/rich</code> بزنید.\n' +
+    'در صورت پشتیبانی، پیام درجا به مدیا ادیت می‌شود.\n' +
+    'فرمت‌بندی متن (بولد، لینک و…) حفظ می‌شود.\n\n' +
+    '<b>📢 کانال:</b> پست‌های دارای <code>tg://…id=…</code> به‌صورت خودکار به یک پیام مدیای واحد تبدیل می‌شوند.';
   await sendPlain(env, message.chat.id, message.message_id, text, message.message_thread_id);
 }
 
@@ -406,7 +429,7 @@ async function handleRich(message, env, args, botId) {
     return;
   } else {
     await sendPlain(env, message.chat.id, message.message_id,
-      '⚠️ چیزی برای تبدیل نیست. روی یک پیام HTML ریپلای کنید، یا از <code>/rich &lt;b&gt;Hi&lt;/b&gt;</code> استفاده کنید.',
+      '⚠️ چیزی برای تبدیل نیست. روی یک پیام ریپلای کنید، یا از <code>/rich tg://photo?id=…</code> استفاده کنید.',
       threadId);
     return;
   }
@@ -424,13 +447,10 @@ async function handleRich(message, env, args, botId) {
 
   const textParts = parts.filter(p => p.type === 'text');
   let combinedText = simplifyHtml(textParts.map(p => p.html).join('\n\n'));
-  if (!combinedText && mediaParts.length === 1 && mediaParts[0].label) {
-    combinedText = mediaParts[0].label;
-  }
   const captionTooLong = combinedText.length > 1024;
   const caption = captionTooLong ? null : (combinedText || null);
 
-  if (replied && mediaParts.length === 1 && !captionTooLong) {
+  if (replied && mediaParts.length === 1 && !captionTooLong && isTgMediaSrc(mediaParts[0].src)) {
     const ok = await tryEditTextToMedia(env, message.chat.id, replied.message_id, mediaParts[0], caption);
     if (ok) {
       if (DEBUG) console.log('[/rich] edited replied text → media in place ✅');
@@ -449,7 +469,7 @@ async function handleRich(message, env, args, botId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PV single media → tg:// tag
+// PV single media → bare tg:// URL
 // ═══════════════════════════════════════════════════════════════════════
 async function handleMediaPV(message, env) {
   if (message.chat.type !== 'private') return false;
@@ -468,24 +488,22 @@ async function handleChannelPost(post, env, _isEdit) {
   const chatId = post.chat.id;
   const msgId  = post.message_id;
 
-  if (post.from?.is_bot)      return;
-  if (!post.text)             return;
-  if (!hasHtmlTag(post.text)) return;
+  if (post.from?.is_bot) return;
+  if (!post.text) return;
+  if (!hasTgMediaUrl(post.text)) return;
 
-  const parts = extractMediaParts(post.text);
+  const styled = getStyledHtml(post.text, post.entities);
+  const parts = extractMediaParts(styled);
   const mediaParts = parts.filter(p => p.type === 'media');
   if (mediaParts.length === 0) return;
 
   const textParts = parts.filter(p => p.type === 'text');
   let combinedText = simplifyHtml(textParts.map(p => p.html).join('\n\n'));
-  if (!combinedText && mediaParts.length === 1 && mediaParts[0].label) {
-    combinedText = mediaParts[0].label;
-  }
   const captionTooLong = combinedText.length > 1024;
   const caption = captionTooLong ? null : (combinedText || null);
 
-  // Single media → try to edit the text post into a media message in place.
-  if (mediaParts.length === 1 && !captionTooLong) {
+  // Single tg:// media → try in-place edit.
+  if (mediaParts.length === 1 && !captionTooLong && isTgMediaSrc(mediaParts[0].src)) {
     const ok = await tryEditTextToMedia(env, chatId, msgId, mediaParts[0], caption);
     if (ok) {
       if (DEBUG) console.log('[channel] edited text → media in place ✅');
