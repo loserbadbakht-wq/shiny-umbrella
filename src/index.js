@@ -3,8 +3,8 @@
 //
 //  ▸ PV single media  → replies with a bare tg:// URL, tap-to-copy
 //  ▸ PV album         → replies with one bare tg:// URL per media
-//  ▸ /rich <text>     → detects bare tg:// URLs, tries edit-in-place, else sends ONE media message
-//  ▸ Channels (admin) → detects bare tg:// URLs, tries edit-in-place, else delete + send ONE media message
+//  ▸ /rich <text>     → detects bare tg:// URLs, tries edit-in-place, else sends media message(s)
+//  ▸ Channels (admin) → detects bare tg:// URLs, tries edit-in-place, else delete + send media message(s)
 //  ▸ /start /ping /debug
 
 const DEBUG = true;
@@ -309,15 +309,32 @@ async function sendAlbum(env, chatId, mediaParts, caption, threadId, replyToId) 
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// In-place edit — only for tg:// sources. Caption inside the media object.
+// In-place edit — supports single media OR an array (media group).
+// Only tg:// sources are accepted. Caption goes inside the first media.
 // ═══════════════════════════════════════════════════════════════════════
-async function tryEditTextToMedia(env, chatId, msgId, mediaPart, caption) {
-  if (!isTgMediaSrc(mediaPart.src)) return false;
-  const fileId = resolveFileId(mediaPart.src);
-  if (!fileId) return false;
+async function tryEditTextToMedia(env, chatId, msgId, mediaParts, caption) {
+  if (!Array.isArray(mediaParts)) mediaParts = [mediaParts];
+  if (!mediaParts.length) return false;
+  for (const p of mediaParts) if (!isTgMediaSrc(p.src)) return false;
 
-  const media = { type: mediaPart.kind, media: fileId };
-  if (caption) { media.caption = caption; media.parse_mode = 'HTML'; }
+  let media;
+  if (mediaParts.length === 1) {
+    const fileId = resolveFileId(mediaParts[0].src);
+    if (!fileId) return false;
+    media = { type: mediaParts[0].kind, media: fileId };
+    if (caption) { media.caption = caption; media.parse_mode = 'HTML'; }
+  } else {
+    // Non-standard: this API may accept an array of InputMedia here.
+    // Standard Bot API would refuse it — we catch that and fall back.
+    media = [];
+    for (let i = 0; i < mediaParts.length; i++) {
+      const fileId = resolveFileId(mediaParts[i].src);
+      if (!fileId) return false;
+      const entry = { type: mediaParts[i].kind, media: fileId };
+      if (i === 0 && caption) { entry.caption = caption; entry.parse_mode = 'HTML'; }
+      media.push(entry);
+    }
+  }
 
   const payload = { chat_id: chatId, message_id: msgId, media };
   const r = await tg(env, 'editMessageMedia', payload);
@@ -377,10 +394,10 @@ async function handleStart(message, env) {
     'هر مدیای تلگرامی بفرستید — ربات لینک <code>tg://…id=…</code> قابل کپی جواب می‌دهد.\n' +
     'آلبوم → همه لینک‌ها یک‌جا.\n\n' +
     '<b>📝 تبدیل به مدیای واقعی (یک پیام):</b>\n' +
-    'یک <code>tg://…id=…</code> را در کانال/چت بفرستید یا روی پیام ریپلای کنید و <code>/rich</code> بزنید.\n' +
-    'در صورت پشتیبانی، پیام درجا به مدیا ادیت می‌شود.\n' +
+    'یک یا چند <code>tg://…id=…</code> را در کانال/چت بفرستید یا روی پیام ریپلای کنید و <code>/rich</code> بزنید.\n' +
+    'در صورت پشتیبانی، پیام درجا به مدیا (یا آلبوم) ادیت می‌شود.\n' +
     'فرمت‌بندی متن (بولد، لینک و…) حفظ می‌شود.\n\n' +
-    '<b>📢 کانال:</b> پست‌های دارای <code>tg://…id=…</code> به‌صورت خودکار به یک پیام مدیای واحد تبدیل می‌شوند.';
+    '<b>📢 کانال:</b> پست‌های دارای <code>tg://…id=…</code> به‌صورت خودکار به پیام مدیا تبدیل می‌شوند.';
   await sendPlain(env, message.chat.id, message.message_id, text, message.message_thread_id);
 }
 
@@ -450,11 +467,15 @@ async function handleRich(message, env, args, botId) {
   const captionTooLong = combinedText.length > 1024;
   const caption = captionTooLong ? null : (combinedText || null);
 
-  if (replied && mediaParts.length === 1 && !captionTooLong && isTgMediaSrc(mediaParts[0].src)) {
-    const ok = await tryEditTextToMedia(env, message.chat.id, replied.message_id, mediaParts[0], caption);
-    if (ok) {
-      if (DEBUG) console.log('[/rich] edited replied text → media in place ✅');
-      return;
+  // Any number of tg:// media → try in-place edit (single or array form).
+  if (replied && !captionTooLong) {
+    const allTg = mediaParts.every(p => isTgMediaSrc(p.src));
+    if (allTg) {
+      const ok = await tryEditTextToMedia(env, message.chat.id, replied.message_id, mediaParts, caption);
+      if (ok) {
+        if (DEBUG) console.log('[/rich] edited replied text → media in place ✅ (' + mediaParts.length + ')');
+        return;
+      }
     }
   }
 
@@ -502,12 +523,15 @@ async function handleChannelPost(post, env, _isEdit) {
   const captionTooLong = combinedText.length > 1024;
   const caption = captionTooLong ? null : (combinedText || null);
 
-  // Single tg:// media → try in-place edit.
-  if (mediaParts.length === 1 && !captionTooLong && isTgMediaSrc(mediaParts[0].src)) {
-    const ok = await tryEditTextToMedia(env, chatId, msgId, mediaParts[0], caption);
-    if (ok) {
-      if (DEBUG) console.log('[channel] edited text → media in place ✅');
-      return;
+  // Any number of tg:// media → try in-place edit (single or array form).
+  if (!captionTooLong) {
+    const allTg = mediaParts.every(p => isTgMediaSrc(p.src));
+    if (allTg) {
+      const ok = await tryEditTextToMedia(env, chatId, msgId, mediaParts, caption);
+      if (ok) {
+        if (DEBUG) console.log('[channel] edited text → media in place ✅ (' + mediaParts.length + ')');
+        return;
+      }
     }
   }
 
