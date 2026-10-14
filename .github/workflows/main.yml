@@ -28,6 +28,7 @@ jobs:
         run: |
           wrangler deploy \
             --var BOT_TOKEN:${{ secrets.TEN_BOT_TOKEN }} \
+            --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }} \
             --var KEY:${{ secrets.KEY }} \
             --var ID:${{ secrets.ID }}
         env:
