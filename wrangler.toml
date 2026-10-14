@@ -9,7 +9,7 @@ crons = ["*/10 * * * *"]   # every 10 minutes
 #   wrangler kv:namespace create GELBOORU_KV
 # Then paste the id below.
 [[kv_namespaces]]
-binding = "GELBOORU_KV"
+binding = "BOT_KV"
 id = "37f7bd7abb8347dbba5384578f6b6807"
 
 [vars]
