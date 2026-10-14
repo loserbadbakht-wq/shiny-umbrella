@@ -11,3 +11,6 @@ crons = ["*/10 * * * *"]   # every 10 minutes
 [[kv_namespaces]]
 binding = "GELBOORU_KV"
 id = "37f7bd7abb8347dbba5384578f6b6807"
+
+[vars]
+WORKER_URL = "https://shiny-art.ultimatepissofshit.workers.dev"
