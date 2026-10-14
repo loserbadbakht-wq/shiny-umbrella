@@ -1,46 +1,56 @@
+// ============= IMPORTS =============
 import tagsConfig from './tags_config.json';
 
-const { ORIENTATION, COPYRIGHT_TAGS, CHARACTER_TAGS } = tagsConfig;
+const {
+  ORIENTATION,
+  COPYRIGHT_TAGS,
+  CHARACTER_TAGS,
+  BLOCKED_TAGS,
+} = tagsConfig;
 
+// ============= CONFIG (shared) =============
+const KV_CACHE_TTL = 30;
+const OWNER_ID_FALLBACK = 302287170;
+
+// ============= ALLOWED CHATS =============
+const ALLOWED_CHAT_IDS = new Set([
+  -1004481485615,
+  -1004119297598,
+  302287170,
+]);
+
+// ============= CONFIG (Gelbooru) =============
 const GELBOORU_API = 'https://gelbooru.com/index.php';
-const BLOCKED_TAGS = ["guro", "snuff", "scat", "bestiality", "rape",
-    "loli", "onee-loli", "shota", "onii-shota", "incest", "mind_break", "netorare",
-    "mahou_shoujo_madoka_magica",];
+const GELBOORU_FETCH_LIMIT = 5;
 
-// ============= ENCRYPTION HELPERS =============
-let ENCRYPTION_KEY = 'default-key-please-change-me';
-
-function initEncryptionKey(env) {
-  if (env && env.DB_ENCRYPTION_KEY) {
-    ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY;
-  }
-}
-
-function encryptData(data) {
+// ============= ENCRYPTION =============
+function encryptData(data, key) {
   const jsonStr = JSON.stringify(data);
   const encoder = new TextEncoder();
   const plaintext = encoder.encode(jsonStr);
-  const keyBytes = encoder.encode(ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32));
-
+  const keyBytes = encoder.encode(key.padEnd(32, '0').slice(0, 32));
   const encrypted = new Uint8Array(plaintext.length);
   for (let i = 0; i < plaintext.length; i++) {
     encrypted[i] = plaintext[i] ^ keyBytes[i % keyBytes.length];
   }
   let binary = '';
-  const CHUNK = 0x8000;
+  const CHUNK = 8192;
   for (let i = 0; i < encrypted.length; i += CHUNK) {
-    binary += String.fromCharCode.apply(null, encrypted.subarray(i, i + CHUNK));
+    binary += String.fromCharCode.apply(
+      null,
+      encrypted.subarray(i, i + CHUNK)
+    );
   }
   return btoa(binary);
 }
 
-function decryptData(encryptedStr) {
-  const binary = atob(encryptedStr);
-  const encrypted = Uint8Array.from(binary, c => c.charCodeAt(0));
-  const keyBytes = new TextEncoder().encode(
-    ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32)
+function decryptData(encryptedStr, key) {
+  const encrypted = Uint8Array.from(atob(encryptedStr), (c) =>
+    c.charCodeAt(0)
   );
-
+  const keyBytes = new TextEncoder().encode(
+    key.padEnd(32, '0').slice(0, 32)
+  );
   const decrypted = new Uint8Array(encrypted.length);
   for (let i = 0; i < encrypted.length; i++) {
     decrypted[i] = encrypted[i] ^ keyBytes[i % keyBytes.length];
@@ -48,48 +58,16 @@ function decryptData(encryptedStr) {
   return JSON.parse(new TextDecoder().decode(decrypted));
 }
 
-// ============= KV STORAGE HELPERS (encrypted) =============
-async function kvGetEncrypted(kv, key, fallback = null) {
-  try {
-    const raw = await kv.get(key);
-    if (raw == null) return fallback;
-    try {
-      return decryptData(raw);
-    } catch (e) {
-      console.error(`[ERROR] Failed to decrypt KV key "${key}":`, e);
-      return fallback;
-    }
-  } catch (e) {
-    console.error(`[ERROR] Failed to read KV key "${key}":`, e);
-    return fallback;
-  }
-}
-
-async function kvPutEncrypted(kv, key, value) {
-  await kv.put(key, encryptData(value));
-}
-
-async function getChatId(kv)      { return await kvGetEncrypted(kv, 'chat_id', null); }
-async function saveChatId(kv, id) { await kvPutEncrypted(kv, 'chat_id', id); }
-async function getLastId(kv) {
-  const v = await kvGetEncrypted(kv, 'last_id', 0);
-  return typeof v === 'number' ? v : parseInt(v, 10) || 0;
-}
-async function saveLastId(kv, id) { await kvPutEncrypted(kv, 'last_id', id); }
-
-async function getSavedWorkerUrl(kv) { return (await kvGetEncrypted(kv, 'worker_url', '')) || ''; }
-async function saveWorkerUrl(kv, url) { await kvPutEncrypted(kv, 'worker_url', url); }
-
-// ---------- helpers ----------
-function buildBlockedFilter() {
-  return ' ' + BLOCKED_TAGS.map(t => `-${t}`).join(' ');
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+function htmlEsc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }[c])
+  );
 }
 
 function escapeAttr(s) {
@@ -100,7 +78,189 @@ function escapeAttr(s) {
     .replace(/>/g, '&gt;');
 }
 
-// Rebuild HTML from plain caption + Telegram's caption_entities array.
+function linesToRichHtml(lines) {
+  return (lines || [])
+    .map((l) => (l === '' ? '<p>&nbsp;</p>' : `<p>${htmlEsc(l)}</p>`))
+    .join('\n');
+}
+
+function normalizeMediaUrl(url) {
+  const s = String(url || '').trim();
+  const m = s.match(/^(https?:\/\/[^/]+)(.*)$/i);
+  if (!m) return s;
+  return m[1] + m[2].replace(/\/{2,}/g, '/');
+}
+
+function safeTruncateHtml(html, maxLen) {
+  const s = String(html || '');
+  if (s.length <= maxLen) return s;
+
+  let cut = s.slice(0, maxLen);
+  const lastGt = cut.lastIndexOf('>');
+  const lastLt = cut.lastIndexOf('<');
+  if (lastLt > lastGt) cut = cut.slice(0, lastLt);
+
+  const stack = [];
+  const tagRe = /<(\/?)([a-z][a-z0-9-]*)(?:\s[^>]*)?>/gi;
+  let m;
+  while ((m = tagRe.exec(cut)) !== null) {
+    const closing = m[1] === '/';
+    const name = m[2].toLowerCase();
+    if (closing) {
+      if (stack.length && stack[stack.length - 1] === name) stack.pop();
+    } else {
+      stack.push(name);
+    }
+  }
+  let suffix = '';
+  while (stack.length) suffix += `</${stack.pop()}>`;
+  return cut + '…' + suffix;
+}
+
+// ============= OWNER =============
+function ownerId(env) {
+  const v = env.OWNER_ID;
+  if (v == null || v === '') return OWNER_ID_FALLBACK;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : OWNER_ID_FALLBACK;
+}
+
+// ============= ALLOWLIST CHECK =============
+function isAllowedChat(chatId) {
+  if (chatId == null) return false;
+  const n = typeof chatId === 'number' ? chatId : parseInt(chatId, 10);
+  if (!Number.isFinite(n)) return false;
+  return ALLOWED_CHAT_IDS.has(n);
+}
+
+// ============= ERROR REPORTING =============
+async function reportError(env, where, err, extra = {}) {
+  const entry = {
+    t: new Date().toISOString(),
+    where: where || 'unknown',
+    msg: (err && (err.message || String(err))) || 'unknown error',
+    stack: (err && err.stack) ? String(err.stack).slice(0, 800) : '',
+    ...extra,
+  };
+
+  try {
+    const raw = await env.BOT_KV.get('errors:recent', { cacheTtl: KV_CACHE_TTL });
+    let list = [];
+    if (raw) {
+      try {
+        list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(list)) list = [];
+      } catch { list = []; }
+    }
+    list.unshift(entry);
+    list = list.slice(0, 20);
+    await env.BOT_KV.put(
+      'errors:recent',
+      encryptData(list, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('reportError KV write failed:', e.message);
+  }
+
+  try {
+    const text =
+      `🚨 *Error*\n` +
+      `📍 where: \`${entry.where}\`\n` +
+      `⏰ ${entry.t}\n` +
+      `\n*Message*\n\`${entry.msg.replace(/`/g, '')}\`` +
+      (entry.stack
+        ? `\n\n*Stack (truncated)*\n\`\`\`\n${entry.stack.slice(0, 500)}\n\`\`\``
+        : '');
+    await sendMessage(env.BOT_TOKEN, ownerId(env), text, undefined, {
+      parse_mode: 'Markdown',
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (e) {
+    console.error('reportError DM failed:', e.message);
+  }
+
+  console.error(`[${entry.where}]`, entry.msg);
+  if (entry.stack) console.error(entry.stack);
+}
+
+// ============= TELEMETRY =============
+async function logEvents(env, events) {
+  if (!events || !events.length) return;
+  try {
+    const raw = await env.BOT_KV.get('telemetry', { cacheTtl: KV_CACHE_TTL });
+    let log = [];
+    if (raw) {
+      try {
+        log = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(log)) log = [];
+      } catch { log = []; }
+    }
+    const now = new Date().toISOString();
+    const fresh = events.slice().reverse().map((e) => ({ t: now, ...e }));
+    log = fresh.concat(log).slice(0, 30);
+    await env.BOT_KV.put(
+      'telemetry',
+      encryptData(log, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('logEvents failed:', e.message);
+  }
+}
+
+async function logEvent(env, event) {
+  await logEvents(env, [event]);
+}
+
+// ═══════════════════════════════════════════════════════════
+//                     GELBOORU BOT
+// ═══════════════════════════════════════════════════════════
+
+async function kvGetEncrypted(env, key, fallback = null) {
+  try {
+    const raw = await env.BOT_KV.get(key);
+    if (raw == null) return fallback;
+    try {
+      return decryptData(raw, env.DB_ENCRYPTION_KEY);
+    } catch (e) {
+      console.error(`[ERROR] Failed to decrypt KV key "${key}":`, e);
+      return fallback;
+    }
+  } catch (e) {
+    console.error(`[ERROR] Failed to read KV key "${key}":`, e);
+    return fallback;
+  }
+}
+
+async function kvPutEncrypted(env, key, value) {
+  await env.BOT_KV.put(key, encryptData(value, env.DB_ENCRYPTION_KEY));
+}
+
+async function getChatId(env) {
+  return await kvGetEncrypted(env, 'art:chat_id', null);
+}
+async function saveChatId(env, id) {
+  await kvPutEncrypted(env, 'art:chat_id', id);
+}
+
+async function getLastId(env) {
+  const v = await kvGetEncrypted(env, 'art:last_id', 0);
+  return typeof v === 'number' ? v : parseInt(v, 10) || 0;
+}
+async function saveLastId(env, id) {
+  await kvPutEncrypted(env, 'art:last_id', id);
+}
+
+async function getSavedWorkerUrl(env) {
+  return (await kvGetEncrypted(env, 'art:worker_url', '')) || '';
+}
+async function saveWorkerUrl(env, url) {
+  await kvPutEncrypted(env, 'art:worker_url', url);
+}
+
+function buildBlockedFilter() {
+  return ' ' + BLOCKED_TAGS.map(t => `-${t}`).join(' ');
+}
+
 function reconstructHtml(text, entities) {
   if (!text) return '';
   if (!entities || !entities.length) return text;
@@ -135,7 +295,6 @@ function reconstructHtml(text, entities) {
   return result;
 }
 
-// ---------- Gelbooru ----------
 async function fetchPosts(tag, limit, apiKey, userId) {
   const params = new URLSearchParams({
     page: 'dapi', s: 'post', q: 'index', json: '1',
@@ -157,6 +316,7 @@ async function fetchPosts(tag, limit, apiKey, userId) {
   return (data.post || []).map(p => ({
     id: parseInt(p.id || 0, 10),
     sample_url: p.sample_url || '',
+    preview_url: p.preview_url || '',
     source: p.source || '',
     tags: p.tags || '',
     rating: p.rating || '',
@@ -165,7 +325,7 @@ async function fetchPosts(tag, limit, apiKey, userId) {
   }));
 }
 
-async function getLatest(apiKey, userId, limit = 50) {
+async function getLatest(apiKey, userId, limit = GELBOORU_FETCH_LIMIT) {
   const [yuri, yaoi] = await Promise.all([
     fetchPosts('yuri', limit, apiKey, userId),
     fetchPosts('yaoi', limit, apiKey, userId),
@@ -179,7 +339,6 @@ async function getLatest(apiKey, userId, limit = 50) {
     .slice(0, limit);
 }
 
-// ---------- Build the message body ----------
 function buildDescription(post) {
   const allTags = post.tags.split(/\s+/).filter(Boolean);
 
@@ -198,23 +357,29 @@ function buildDescription(post) {
   let   tagsStr      = other.length       ? other.join(' ')       : 'None';
   if (tagsStr.length > 1000) tagsStr = tagsStr.slice(0, 1000) + '...';
 
-  const sourceLine = post.source
-    ? `\n\n<a href="${escapeAttr(post.source)}">Source</a>`
-    : '';
+  const footerParts = [];
+  if (post.file_url) {
+    footerParts.push(
+      `<a href="${escapeAttr(post.file_url)}">original size</a>`
+    );
+  }
+  if (post.source) {
+    footerParts.push(
+      `<a href="${escapeAttr(post.source)}">Source</a>`
+    );
+  }
+  const footer = footerParts.join('\n\n');
 
   return {
-    title: allTags.slice(0, 3).join(' ') || `Image ${post.id}`,
-    text:
+    body:
       `<b>Copyright:</b> ${copyrightStr}\n\n` +
       `<b>Character(s):</b> ${characterStr}\n\n` +
       `<b>Orientation:</b> ${orientStr}\n\n` +
-      `<b>Tags:</b> ${tagsStr}\n\n` +
-      `<a href="${escapeAttr(post.file_url)}">original size</a>` +
-      sourceLine,
+      `<b>Tags:</b> ${tagsStr}`,
+    footer,
   };
 }
 
-// ---------- Telegram ----------
 async function tg(token, method, body) {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: 'POST',
@@ -224,15 +389,29 @@ async function tg(token, method, body) {
   return res.json();
 }
 
-// ============================================================
-// STREAMING PROXY
-// ============================================================
 const PROXY_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36';
 
+const REFERER_BY_HOST = [
+  { test: /(^|\.)gelbooru\.com$/i, referer: 'https://gelbooru.com/' },
+  { test: /(^|\.)donmai\.us$/i,    referer: 'https://danbooru.donmai.us/' },
+  { test: /(^|\.)youtube\.com$/i,  referer: 'https://www.youtube.com/' },
+  { test: /(^|\.)ytimg\.com$/i,    referer: 'https://www.youtube.com/' },
+];
+
+function refererForHost(hostname) {
+  for (const rule of REFERER_BY_HOST) {
+    if (rule.test.test(hostname)) return rule.referer;
+  }
+  return `https://${hostname}/`;
+}
+
 function guessContentType(url, upstreamCt) {
-  if (upstreamCt && /^image\//i.test(upstreamCt)) return upstreamCt;
+  const ct = (upstreamCt || '').toLowerCase().trim();
+  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') {
+    return upstreamCt;
+  }
   let ext = '';
   try {
     ext = new URL(url).pathname.split('.').pop()?.toLowerCase() || '';
@@ -241,13 +420,14 @@ function guessContentType(url, upstreamCt) {
     jpg: 'image/jpeg', jpeg: 'image/jpeg', jpe: 'image/jpeg',
     png: 'image/png', gif: 'image/gif', webp: 'image/webp',
     bmp: 'image/bmp', avif: 'image/avif', svg: 'image/svg+xml',
-  })[ext] || 'image/jpeg';
+    mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+  })[ext] || 'application/octet-stream';
 }
 
 async function handleProxy(request, targetUrlStr) {
   let targetUrl;
   try {
-    targetUrl = new URL(targetUrlStr);
+    targetUrl = new URL(normalizeMediaUrl(targetUrlStr));
   } catch (e) {
     console.log('❌ Proxy: bad target URL:', targetUrlStr);
     return new Response('Invalid target URL: ' + targetUrlStr, { status: 400 });
@@ -257,14 +437,17 @@ async function handleProxy(request, targetUrlStr) {
     return new Response('Invalid protocol', { status: 400 });
   }
 
+  const ref = refererForHost(targetUrl.hostname);
+
   const headers = new Headers();
   headers.set('User-Agent', PROXY_UA);
   headers.set(
     'Accept',
-    'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+    'image/avif,image/webp,image/apng,image/svg+xml,image/*,video/*,*/*;q=0.8'
   );
   headers.set('Accept-Language', 'en-US,en;q=0.9');
-  headers.set('Referer', `${targetUrl.origin}/`);
+  headers.set('Referer', ref);
+  headers.set('Origin', ref.replace(/\/$/, ''));
 
   const range = request.headers.get('Range');
   if (range) headers.set('Range', range);
@@ -281,13 +464,26 @@ async function handleProxy(request, targetUrlStr) {
     return new Response(`Proxy fetch failed: ${e.message}`, { status: 502 });
   }
 
-  console.log(`🎯 Proxy ${targetUrl.href} → ${upstream.status} ${upstream.headers.get('content-type')}`);
+  console.log(
+    `🎯 Proxy ${targetUrl.href} (ref=${ref}) → ${upstream.status} ` +
+    `${upstream.headers.get('content-type')}`
+  );
 
   if (!upstream.ok) {
     return new Response(`Upstream returned ${upstream.status}`, {
       status: upstream.status,
       headers: { 'content-type': 'text/plain' },
     });
+  }
+
+  const upstreamCt = (upstream.headers.get('content-type') || '').toLowerCase();
+  if (upstreamCt.startsWith('text/html') || upstreamCt.includes('application/xhtml')) {
+    const preview = await upstream.text().then(t => t.slice(0, 120)).catch(() => '');
+    console.log('❌ Proxy: upstream returned HTML:', preview);
+    return new Response(
+      `Upstream returned HTML (likely hotlink block). Preview: ${preview}`,
+      { status: 502, headers: { 'content-type': 'text/plain' } }
+    );
   }
 
   const responseHeaders = new Headers();
@@ -301,7 +497,7 @@ async function handleProxy(request, targetUrlStr) {
   }
   responseHeaders.set('access-control-allow-origin', '*');
   responseHeaders.set('cache-control', 'public, max-age=86400');
-  responseHeaders.set('x-proxied-by', 'shiny-art-worker');
+  responseHeaders.set('x-proxied-by', 'gelbooru-worker');
 
   return new Response(upstream.body, {
     status: 200,
@@ -310,66 +506,142 @@ async function handleProxy(request, targetUrlStr) {
   });
 }
 
-// ---------- Build the plain proxy URL Telegram will fetch ----------
 function buildProxyUrl(workerUrl, targetUrl) {
   const base = workerUrl.replace(/\/+$/, '');
   return `${base}/${targetUrl}`;
 }
 
-// ---------- Resolve the Worker's own public URL ----------
 async function resolveWorkerUrl(env) {
   const fromEnv = (env.WORKER_URL || '').trim().replace(/\/+$/, '');
   if (fromEnv) return fromEnv;
-  const fromKv = (await getSavedWorkerUrl(env.GELBOORU_KV) || '').trim().replace(/\/+$/, '');
+  const fromKv = (await getSavedWorkerUrl(env) || '').trim().replace(/\/+$/, '');
   return fromKv;
 }
 
-// ---------- Inline keyboard with ❤️ button ----------
+function classifyMediaKind(url) {
+  const clean = String(url || '')
+    .toLowerCase()
+    .split('?')[0]
+    .split('#')[0];
+  if (/\.(mp4|webm|mov|m4v|avi|mkv)$/.test(clean)) return 'video';
+  if (/\.gif$/.test(clean)) return 'animation';
+  return 'photo';
+}
+
+function buildMediaCandidates(post) {
+  const list = [];
+  const seen = new Set();
+  const push = (url, kind) => {
+    const clean = normalizeMediaUrl(url);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    list.push({ url: clean, kind: kind || classifyMediaKind(clean) });
+  };
+
+  push(post.sample_url);
+  push(post.file_url);
+  push(post.preview_url, 'photo');
+
+  return list;
+}
+
 const LIKE_KEYBOARD = {
   inline_keyboard: [
     [{ text: '❤️', callback_data: 'like' }],
   ],
 };
 
-// ---------- Send a post ----------
-async function sendPost(env, chatId, post) {
-  const { text, title } = buildDescription(post);
+async function trySendMedia(env, chatId, threadId, candidates, body, footer) {
+  const workerUrl = await resolveWorkerUrl(env);
+  if (!workerUrl) {
+    return { ok: false, reason: 'no worker url' };
+  }
 
-  if (post.sample_url) {
-    const workerUrl = await resolveWorkerUrl(env);
+  const tid = threadId ? { message_thread_id: threadId } : {};
 
-    if (!workerUrl) {
-      console.log('⚠️ No worker URL yet — send /start once so we can save it.');
-    } else {
-      const proxyUrl = buildProxyUrl(workerUrl, post.sample_url);
-      console.log(`📤 sendPhoto: ${proxyUrl}`);
+  const footerText = footer ? `\n\n${footer}` : '';
+  const bodyBudget = Math.max(200, 1000 - footerText.length - 20);
+  const trimmedBody = safeTruncateHtml(body || '', bodyBudget);
+  const cap = trimmedBody + footerText;
 
-      const r = await tg(env.BOT_TOKEN, 'sendPhoto', {
+  const failures = [];
+
+  for (const cand of candidates) {
+    if (!cand || !cand.url) continue;
+    const kind = cand.kind || classifyMediaKind(cand.url);
+    const primaryMethod =
+      kind === 'video' ? 'sendVideo'
+      : kind === 'animation' ? 'sendAnimation'
+      : 'sendPhoto';
+    const primaryField =
+      kind === 'video' ? 'video'
+      : kind === 'animation' ? 'animation'
+      : 'photo';
+
+    const proxyUrl = buildProxyUrl(workerUrl, cand.url);
+
+    let res = await tg(env.BOT_TOKEN, primaryMethod, {
+      chat_id: chatId,
+      ...tid,
+      [primaryField]: proxyUrl,
+      caption: cap,
+      parse_mode: 'HTML',
+      reply_markup: LIKE_KEYBOARD,
+    });
+    if (res.ok) {
+      return { ok: true, method: `${primaryMethod}_proxy`, url: cand.url };
+    }
+    failures.push(`${primaryMethod}_proxy: ${res.description || 'failed'}`);
+
+    if (primaryMethod !== 'sendDocument') {
+      res = await tg(env.BOT_TOKEN, 'sendDocument', {
         chat_id: chatId,
-        photo: proxyUrl,
-        caption: text.slice(0, 1024),
+        ...tid,
+        document: proxyUrl,
+        caption: cap,
         parse_mode: 'HTML',
         reply_markup: LIKE_KEYBOARD,
       });
-
-      if (r.ok) {
-        if (text.length > 1024) {
-          await tg(env.BOT_TOKEN, 'sendMessage', {
-            chat_id: chatId,
-            text: `<b>${title}</b>\n\n${text}`,
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-          });
-        }
-        return true;
+      if (res.ok) {
+        return { ok: true, method: 'sendDocument_proxy', url: cand.url };
       }
-      console.log('❌ sendPhoto failed:', r.description, '| url:', proxyUrl);
+      failures.push(`sendDocument_proxy: ${res.description || 'failed'}`);
     }
   }
 
+  return { ok: false, reason: failures.join(' | ') || 'no candidates' };
+}
+
+async function sendPost(env, chatId, post) {
+  const { body, footer } = buildDescription(post);
+  const candidates = buildMediaCandidates(post);
+
+  if (candidates.length) {
+    const result = await trySendMedia(
+      env, chatId, null, candidates, body, footer
+    );
+    if (result.ok) {
+      return true;
+    }
+
+    await reportError(env, 'art_send', new Error(result.reason), {
+      postId: post.id,
+      sample: !!post.sample_url,
+      preview: !!post.preview_url,
+      file: !!post.file_url,
+    });
+  } else {
+    await reportError(env, 'art_no_media',
+      new Error('post has no media URLs at all'),
+      { postId: post.id }
+    );
+  }
+
+  const fullText = `${body}${footer ? `\n\n${footer}` : ''}`;
+
   const r = await tg(env.BOT_TOKEN, 'sendMessage', {
     chat_id: chatId,
-    text: `<b>${title}</b>\n\n${text}`,
+    text: safeTruncateHtml(fullText, 4000),
     parse_mode: 'HTML',
     disable_web_page_preview: true,
     reply_markup: LIKE_KEYBOARD,
@@ -377,7 +649,6 @@ async function sendPost(env, chatId, post) {
   return !!r.ok;
 }
 
-// ---------- Latest-post sender (used by /test) ----------
 async function sendLatestPost(env, chatId) {
   const posts = await getLatest(env.KEY, env.ID, 1);
   if (!posts.length) {
@@ -390,14 +661,7 @@ async function sendLatestPost(env, chatId) {
   await sendPost(env, chatId, posts[0]);
 }
 
-// ---------- Handle ❤️ button press → edit the post caption ----------
-async function handleCallbackQuery(env, cq) {
-  // Not a like → just ack and bail.
-  if (cq.data !== 'like') {
-    await tg(env.BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: cq.id });
-    return;
-  }
-
+async function handleGelbooruLike(env, cq) {
   const msg = cq.message;
   if (!msg) {
     await tg(env.BOT_TOKEN, 'answerCallbackQuery', { callback_query_id: cq.id });
@@ -406,16 +670,13 @@ async function handleCallbackQuery(env, cq) {
 
   const from = cq.from || {};
   const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Someone';
-  const likeLine = `${escapeHtml(name)} liked this art!`;
+  const likeLine = `${htmlEsc(name)} liked this art!`;
   const LIKE_SUFFIX = ' liked this art!';
 
-  // Telegram returns plain text + a separate entities array.
-  // Rebuild the HTML first, or all links/formatting die.
   const plainCaption = msg.caption || msg.text || '';
   const entities = msg.caption_entities || msg.entities || [];
   const htmlCaption = reconstructHtml(plainCaption, entities);
 
-  // Same user can only like once — dedup by their exact like line.
   if (htmlCaption.includes(likeLine)) {
     await tg(env.BOT_TOKEN, 'answerCallbackQuery', {
       callback_query_id: cq.id,
@@ -431,7 +692,6 @@ async function handleCallbackQuery(env, cq) {
 
   let newCaption = htmlCaption ? `${htmlCaption}\n\n${likeLine}` : likeLine;
 
-  // Telegram caption limit is 1024 chars; drop the oldest like-lines if needed.
   const MAX = 1024;
   if (newCaption.length > MAX) {
     const lines = newCaption.split('\n\n');
@@ -468,127 +728,625 @@ async function handleCallbackQuery(env, cq) {
   }
 }
 
-// ---------- Handlers ----------
-async function handleCron(env) {
-  initEncryptionKey(env);
+async function handleGelbooruSubscribe(env, msg) {
+  const chatId = msg.chat.id;
+  const threadId = topicOf(msg) ?? null;
 
-  if (!env.KEY || !env.ID) {
-    console.log('❌ Missing KEY or ID env vars.');
+  await saveChatId(env, chatId);
+
+  await tg(env.BOT_TOKEN, 'sendMessage', {
+    chat_id: chatId,
+    ...(threadId ? { message_thread_id: threadId } : {}),
+    text:
+      '✅ Subscribed! You will receive new Gelbooru (yuri / yaoi) posts on every check.\n\n' +
+      'Send /test to get the latest post right now.',
+  });
+
+  await logEvent(env, { ev: 'art_sub', chatId, threadId });
+}
+
+async function handleGelbooruTest(env, msg) {
+  const chatId = msg.chat.id;
+  const threadId = topicOf(msg) ?? null;
+
+  if (!threadId) {
+    await sendLatestPost(env, chatId);
     return;
   }
 
-  const chatId = await getChatId(env.GELBOORU_KV);
-  if (!chatId) {
-    console.log('⚠️ No chat_id in KV. Send /start to the bot first.');
-    return;
-  }
-
-  const posts  = await getLatest(env.KEY, env.ID, 50);
-  const lastId = await getLastId(env.GELBOORU_KV);
-
-  const newPosts = posts.filter(p => p.id > lastId).sort((a, b) => a.id - b.id);
-  console.log(`🔄 ${newPosts.length} new posts (last_id=${lastId})`);
-
-  for (const post of newPosts) {
-    try {
-      await sendPost(env, chatId, post);
-      await saveLastId(env.GELBOORU_KV, post.id);
-    } catch (e) {
-      console.error(`❌ Failed to send post ${post.id}:`, e);
+  try {
+    const posts = await getLatest(env.KEY, env.ID, 1);
+    if (!posts.length) {
+      await tg(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: chatId,
+        message_thread_id: threadId,
+        text: '⚠️ No posts found right now.',
+      });
+      return;
     }
+    const post = posts[0];
+    const { body, footer } = buildDescription(post);
+    const candidates = buildMediaCandidates(post);
+
+    if (candidates.length) {
+      const result = await trySendMedia(
+        env, chatId, threadId, candidates, body, footer
+      );
+      if (result.ok) {
+        return;
+      }
+
+      await reportError(env, 'art_test_send', new Error(result.reason), {
+        postId: post.id,
+        sample: !!post.sample_url,
+        preview: !!post.preview_url,
+        file: !!post.file_url,
+      });
+    }
+
+    const fullText = `${body}${footer ? `\n\n${footer}` : ''}`;
+
+    await tg(env.BOT_TOKEN, 'sendMessage', {
+      chat_id: chatId,
+      message_thread_id: threadId,
+      text: safeTruncateHtml(fullText, 4000),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: LIKE_KEYBOARD,
+    });
+  } catch (e) {
+    console.error('gelbooru /test failed:', e);
+    await tg(env.BOT_TOKEN, 'sendMessage', {
+      chat_id: chatId,
+      ...(threadId ? { message_thread_id: threadId } : {}),
+      text: '❌ Failed to fetch the latest post.',
+    });
   }
 }
 
-async function handleWebhook(request, env) {
-  initEncryptionKey(env);
-
-  // Auto-capture this Worker's public origin on any incoming request.
+async function handleGelbooruCron(env, events) {
+  if (!events) events = [];
+  const summary = {
+    chatId: null,
+    lastId: 0,
+    newCount: 0,
+    sent: 0,
+    error: null,
+  };
   try {
-    const origin = new URL(request.url).origin;
-    const saved = await getSavedWorkerUrl(env.GELBOORU_KV);
-    if (origin && origin !== saved) {
-      await saveWorkerUrl(env.GELBOORU_KV, origin);
-      console.log(`📍 Saved worker URL: ${origin}`);
-    }
-  } catch {}
-
-  try {
-    const update = await request.json();
-
-    if (update.callback_query) {
-      await handleCallbackQuery(env, update.callback_query);
-      return new Response('ok');
+    if (!env.KEY || !env.ID) {
+      summary.error = 'Missing KEY or ID';
+      console.log('❌ Missing KEY or ID env vars (Gelbooru).');
+      return summary;
     }
 
-    const msg = update.message || update.edited_message;
+    const chatId = await getChatId(env);
+    summary.chatId = chatId;
+    if (!chatId) {
+      summary.error = 'No chat_id in KV';
+      console.log('⚠️ No Gelbooru chat_id in KV. Send /art to the bot first.');
+      return summary;
+    }
 
-    if (msg?.text) {
-      const chatId = msg.chat.id;
-      const text = msg.text.trim();
+    const posts  = await getLatest(env.KEY, env.ID, GELBOORU_FETCH_LIMIT);
+    const lastId = await getLastId(env);
+    summary.lastId = lastId;
 
-      if (text.startsWith('/start')) {
-        await saveChatId(env.GELBOORU_KV, chatId);
-        await tg(env.BOT_TOKEN, 'sendMessage', {
-          chat_id: chatId,
-          text:
-            '✅ Subscribed! You will receive new Gelbooru (yuri / yaoi) posts every 10 minutes.\n\n' +
-            'Send /test to get the latest post right now.',
+    const newPosts = posts
+      .filter(p => p.id > lastId)
+      .sort((a, b) => a.id - b.id);
+    summary.newCount = newPosts.length;
+    console.log(`🔄 ${newPosts.length} new Gelbooru posts (last_id=${lastId})`);
+
+    let lastSentId = lastId;
+    for (const post of newPosts) {
+      try {
+        await sendPost(env, chatId, post);
+        summary.sent++;
+        lastSentId = post.id;
+      } catch (e) {
+        console.error(`❌ Failed to send post ${post.id}:`, e);
+        events.push({
+          ev: 'gelbooru_send_error',
+          postId: post.id,
+          msg: e.message,
         });
-        return new Response('ok');
+        break;
       }
+    }
 
-      if (text.startsWith('/test')) {
-        try {
-          await sendLatestPost(env, chatId);
-        } catch (e) {
-          console.error('sendLatestPost failed:', e);
-          await tg(env.BOT_TOKEN, 'sendMessage', {
-            chat_id: chatId,
-            text: '❌ Failed to fetch the latest post.',
-          });
-        }
-        return new Response('ok');
-      }
+    if (lastSentId !== lastId) {
+      await saveLastId(env, lastSentId);
     }
   } catch (e) {
-    console.error('Webhook error:', e);
+    summary.error = e.message;
   }
-  return new Response('ok');
+  return summary;
 }
 
-// ---------- Diagnostics ----------
-async function handleDebug(env) {
+async function handleGelbooruDebug(env) {
   const info = {
-    savedWorkerUrl: await getSavedWorkerUrl(env.GELBOORU_KV),
+    savedWorkerUrl: await getSavedWorkerUrl(env),
     envWorkerUrl:   env.WORKER_URL || null,
-    kvChatId:       await getChatId(env.GELBOORU_KV),
-    kvLastId:       await getLastId(env.GELBOORU_KV),
+    kvChatId:       await getChatId(env),
+    kvLastId:       await getLastId(env),
+    hasKey:         !!env.KEY,
+    hasId:          !!env.ID,
   };
   return new Response(JSON.stringify(info, null, 2), {
     headers: { 'content-type': 'application/json; charset=utf-8' },
   });
 }
 
+function parseCommand(text) {
+  if (!text || typeof text !== 'string' || !text.startsWith('/')) return null;
+  const first = text.trim().split(/\s+/)[0];
+  return first.split('@')[0].toLowerCase();
+}
+
+async function handleUpdate(update, env) {
+  const msg = update.message || update.channel_post;
+  if (!msg || !msg.text) return;
+  const cmd = parseCommand(msg.text);
+  if (!cmd) return;
+  if (!env.BOT_TOKEN) return;
+
+  const threadId = topicOf(msg) ?? null;
+
+  switch (cmd) {
+    case '/start': {
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        '<b>Gelbooru Bot — دستورات:</b>\n' +
+          '/art — اشتراک پست‌های Gelbooru (yuri / yaoi)\n' +
+          '/test — ارسال جدیدترین پست همین الان\n' +
+          '/id — نمایش Chat ID و Topic ID\n' +
+          '/ping — تست',
+        threadId ?? undefined,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      await logEvent(env, { ev: 'start_help' });
+      return;
+    }
+
+    case '/ping': {
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `🏓 pong — ${new Date().toISOString()}`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/id': {
+      const lines = [];
+      lines.push('🆔 شناسه‌ها');
+      lines.push('');
+      lines.push(`Chat ID: <code>${msg.chat.id}</code>`);
+      lines.push(`Chat type: <code>${msg.chat.type}</code>`);
+
+      if (msg.chat.title) {
+        lines.push(`Title: <code>${htmlEsc(msg.chat.title)}</code>`);
+      }
+      if (msg.chat.username) {
+        lines.push(`Username: <code>@${htmlEsc(msg.chat.username)}</code>`);
+      }
+
+      if (msg.chat.type === 'supergroup' || msg.chat.type === 'channel') {
+        lines.push(
+          `Chat (full): <code>${String(msg.chat.id).replace(
+            /^-100/,
+            ''
+          )}</code>  ← بدون -100`
+        );
+      }
+
+      lines.push('');
+      lines.push('🧵 Topic / Thread');
+      if (threadId) {
+        lines.push(`Thread ID: <code>${threadId}</code>`);
+      } else {
+        lines.push('Thread ID: — (بدون تاپیک)');
+      }
+
+      if (msg.from) {
+        lines.push('');
+        lines.push('👤 Sender');
+        lines.push(`User ID: <code>${msg.from.id}</code>`);
+        if (msg.from.username) {
+          lines.push(`Username: <code>@${htmlEsc(msg.from.username)}</code>`);
+        }
+        const name = [msg.from.first_name, msg.from.last_name]
+          .filter(Boolean)
+          .join(' ');
+        if (name) {
+          lines.push(`Name: <code>${htmlEsc(name)}</code>`);
+        }
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        lines.join('\n'),
+        threadId ?? undefined,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
+      );
+
+      await logEvent(env, {
+        ev: 'id_cmd',
+        chatId: msg.chat.id,
+        threadId,
+      });
+      return;
+    }
+
+    case '/errors': {
+      if (msg.from?.id !== ownerId(env)) return;
+      const parts = msg.text.trim().split(/\s+/);
+      let n = 10;
+      if (parts[1]) {
+        const parsed = parseInt(parts[1], 10);
+        if (Number.isFinite(parsed) && parsed > 0 && parsed <= 20) n = parsed;
+      }
+      const raw = await env.BOT_KV.get('errors:recent', { cacheTtl: KV_CACHE_TTL });
+      let list = [];
+      if (raw) {
+        try {
+          list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+          if (!Array.isArray(list)) list = [];
+        } catch { list = []; }
+      }
+      if (!list.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '✅ هیچ خطایی ثبت نشده.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `📋 *${list.length} error(s) recorded. Showing last ${Math.min(n, list.length)}:*`,
+        threadId ?? undefined,
+        { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+      );
+      for (const e of list.slice(0, n)) {
+        const text =
+          `📍 *${e.where}*\n` +
+          `⏰ ${e.t}\n` +
+          `\n*Message:*\n\`${String(e.msg).replace(/`/g, '')}\`` +
+          (e.stack
+            ? `\n\n*Stack:*\n\`\`\`\n${e.stack.slice(0, 900)}\n\`\`\``
+            : '');
+        try {
+          await sendMessage(env.BOT_TOKEN, msg.chat.id, text, threadId ?? undefined, {
+            parse_mode: 'Markdown',
+            link_preview_options: { is_disabled: true },
+          });
+        } catch (err) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            `${e.where} — ${e.msg}\n${e.stack || ''}`,
+            threadId ?? undefined
+          );
+        }
+      }
+      return;
+    }
+
+    case '/clearerrors': {
+      if (msg.from?.id !== ownerId(env)) return;
+      await env.BOT_KV.delete('errors:recent');
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        '🗑 Error log cleared.',
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/debug': {
+      const send = (lines) =>
+        sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          { html: linesToRichHtml(lines), is_rtl: false },
+          threadId ?? undefined
+        );
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 1/2 — Basic');
+        s.push('');
+        s.push('📍 Chat');
+        s.push(`  type: ${msg.chat.type}`);
+        s.push(`  thread: ${threadId ?? '—'}`);
+        s.push('');
+        s.push('⚙️ Env');
+        s.push(`  BOT_TOKEN: ${env.BOT_TOKEN ? '✅' : '❌'}`);
+        s.push(`  DB_ENCRYPTION_KEY: ${env.DB_ENCRYPTION_KEY ? '✅' : '❌'}`);
+        s.push(`  BOT_KV: ${env.BOT_KV ? '✅' : '❌'}`);
+        s.push(`  OWNER_ID: ${ownerId(env)}`);
+        s.push(`  KEY (Gelbooru): ${env.KEY ? '✅' : '❌'}`);
+        s.push(`  ID (Gelbooru): ${env.ID ? '✅' : '❌'}`);
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 1/2 — Basic ⚠️ ${e.message}`]);
+      }
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 2/2 — Gelbooru & Bot');
+        s.push('');
+        try {
+          const gChatId = await getChatId(env);
+          const gLastId = await getLastId(env);
+          s.push(`🎨 Gelbooru`);
+          s.push(`  chat_id: ${gChatId ?? '—'}`);
+          s.push(`  last_id: ${gLastId}`);
+          s.push(`  worker_url: ${(await getSavedWorkerUrl(env)) || '—'}`);
+        } catch (e) {
+          s.push(`🎨 Gelbooru ⚠️ ${e.message}`);
+        }
+        s.push('');
+        s.push('🤖 Bot');
+        try {
+          const me = await telegram(env.BOT_TOKEN, 'getMe');
+          s.push(`  @${me.result.username}`);
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        s.push('');
+        s.push('🪝 Webhook');
+        try {
+          const info = await telegram(env.BOT_TOKEN, 'getWebhookInfo');
+          const r = info.result || {};
+          s.push(`  url: ${r.url ? '✅ set' : '❌'}`);
+          s.push(`  pending: ${r.pending_update_count ?? 0}`);
+          if (r.last_error_message) {
+            s.push(`  ⚠️ ${r.last_error_message}`);
+          } else {
+            s.push('  last_error: none ✅');
+          }
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 2/2 ⚠️ ${e.message}`]);
+      }
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//                         WORKER
+// ═══════════════════════════════════════════════════════════
 export default {
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(handleCron(env));
-  },
   async fetch(request, env) {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
-    if (url.pathname === '/debug') {
-      initEncryptionKey(env);
-      return handleDebug(env);
+      // Media proxy: /https://target → forward with proper headers
+      if (
+        url.pathname.startsWith('/http://') ||
+        url.pathname.startsWith('/https://')
+      ) {
+        const target = url.pathname.slice(1) + (url.search || '');
+        return handleProxy(request, target);
+      }
+
+      if (url.pathname === '/debug' && request.method === 'GET') {
+        return handleGelbooruDebug(env);
+      }
+
+      if (request.method === 'GET') {
+        return new Response('OK', { status: 200 });
+      }
+      if (request.method !== 'POST') {
+        return new Response('OK', { status: 200 });
+      }
+
+      // Persist the worker's own origin so we can build proxy URLs later.
+      try {
+        const origin = url.origin;
+        const saved = await getSavedWorkerUrl(env);
+        if (origin && origin !== saved) {
+          await saveWorkerUrl(env, origin);
+          console.log(`📍 Saved worker URL: ${origin}`);
+        }
+      } catch { /* ignore */ }
+
+      let update;
+      try {
+        update = await request.json();
+      } catch {
+        return new Response('OK', { status: 200 });
+      }
+
+      const gateChatId =
+        update.callback_query?.message?.chat?.id ??
+        update.message?.chat?.id ??
+        update.channel_post?.chat?.id ??
+        update.edited_message?.chat?.id ??
+        update.edited_channel_post?.chat?.id ??
+        null;
+      if (!isAllowedChat(gateChatId)) {
+        console.log(`🚫 Ignored update from disallowed chat: ${gateChatId}`);
+        return new Response('OK', { status: 200 });
+      }
+
+      if (update.callback_query) {
+        const data = update.callback_query.data || '';
+        try {
+          if (data === 'like') {
+            await handleGelbooruLike(env, update.callback_query);
+          } else {
+            await answerCallbackQuery(env.BOT_TOKEN, update.callback_query.id);
+          }
+        } catch (err) {
+          await reportError(env, 'fetch.callback', err, { data });
+        }
+        return new Response('OK', { status: 200 });
+      }
+
+      const msg = update.message || update.channel_post;
+      if (!msg) return new Response('OK', { status: 200 });
+
+      const cmd = msg.text ? parseCommand(msg.text) : null;
+
+      if (cmd === '/art') {
+        try {
+          await handleGelbooruSubscribe(env, msg);
+        } catch (err) {
+          await reportError(env, 'art', err);
+        }
+        return new Response('OK', { status: 200 });
+      }
+      if (cmd === '/test') {
+        try {
+          await handleGelbooruTest(env, msg);
+        } catch (err) {
+          await reportError(env, 'test', err);
+        }
+        return new Response('OK', { status: 200 });
+      }
+
+      try {
+        await handleUpdate(update, env);
+      } catch (err) {
+        await reportError(env, 'handleUpdate', err, {
+          cmd: msg?.text ? parseCommand(msg.text) : null,
+        });
+        if (msg?.chat?.id) {
+          try {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              `❌ خطای داخلی: ${err.message}`,
+              topicOf(msg)
+            );
+          } catch { /* ignore */ }
+        }
+      }
+      return new Response('OK', { status: 200 });
+    } catch (outer) {
+      await reportError(env, 'fetch.outer', outer);
+      return new Response('OK', { status: 200 });
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    console.log(`⏰ Cron fired: ${event.cron} at ${new Date().toISOString()}`);
+
+    if (!env.BOT_TOKEN || !env.DB_ENCRYPTION_KEY || !env.BOT_KV) {
+      console.error('Missing env bindings');
+      return;
     }
 
-    if (
-      url.pathname.startsWith('/http://') ||
-      url.pathname.startsWith('/https://')
-    ) {
-      const target = url.pathname.slice(1) + (url.search || '');
-      return handleProxy(request, target);
-    }
+    ctx.waitUntil((async () => {
+      const events = [];
+      let gelSummary = null;
+      try {
+        gelSummary = await handleGelbooruCron(env, events);
+      } catch (e) {
+        console.error('handleGelbooruCron threw:', e);
+        gelSummary = { error: e.message };
+      }
 
-    return handleWebhook(request, env);
+      await logEvents(env, events);
+      console.log('✅ Gelbooru cron done:', JSON.stringify(gelSummary));
+    })());
   },
 };
+
+// ═══════════════════════════════════════════════════════════
+//                    LOW-LEVEL HELPERS
+// ═══════════════════════════════════════════════════════════
+function topicOf(msg) {
+  return msg.is_topic_message && msg.message_thread_id
+    ? msg.message_thread_id
+    : undefined;
+}
+
+async function sendMessage(token, chatId, text, threadId, extra = {}) {
+  const body = { chat_id: chatId, text, ...extra };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function sendRichMessage(token, chatId, richMessage, threadId, extra = {}) {
+  const body = { chat_id: chatId, rich_message: richMessage, ...extra };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/sendRichMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendRichMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function answerCallbackQuery(token, callbackQueryId, extra = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/answerCallbackQuery`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, ...extra }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `answerCallbackQuery ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function telegram(token, method, params = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/${method}`,
+    Object.keys(params).length
+      ? {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        }
+      : undefined
+  );
+  return res.json();
+      }
