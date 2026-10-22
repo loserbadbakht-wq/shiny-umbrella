@@ -17,13 +17,7 @@ binding = "RSS_BOT_KV"
 id = "19f2b831dd934b5a9c73713bbab81dd7"   # <-- replace with your namespace ID
 preview_id = "19f2b831dd934b5a9c73713bbab81dd7"
 
-[[durable_objects.bindings]]
-name = "BROADCASTER"
-class_name = "Broadcaster"
 
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["Broadcaster"]
 
 # ---------- Cron Trigger ----------
 # Runs every 10 minutes. Adjust as needed.
