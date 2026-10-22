@@ -22,7 +22,7 @@ name = "BROADCASTER"
 class_name = "Broadcaster"
 
 [[migrations]]
-tag = "v2"
+tag = "v1"
 new_sqlite_classes = ["Broadcaster"]
 
 # ---------- Cron Trigger ----------
