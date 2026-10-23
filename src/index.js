@@ -1,0 +1,3184 @@
+// ============= CONFIG (shared) =============
+const KV_CACHE_TTL = 30;
+const OWNER_ID_FALLBACK = 302287170;
+
+const RLM = '\u200F';
+
+// ============= ALLOWED CHATS =============
+const ALLOWED_CHAT_IDS = new Set([
+  -1004481485615,
+  -1004119297598,
+  302287170,
+]);
+
+// ============= CONFIG (RSS) =============
+const RSS_TARGETS_KEY = 'rss:targets';
+const RSS_PIXEL_TARGETS_KEY = 'rss:pixel:targets';
+const ERRORS_KEY = 'errors:recent';
+const RSS_FETCH_TIMEOUT = 12000;
+const CRON_LAST_KEY = 'cron:last';
+const CRON_FIRED_FLAG_KEY = 'cron:fired_once';
+
+// ============= KV MIGRATION =============
+// Export format v2 stores the raw encrypted strings exactly as they sit in
+// KV — no plaintext user data ever leaves the storage. Import requires the
+// same DB_ENCRYPTION_KEY on the destination account.
+//
+// Exception: CRON_FIRED_FLAG_KEY is stored as plaintext ('1'), never
+// encrypted. The import path handles it before attempting decryption.
+const KV_EXPORT_KEYS = [
+  RSS_TARGETS_KEY,
+  RSS_PIXEL_TARGETS_KEY,
+  ERRORS_KEY,
+  'telemetry',
+  CRON_LAST_KEY,
+  CRON_FIRED_FLAG_KEY,
+];
+
+// Browser-like UA used for RSS fetches (helps bypass Cloudflare bot checks).
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// ============= ENCRYPTION =============
+function encryptData(data, key) {
+  const jsonStr = JSON.stringify(data);
+  const encoder = new TextEncoder();
+  const plaintext = encoder.encode(jsonStr);
+  const keyBytes = encoder.encode(key.padEnd(32, '0').slice(0, 32));
+  const encrypted = new Uint8Array(plaintext.length);
+  for (let i = 0; i < plaintext.length; i++) {
+    encrypted[i] = plaintext[i] ^ keyBytes[i % keyBytes.length];
+  }
+  let binary = '';
+  const CHUNK = 8192;
+  for (let i = 0; i < encrypted.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(
+      null,
+      encrypted.subarray(i, i + CHUNK)
+    );
+  }
+  return btoa(binary);
+}
+
+function decryptData(encryptedStr, key) {
+  const encrypted = Uint8Array.from(atob(encryptedStr), (c) =>
+    c.charCodeAt(0)
+  );
+  const keyBytes = new TextEncoder().encode(
+    key.padEnd(32, '0').slice(0, 32)
+  );
+  const decrypted = new Uint8Array(encrypted.length);
+  for (let i = 0; i < encrypted.length; i++) {
+    decrypted[i] = encrypted[i] ^ keyBytes[i % keyBytes.length];
+  }
+  return JSON.parse(new TextDecoder().decode(decrypted));
+}
+
+function htmlEsc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }[c])
+  );
+}
+
+function linesToRichHtml(lines) {
+  return (lines || [])
+    .map((l) => (l === '' ? '<p>&nbsp;</p>' : `<p>${htmlEsc(l)}</p>`))
+    .join('\n');
+}
+
+// ============= CONDITIONAL KV WRITE =============
+async function writeIfChanged(env, key, data, options = {}) {
+  const newRaw = encryptData(data, env.DB_ENCRYPTION_KEY);
+  let oldRaw = null;
+  try {
+    oldRaw = await env.BOT_KV.get(key);
+  } catch { /* ignore */ }
+  if (oldRaw === newRaw) return false;
+  await env.BOT_KV.put(key, newRaw, options);
+  return true;
+}
+
+// ============= OWNER =============
+function ownerId(env) {
+  const v = env.OWNER_ID;
+  if (v == null || v === '') return OWNER_ID_FALLBACK;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : OWNER_ID_FALLBACK;
+}
+
+// ============= ALLOWLIST CHECK =============
+function isAllowedChat(chatId) {
+  if (chatId == null) return false;
+  const n = typeof chatId === 'number' ? chatId : parseInt(chatId, 10);
+  if (!Number.isFinite(n)) return false;
+  return ALLOWED_CHAT_IDS.has(n);
+}
+
+// ============= ERROR REPORTING =============
+async function reportError(env, where, err, extra = {}) {
+  const entry = {
+    t: new Date().toISOString(),
+    where: where || 'unknown',
+    msg: (err && (err.message || String(err))) || 'unknown error',
+    stack: (err && err.stack) ? String(err.stack).slice(0, 800) : '',
+    ...extra,
+  };
+
+  try {
+    const raw = await env.BOT_KV.get(ERRORS_KEY, { cacheTtl: KV_CACHE_TTL });
+    let list = [];
+    if (raw) {
+      try {
+        list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(list)) list = [];
+      } catch { list = []; }
+    }
+    list.unshift(entry);
+    list = list.slice(0, 20);
+    await env.BOT_KV.put(
+      ERRORS_KEY,
+      encryptData(list, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('reportError KV write failed:', e.message);
+  }
+
+  try {
+    const text =
+      `🚨 *Error*\n` +
+      `📍 where: \`${entry.where}\`\n` +
+      `⏰ ${entry.t}\n` +
+      `\n*Message*\n\`${entry.msg.replace(/`/g, '')}\`` +
+      (entry.stack
+        ? `\n\n*Stack (truncated)*\n\`\`\`\n${entry.stack.slice(0, 500)}\n\`\`\``
+        : '');
+    await sendMessage(env.BOT_TOKEN, ownerId(env), text, undefined, {
+      parse_mode: 'Markdown',
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (e) {
+    console.error('reportError DM failed:', e.message);
+  }
+
+  console.error(`[${entry.where}]`, entry.msg);
+  if (entry.stack) console.error(entry.stack);
+}
+
+// ============= TELEMETRY =============
+async function logEvents(env, events) {
+  if (!events || !events.length) return;
+  try {
+    const raw = await env.BOT_KV.get('telemetry', { cacheTtl: KV_CACHE_TTL });
+    let log = [];
+    if (raw) {
+      try {
+        log = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(log)) log = [];
+      } catch { log = []; }
+    }
+    const now = new Date().toISOString();
+    const fresh = events.slice().reverse().map((e) => ({ t: now, ...e }));
+    log = fresh.concat(log).slice(0, 30);
+    await env.BOT_KV.put(
+      'telemetry',
+      encryptData(log, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('logEvents failed:', e.message);
+  }
+}
+
+async function logEvent(env, event) {
+  await logEvents(env, [event]);
+}
+
+// ═══════════════════════════════════════════════════════════
+//                        RSS BOT
+// ═══════════════════════════════════════════════════════════
+
+function xmlUnescape(s) {
+  return String(s)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&');
+}
+
+function stripCdata(s) {
+  const m = String(s).match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+  return (m ? m[1] : s).trim();
+}
+
+function extractTag(xml, tag) {
+  const re = new RegExp(
+    `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+    'i'
+  );
+  const m = xml.match(re);
+  if (!m) return '';
+  return xmlUnescape(stripCdata(m[1])).trim();
+}
+
+function extractAttr(xml, tag, attr) {
+  const re = new RegExp(
+    `<${tag}\\b[^>]*\\s${attr}\\s*=\\s*"([^"]*)"`,
+    'i'
+  );
+  const m = xml.match(re);
+  if (!m) return '';
+  return xmlUnescape(m[1]).trim();
+}
+
+function parseRssItem(xml) {
+  let link = extractTag(xml, 'link');
+  if (!link) {
+    const m = xml.match(/<link[^>]*\shref\s*=\s*"([^"]+)"/i);
+    if (m) link = xmlUnescape(m[1]).trim();
+  }
+
+  let description = '';
+  let descriptionIsHtml = false;
+
+  const htmlDesc =
+    extractTag(xml, 'content:encoded') ||
+    extractTag(xml, 'description') ||
+    extractTag(xml, 'summary') ||
+    extractTag(xml, 'content');
+  if (htmlDesc) {
+    description = htmlDesc;
+    descriptionIsHtml = true;
+  } else {
+    const mediaDesc = extractTag(xml, 'media:description');
+    if (mediaDesc) {
+      description = mediaDesc;
+      descriptionIsHtml = false;
+    }
+  }
+
+  let thumbnail = extractAttr(xml, 'media:thumbnail', 'url');
+  if (!thumbnail) {
+    thumbnail =
+      extractTag(xml, 'thumbnail') ||
+      extractAttr(xml, 'enclosure', 'url') ||
+      extractAttr(xml, 'media:content', 'url') ||
+      '';
+  }
+
+  const pubDate =
+    extractTag(xml, 'pubDate') ||
+    extractTag(xml, 'dc:date') ||
+    extractTag(xml, 'published') ||
+    extractTag(xml, 'updated') ||
+    '';
+
+  const guid =
+    extractTag(xml, 'guid') ||
+    extractTag(xml, 'id') ||
+    extractTag(xml, 'media:title') ||
+    link ||
+    extractTag(xml, 'title') ||
+    '';
+
+  const title = extractTag(xml, 'title');
+
+  return {
+    title,
+    link,
+    description,
+    descriptionIsHtml,
+    pubDate,
+    guid,
+    thumbnail,
+  };
+}
+
+function parseRssXml(xml) {
+  if (!xml || typeof xml !== 'string') return null;
+  const isRss = /<rss\b/i.test(xml);
+  const isAtom = /<feed\b/i.test(xml);
+  if (!isRss && !isAtom) return null;
+
+  let title = '';
+  if (isRss) {
+    const m = xml.match(
+      /<channel\b[^>]*>[\s\S]*?<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/i
+    );
+    if (m) title = xmlUnescape(stripCdata(m[1])).trim();
+  } else {
+    const m = xml.match(
+      /<feed\b[^>]*>[\s\S]*?<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/i
+    );
+    if (m) title = xmlUnescape(stripCdata(m[1])).trim();
+  }
+
+  const items = [];
+  const itemRe = /<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi;
+  let m;
+  while ((m = itemRe.exec(xml)) !== null) {
+    const item = parseRssItem(m[0]);
+    if (item.guid || item.link || item.title) items.push(item);
+  }
+  const entryRe = /<entry(?:\s[^>]*)?>[\s\S]*?<\/entry>/gi;
+  while ((m = entryRe.exec(xml)) !== null) {
+    const item = parseRssItem(m[0]);
+    if (item.guid || item.link || item.title) items.push(item);
+  }
+
+  return { title, items };
+}
+
+async function fetchRssOnce(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RSS_FETCH_TIMEOUT);
+  try {
+    const cleanUrl = String(url).trim().replace(/[\u200B-\u200D\uFEFF]/g, '');
+    const isYouTube = /(?:^|\.)youtube\.com|(?:^|\.)youtu\.be/i.test(cleanUrl);
+
+    let origin = '';
+    try {
+      origin = new URL(cleanUrl).origin;
+    } catch { /* ignore */ }
+
+    const headers = {
+      'User-Agent': BROWSER_UA,
+      'Accept':
+        'application/rss+xml, application/atom+xml, ' +
+        'application/xml, text/xml, text/html, */*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Upgrade-Insecure-Requests': '1',
+    };
+    if (origin) {
+      headers['Referer'] = origin + '/';
+      headers['Origin'] = origin;
+    }
+
+    if (isYouTube) {
+      headers['Referer'] = 'https://www.youtube.com/';
+      headers['Origin'] = 'https://www.youtube.com';
+    }
+
+    console.log(`📡 RSS fetch: ${cleanUrl} (YouTube=${isYouTube})`);
+
+    const res = await fetch(cleanUrl, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        reason: `HTTP ${res.status}${res.statusText ? ' ' + res.statusText : ''}`,
+        status: res.status,
+      };
+    }
+
+    const xml = await res.text();
+    const parsed = parseRssXml(xml);
+    if (!parsed) {
+      return {
+        ok: false,
+        reason: `bad shape: ${xml.slice(0, 80)}`,
+        status: res.status,
+      };
+    }
+    return { ok: true, data: parsed };
+  } catch (e) {
+    clearTimeout(timer);
+    return { ok: false, reason: e.message };
+  }
+}
+
+async function readRssTargets(env) {
+  const raw = await env.BOT_KV.get(RSS_TARGETS_KEY, {
+    cacheTtl: KV_CACHE_TTL,
+  });
+  if (!raw) return [];
+  try {
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    console.error('readRssTargets decrypt failed:', e.message);
+    return [];
+  }
+}
+
+async function writeRssTargets(env, targets) {
+  await writeIfChanged(env, RSS_TARGETS_KEY, targets);
+}
+
+async function readPixelTargets(env) {
+  const raw = await env.BOT_KV.get(RSS_PIXEL_TARGETS_KEY, {
+    cacheTtl: KV_CACHE_TTL,
+  });
+  if (!raw) return [];
+  try {
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    console.error('readPixelTargets decrypt failed:', e.message);
+    return [];
+  }
+}
+
+async function writePixelTargets(env, targets) {
+  await writeIfChanged(env, RSS_PIXEL_TARGETS_KEY, targets);
+}
+
+async function saveCronStatus(env, info) {
+  try {
+    await env.BOT_KV.put(
+      CRON_LAST_KEY,
+      encryptData(info, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('saveCronStatus failed:', e.message);
+  }
+}
+
+async function readCronStatus(env) {
+  try {
+    const raw = await env.BOT_KV.get(CRON_LAST_KEY);
+    if (!raw) return null;
+    return decryptData(raw, env.DB_ENCRYPTION_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function simpleHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h * 33) ^ s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(16);
+}
+
+function formatPubDate(s) {
+  if (!s) return '';
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return new Intl.DateTimeFormat('fa-IR', {
+      timeZone: 'Asia/Tehran',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(d);
+  } catch {
+    return s;
+  }
+}
+
+function normalizeForCompare(s) {
+  return String(s || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/\S*:\/\/\S*/g, ' ')
+    .replace(/\S*\.\S*\/\S*/g, ' ')
+    .replace(/\p{So}/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+const GENERIC_TITLES = new Set([
+  'image',
+  'photo',
+  'picture',
+  'untitled',
+  'no title',
+  'no-title',
+  '(no title)',
+  'no_title',
+  'na',
+  'n/a',
+  '-',
+  '—',
+]);
+
+function isGenericTitle(title) {
+  if (!title) return true;
+  const t = String(title).trim().toLowerCase();
+  if (!t) return true;
+  return GENERIC_TITLES.has(t);
+}
+
+function isTitleInDescription(title, description) {
+  if (!title || !description) return false;
+  const t = normalizeForCompare(title);
+  if (!t) return false;
+  const d = normalizeForCompare(description);
+  if (!d) return false;
+  return d.includes(t);
+}
+
+function extractRtPrefix(title, description) {
+  const m = String(title || '').match(/^(RT by @[A-Za-z0-9_]+:)/);
+  if (!m) return null;
+  const nDesc = normalizeForCompare(description || '');
+  if (!nDesc || nDesc.length < 20) return null;
+  return m[1];
+}
+
+function groupImagesIntoSlideshow(html) {
+  const s = String(html || '');
+  if (!s) return s;
+
+  const imgRe = /<img\b[^>]*\/?>/gi;
+  const matches = [];
+  let m;
+  while ((m = imgRe.exec(s)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length, tag: m[0] });
+  }
+  if (matches.length < 2) return s;
+
+  const groups = [];
+  let current = [matches[0]];
+  for (let i = 1; i < matches.length; i++) {
+    const between = s.slice(
+      current[current.length - 1].end,
+      matches[i].start
+    );
+    if (/^\s*$/.test(between)) {
+      current.push(matches[i]);
+    } else {
+      groups.push(current);
+      current = [matches[i]];
+    }
+  }
+  groups.push(current);
+
+  let result = '';
+  let cursor = 0;
+  for (const group of groups) {
+    result += s.slice(cursor, group[0].start);
+    if (group.length >= 2) {
+      result +=
+        '<tg-slideshow>\n' +
+        group.map((g) => g.tag).join('\n') +
+        '\n<figcaption>ورق بزنید</figcaption>\n' +
+        '</tg-slideshow>';
+    } else {
+      result += group[0].tag;
+    }
+    cursor = group[group.length - 1].end;
+  }
+  result += s.slice(cursor);
+  return result;
+}
+
+function buildRssItemRichMessage(item, feedTitle, hideTitle) {
+  const parts = [];
+  const titleDuplicated = isTitleInDescription(item.title, item.description);
+  const titleIsGeneric = isGenericTitle(item.title);
+  const rtPrefix = extractRtPrefix(item.title, item.description);
+
+  if (rtPrefix && !hideTitle) {
+    parts.push(`<h1>${htmlEsc(rtPrefix)}</h1>`);
+  } else if (item.title && !hideTitle && !titleDuplicated && !titleIsGeneric) {
+    parts.push(`<h1>${htmlEsc(item.title)}</h1>`);
+  }
+  if (item.thumbnail) {
+    parts.push(`<img src="${htmlEsc(item.thumbnail)}" />`);
+  }
+  if (item.pubDate) {
+    parts.push(`<p>🗓 ${htmlEsc(formatPubDate(item.pubDate))}</p>`);
+  }
+  if (item.link) {
+    const label = feedTitle ? htmlEsc(feedTitle) : 'مشاهده مطلب';
+    parts.push(`<p>🔗 <a href="${htmlEsc(item.link)}">${label}</a></p>`);
+  }
+  if (item.description) {
+    if (item.descriptionIsHtml) {
+      let html = item.description;
+      if (html.length > 3000) html = html.slice(0, 3000) + '…';
+      html = groupImagesIntoSlideshow(html);
+      parts.push(html);
+    } else {
+      let text = htmlEsc(item.description)
+        .replace(/\r\n/g, '\n')
+        .replace(/\n+/g, ' ')
+        .trim();
+      if (text.length > 1200) text = text.slice(0, 1200) + '…';
+      parts.push(`<p>${text}</p>`);
+    }
+  }
+  return { html: parts.join('\n'), is_rtl: true };
+}
+
+function buildPixelMessage(type, item) {
+  const name = item && item.title ? item.title : '';
+  return (
+    `🟦<b>تریلر جدید ${htmlEsc(type)} ${htmlEsc(name)} منتشر شد</b>\n` +
+    `\n` +
+    `🔹PixelMedia`
+  );
+}
+
+async function sendPixelPair(token, chatId, threadId, type, item, feedName) {
+  await sendMessage(
+    token,
+    chatId,
+    buildPixelMessage(type, item),
+    threadId,
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    }
+  );
+
+  const link = String(item && item.link ? item.link : '').trim();
+  if (link) {
+    const parts = [`🔗 ${link}`];
+    if (feedName) parts.push(`📡 ${feedName}`);
+    if (item && item.pubDate) {
+      parts.push(`🗓 ${formatPubDate(item.pubDate)}`);
+    }
+    await sendMessage(
+      token,
+      chatId,
+      parts.join('\n'),
+      threadId,
+      { link_preview_options: { is_disabled: true } }
+    );
+  }
+}
+
+function xmlEscapeAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function buildOpml(feeds) {
+  let out = '<?xml version="1.0" encoding="UTF-8"?>\n';
+  out += '<opml version="2.0">\n';
+  out += '  <head>\n';
+  out += '    <title>RSS Subscriptions</title>\n';
+  out += '  </head>\n';
+  out += '  <body>\n';
+  for (const f of feeds) {
+    const t = xmlEscapeAttr(f.title || f.url);
+    const u = xmlEscapeAttr(f.url);
+    out += `    <outline type="rss" text="${t}" title="${t}" xmlUrl="${u}"/>\n`;
+  }
+  out += '  </body>\n';
+  out += '</opml>\n';
+  return out;
+}
+
+function parseOpml(xml) {
+  const feeds = [];
+  const re = /<outline\b[^>]*>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const tag = m[0];
+    const urlMatch = tag.match(/\sxmlUrl\s*=\s*"([^"]+)"/i);
+    if (!urlMatch) continue;
+    const textMatch = tag.match(/\stext\s*=\s*"([^"]+)"/i);
+    const titleMatch = tag.match(/\stitle\s*=\s*"([^"]+)"/i);
+    feeds.push({
+      url: xmlUnescape(urlMatch[1]).trim(),
+      title: xmlUnescape(
+        (textMatch && textMatch[1]) ||
+        (titleMatch && titleMatch[1]) ||
+        ''
+      ).trim(),
+    });
+  }
+  return feeds;
+}
+
+function normalizeDomainArg(s) {
+  let d = String(s || '').trim().toLowerCase();
+  if (!d) return '';
+  d = d.replace(/^https?:\/\//, '');
+  d = d.replace(/^\.+/, '');
+  d = d.replace(/[/?#].*$/, '');
+  d = d.replace(/:\d+$/, '');
+  return d;
+}
+
+function urlMatchesDomain(url, domain) {
+  if (!domain) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === domain || host.endsWith('.' + domain);
+  } catch {
+    return false;
+  }
+}
+
+function parseRssCallback(data) {
+  if (!data || typeof data !== 'string' || !data.startsWith('rss:')) return null;
+  const parts = data.split(':');
+  if (parts[1] !== 'toggle') return null;
+  const ref = parts.slice(2).join(':');
+  if (!ref) return null;
+  return { action: 'toggle', ref };
+}
+
+function rssSettingsMessage(mine, ref) {
+  if (ref === 'all') {
+    const total = mine.length;
+    const hidden = mine.filter((t) => !!t.hideTitle).length;
+    let stateStr;
+    if (hidden === 0) stateStr = 'همه روشن (ON)';
+    else if (hidden === total) stateStr = 'همه خاموش (OFF)';
+    else stateStr = `مخلوط — ${hidden} از ${total} خاموش`;
+
+    const willHide = hidden < total;
+    const buttonText = willHide
+      ? '🔕 Turn Feed Title off'
+      : '🔔 Turn Feed Title on';
+
+    return {
+      text:
+        `${RLM}📡 تنظیمات RSS — همه فیدها\n` +
+        `${RLM}تعداد: ${total}\n` +
+        `${RLM}نمایش تیتر آیتم‌ها: ${stateStr}\n\n` +
+        `${RLM}با زدن دکمه، برای همه فیدهای این چت تغییر می‌کنه.`,
+      button: { text: buttonText, callback_data: 'rss:toggle:all' },
+    };
+  }
+
+  const t = mine.find((x) => simpleHash(x.url) === ref);
+  if (!t) return null;
+  const hide = !!t.hideTitle;
+  const stateStr = hide ? 'خاموش (OFF)' : 'روشن (ON)';
+  const buttonText = hide
+    ? '🔔 Turn Feed Title on'
+    : '🔕 Turn Feed Title off';
+
+  return {
+    text:
+      `${RLM}📡 تنظیمات RSS\n` +
+      `${RLM}«${t.title || 'RSS'}»\n` +
+      `${RLM}${t.url}\n\n` +
+      `${RLM}نمایش تیتر آیتم‌ها: ${stateStr}`,
+    button: { text: buttonText, callback_data: `rss:toggle:${ref}` },
+  };
+}
+
+function rssSettingsKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: settings.button.text,
+          callback_data: settings.button.callback_data,
+        },
+      ],
+    ],
+  };
+}
+
+async function handleRssSettingsCallback(cq, parsed, env) {
+  const chatId = cq.message.chat.id;
+  const threadId = cq.message.message_thread_id ?? null;
+  const messageId = cq.message.message_id;
+
+  const targets = await readRssTargets(env);
+  const mine = targets.filter(
+    (t) => t.chatId === chatId && (t.threadId ?? null) === threadId
+  );
+
+  if (!mine.length) {
+    try {
+      await editMessageText(
+        env.BOT_TOKEN,
+        chatId,
+        messageId,
+        '📭 دیگه هیچ RSS ای در اینجا نیست.',
+        { reply_markup: { inline_keyboard: [] } }
+      );
+    } catch { /* ignore */ }
+    return;
+  }
+
+  let changed = 0;
+  if (parsed.ref === 'all') {
+    const allHidden = mine.every((t) => !!t.hideTitle);
+    const newHide = !allHidden;
+    for (const t of targets) {
+      if (t.chatId === chatId && (t.threadId ?? null) === threadId) {
+        t.hideTitle = newHide;
+        changed++;
+      }
+    }
+  } else {
+    const t = targets.find(
+      (x) =>
+        x.chatId === chatId &&
+        (x.threadId ?? null) === threadId &&
+        simpleHash(x.url) === parsed.ref
+    );
+    if (!t) {
+      try {
+        await editMessageText(
+          env.BOT_TOKEN,
+          chatId,
+          messageId,
+          '⚠️ این فید دیگه وجود نداره.',
+          { reply_markup: { inline_keyboard: [] } }
+        );
+      } catch { /* ignore */ }
+      return;
+    }
+    t.hideTitle = !t.hideTitle;
+    changed = 1;
+  }
+
+  await writeRssTargets(env, targets);
+
+  const newMine = targets.filter(
+    (t) => t.chatId === chatId && (t.threadId ?? null) === threadId
+  );
+  const settings = rssSettingsMessage(newMine, parsed.ref);
+  if (!settings) return;
+
+  try {
+    await editMessageText(
+      env.BOT_TOKEN,
+      chatId,
+      messageId,
+      settings.text,
+      { reply_markup: rssSettingsKeyboard(settings) }
+    );
+  } catch (e) {
+    if (!/not modified/i.test(String(e.message || ''))) {
+      console.error('rss settings edit failed:', e.message);
+    }
+  }
+
+  await logEvent(env, {
+    ev: 'rss_settings_toggle',
+    ref: parsed.ref,
+    changed,
+  });
+}
+
+async function handleRssCallback(update, env) {
+  const cq = update.callback_query;
+  if (!cq) return;
+  try {
+    await answerCallbackQuery(env.BOT_TOKEN, cq.id);
+  } catch { /* ignore */ }
+
+  const parsed = parseRssCallback(cq.data);
+  if (!parsed) return;
+
+  try {
+    await handleRssSettingsCallback(cq, parsed, env);
+  } catch (e) {
+    await reportError(env, 'handleRssSettingsCallback', e, { data: cq.data });
+  }
+}
+
+function rssItemId(item) {
+  if (item.guid) return item.guid;
+  if (item.link) return 'link:' + item.link;
+  if (item.title) return 'title:' + item.title + '|' + (item.pubDate || '');
+  return null;
+}
+
+function mergeTrackedGuids(existing, newGuids, seed, allGuids) {
+  const seen = new Set();
+  const merged = [];
+  const source = seed ? [...allGuids, ...existing] : [...newGuids, ...existing];
+  for (const g of source) {
+    if (!g || seen.has(g)) continue;
+    seen.add(g);
+    merged.push(g);
+    if (merged.length >= 500) break;
+  }
+  return merged;
+}
+
+// ═══════════════════════════════════════════════════════════
+//                    REGULAR RSS CRON
+// ═══════════════════════════════════════════════════════════
+
+async function handleRssCron(env, events) {
+  if (!events) events = [];
+  const summary = {
+    at: new Date().toISOString(),
+    total: 0,
+    sent: 0,
+    failed: 0,
+    details: [],
+  };
+  try {
+    const targets = await readRssTargets(env);
+    summary.total = targets.length;
+    if (!targets.length) return summary;
+
+    const urlCache = new Map();
+    let changed = false;
+
+    for (const t of targets) {
+      const d = {
+        url: t.url,
+        chatId: t.chatId,
+        threadId: t.threadId ?? null,
+        fetchOk: false,
+        reason: '',
+        itemsFound: 0,
+        newFound: 0,
+        sent: 0,
+        tracked: 0,
+        seeded: false,
+        newestGuid: '',
+      };
+
+      let r = urlCache.get(t.url);
+      if (!r) {
+        r = await fetchRssOnce(t.url);
+        urlCache.set(t.url, r);
+      }
+      if (!r.ok) {
+        d.reason = r.reason || 'unknown';
+        summary.failed++;
+        summary.details.push(d);
+        continue;
+      }
+      d.fetchOk = true;
+
+      const items = r.data.items;
+      d.itemsFound = items.length;
+      d.newestGuid = items[0] ? (rssItemId(items[0]) || '').slice(0, 40) : '';
+      if (!items.length) {
+        summary.details.push(d);
+        continue;
+      }
+
+      const hasSentGuids = Array.isArray(t.sentGuids);
+      const sentGuids = hasSentGuids ? t.sentGuids.slice() : [];
+      const sentSet = new Set(sentGuids);
+      d.tracked = sentGuids.length;
+
+      const newItems = [];
+      for (const item of items) {
+        const ident = rssItemId(item);
+        if (ident && sentSet.has(ident)) continue;
+        newItems.push(item);
+      }
+      d.newFound = newItems.length;
+
+      const MAX_NEW_PER_PASS = 10;
+      const RESEED_THRESHOLD = 30;
+      const isSeedRun =
+        !t.seededAt ||
+        !hasSentGuids ||
+        newItems.length > RESEED_THRESHOLD;
+      d.seeded = isSeedRun;
+
+      const toSend = isSeedRun ? [] : newItems.slice(0, MAX_NEW_PER_PASS);
+      toSend.reverse();
+
+      const justSent = [];
+      for (const item of toSend) {
+        try {
+          await sendRichMessage(
+            env.BOT_TOKEN,
+            t.chatId,
+            buildRssItemRichMessage(
+              item,
+              t.title || r.data.title,
+              !!t.hideTitle
+            ),
+            t.threadId ?? undefined
+          );
+          d.sent++;
+          summary.sent++;
+          const ident = rssItemId(item);
+          if (ident) justSent.push(ident);
+        } catch (e) {
+          console.error('RSS sendRichMessage failed:', e.message);
+          summary.failed++;
+          events.push({
+            ev: 'rss_send_error',
+            msg: e.message,
+            url: t.url.slice(0, 80),
+          });
+          break;
+        }
+      }
+
+      const allGuids = items.map((i) => rssItemId(i)).filter(Boolean);
+      const toRecord = isSeedRun ? allGuids : justSent;
+
+      if (toRecord.length > 0 || isSeedRun) {
+        t.sentGuids = mergeTrackedGuids(sentGuids, toRecord, isSeedRun, allGuids);
+        t.seededAt = Date.now();
+        if ('lastGuid' in t) delete t.lastGuid;
+        if (r.data.title) t.title = r.data.title;
+        changed = true;
+      }
+
+      if (d.sent > 0) {
+        events.push({
+          ev: 'rss_sent',
+          url: t.url.slice(0, 80),
+          count: d.sent,
+        });
+      }
+
+      summary.details.push(d);
+    }
+
+    if (changed) {
+      await writeRssTargets(env, targets);
+    }
+  } catch (e) {
+    summary.error = e.message;
+    await reportError(env, 'scheduled.rss', e);
+  }
+  return summary;
+}
+
+// ═══════════════════════════════════════════════════════════
+//                    PIXEL RSS CRON
+// ═══════════════════════════════════════════════════════════
+
+async function handlePixelRssCron(env, events) {
+  if (!events) events = [];
+  const summary = {
+    at: new Date().toISOString(),
+    total: 0,
+    sent: 0,
+    failed: 0,
+    details: [],
+  };
+  try {
+    const targets = await readPixelTargets(env);
+    summary.total = targets.length;
+    if (!targets.length) return summary;
+
+    const urlCache = new Map();
+    let changed = false;
+
+    for (const t of targets) {
+      const d = {
+        url: t.url,
+        chatId: t.chatId,
+        threadId: t.threadId ?? null,
+        type: t.type || '',
+        fetchOk: false,
+        reason: '',
+        itemsFound: 0,
+        newFound: 0,
+        sent: 0,
+        tracked: 0,
+        seeded: false,
+        newestGuid: '',
+      };
+
+      let r = urlCache.get(t.url);
+      if (!r) {
+        r = await fetchRssOnce(t.url);
+        urlCache.set(t.url, r);
+      }
+      if (!r.ok) {
+        d.reason = r.reason || 'unknown';
+        summary.failed++;
+        summary.details.push(d);
+        continue;
+      }
+      d.fetchOk = true;
+
+      const items = r.data.items;
+      d.itemsFound = items.length;
+      d.newestGuid = items[0] ? (rssItemId(items[0]) || '').slice(0, 40) : '';
+      if (!items.length) {
+        summary.details.push(d);
+        continue;
+      }
+
+      const hasSentGuids = Array.isArray(t.sentGuids);
+      const sentGuids = hasSentGuids ? t.sentGuids.slice() : [];
+      const sentSet = new Set(sentGuids);
+      d.tracked = sentGuids.length;
+
+      const newItems = [];
+      for (const item of items) {
+        const ident = rssItemId(item);
+        if (ident && sentSet.has(ident)) continue;
+        newItems.push(item);
+      }
+      d.newFound = newItems.length;
+
+      const MAX_NEW_PER_PASS = 10;
+      const RESEED_THRESHOLD = 30;
+      const isSeedRun =
+        !t.seededAt ||
+        !hasSentGuids ||
+        newItems.length > RESEED_THRESHOLD;
+      d.seeded = isSeedRun;
+
+      const toSend = isSeedRun ? [] : newItems.slice(0, MAX_NEW_PER_PASS);
+      toSend.reverse();
+
+      const justSent = [];
+      for (const item of toSend) {
+        try {
+          await sendPixelPair(
+            env.BOT_TOKEN,
+            t.chatId,
+            t.threadId ?? undefined,
+            t.type || '',
+            item,
+            t.title || r.data.title || ''
+          );
+
+          d.sent++;
+          summary.sent++;
+          const ident = rssItemId(item);
+          if (ident) justSent.push(ident);
+        } catch (e) {
+          console.error('Pixel RSS sendPixelPair failed:', e.message);
+          summary.failed++;
+          events.push({
+            ev: 'rss_pixel_send_error',
+            msg: e.message,
+            url: t.url.slice(0, 80),
+          });
+          break;
+        }
+      }
+
+      const allGuids = items.map((i) => rssItemId(i)).filter(Boolean);
+      const toRecord = isSeedRun ? allGuids : justSent;
+
+      if (toRecord.length > 0 || isSeedRun) {
+        t.sentGuids = mergeTrackedGuids(sentGuids, toRecord, isSeedRun, allGuids);
+        t.seededAt = Date.now();
+        if ('lastGuid' in t) delete t.lastGuid;
+        if (r.data.title) t.title = r.data.title;
+        changed = true;
+      }
+
+      if (d.sent > 0) {
+        events.push({
+          ev: 'rss_pixel_sent',
+          url: t.url.slice(0, 80),
+          count: d.sent,
+        });
+      }
+
+      summary.details.push(d);
+    }
+
+    if (changed) {
+      await writePixelTargets(env, targets);
+    }
+  } catch (e) {
+    summary.error = e.message;
+    await reportError(env, 'scheduled.rss_pixel', e);
+  }
+  return summary;
+}
+
+// ═══════════════════════════════════════════════════════════
+//                    KV EXPORT / IMPORT
+// ═══════════════════════════════════════════════════════════
+
+function targetKeyOf(t) {
+  return `${t.chatId}|${t.threadId ?? ''}|${t.url}`;
+}
+
+function dedupeTargets(imported, existing) {
+  const seen = new Set();
+  const result = [];
+  for (const t of imported) {
+    if (!t || typeof t !== 'object' || !t.url) continue;
+    const k = targetKeyOf(t);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    result.push(t);
+  }
+  for (const t of existing) {
+    if (!t || typeof t !== 'object' || !t.url) continue;
+    const k = targetKeyOf(t);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    result.push(t);
+  }
+  return result;
+}
+
+async function handleKvExport(env, msg, threadId) {
+  if (msg.from?.id !== ownerId(env)) return;
+
+  // Version 2: each value is the raw string exactly as stored in KV.
+  // Encrypted values are NOT decrypted here; the CRON_FIRED_FLAG_KEY
+  // value is plaintext '1' and is stored verbatim. Import handles both.
+  const data = {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    keys: {},
+  };
+
+  for (const key of KV_EXPORT_KEYS) {
+    try {
+      const raw = await env.BOT_KV.get(key);
+      if (raw == null) continue;
+      data.keys[key] = raw;
+    } catch (e) {
+      console.error(`Export failed for ${key}:`, e);
+    }
+  }
+
+  const json = JSON.stringify(data, null, 2);
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const filename = `rss-kv-export-${dateStr}.json`;
+
+  try {
+    await sendDocument(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      filename,
+      json,
+      'application/json',
+      threadId ?? undefined,
+      {
+        caption:
+          '📦 KV export (encrypted). ' +
+          'Import on the new account with the same DB_ENCRYPTION_KEY.',
+      }
+    );
+  } catch (e) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      `❌ Failed to send export: ${e.message}`,
+      threadId ?? undefined
+    );
+    await reportError(env, 'kv_export', e);
+    return;
+  }
+
+  await logEvent(env, { ev: 'kv_export', keys: Object.keys(data.keys).length });
+}
+
+async function handleKvImport(env, msg, threadId) {
+  if (msg.from?.id !== ownerId(env)) return;
+
+  const arg = msg.text.replace(/^\/rsskvimport(@\w+)?\s*/i, '').trim().toLowerCase();
+  const merge = arg === 'merge';
+
+  const reply = msg.reply_to_message;
+  if (!reply || !reply.document) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      'ℹ️ Usage:\n' +
+        'Reply to an exported `.json` file and send:\n' +
+        '• `/rsskvimport` — replace all current KV\n' +
+        '• `/rsskvimport merge` — merge with current KV\n\n' +
+        'The destination account must use the same `DB_ENCRYPTION_KEY`.',
+      threadId ?? undefined,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  let text;
+  try {
+    text = await getFileText(env.BOT_TOKEN, reply.document.file_id);
+  } catch (e) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      `❌ Failed to download file: ${e.message}`,
+      threadId ?? undefined
+    );
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      `❌ Invalid JSON: ${e.message}`,
+      threadId ?? undefined
+    );
+    return;
+  }
+
+  if (!parsed || parsed.version !== 2 || !parsed.keys || typeof parsed.keys !== 'object') {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      '⚠️ Unrecognized export file (expected version 2 with a "keys" object ' +
+        'whose values are strings).',
+      threadId ?? undefined
+    );
+    return;
+  }
+
+  const whitelist = new Set(KV_EXPORT_KEYS);
+  const results = [];
+  let written = 0;
+  let skipped = 0;
+
+  for (const [key, raw] of Object.entries(parsed.keys)) {
+    if (!whitelist.has(key)) {
+      results.push(`⏭ ${key} (unknown, skipped)`);
+      skipped++;
+      continue;
+    }
+    if (typeof raw !== 'string') {
+      results.push(`❌ ${key} (not a string)`);
+      skipped++;
+      continue;
+    }
+
+    // cron:fired_once is stored as plaintext ('1'), never encrypted.
+    // Copy it as-is without attempting decryption.
+    if (key === CRON_FIRED_FLAG_KEY) {
+      try {
+        const existing = await env.BOT_KV.get(key);
+        if (merge && existing) {
+          results.push(`⏭ ${key} (already set, kept)`);
+          skipped++;
+        } else {
+          await env.BOT_KV.put(key, raw);
+          results.push(`✅ ${key}`);
+          written++;
+        }
+      } catch (e) {
+        results.push(`❌ ${key}: ${e.message}`);
+        skipped++;
+      }
+      continue;
+    }
+
+    // Verify this Worker's key can decrypt the blob. If it can't, the
+    // destination is using a different DB_ENCRYPTION_KEY.
+    let value;
+    try {
+      value = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    } catch {
+      results.push(`❌ ${key} (cannot decrypt — DB_ENCRYPTION_KEY differs)`);
+      skipped++;
+      continue;
+    }
+
+    try {
+      if (!merge) {
+        // Replace: write the encrypted blob as-is, no re-encryption needed.
+        await env.BOT_KV.put(key, raw);
+        const count = Array.isArray(value) ? ` (${value.length} entries)` : '';
+        results.push(`✅ ${key}${count}`);
+        written++;
+        continue;
+      }
+
+      if (key === RSS_TARGETS_KEY || key === RSS_PIXEL_TARGETS_KEY) {
+        if (!Array.isArray(value)) {
+          results.push(`❌ ${key} (expected array)`);
+          skipped++;
+          continue;
+        }
+        const existing = key === RSS_TARGETS_KEY
+          ? await readRssTargets(env)
+          : await readPixelTargets(env);
+        const before = existing.length;
+        const imported = value.filter((t) => t && isAllowedChat(t.chatId));
+        const dropped = value.length - imported.length;
+        const merged = dedupeTargets(imported, existing);
+        await env.BOT_KV.put(
+          key,
+          encryptData(merged, env.DB_ENCRYPTION_KEY)
+        );
+        results.push(
+          `✅ ${key} (merged: ${before} + ${imported.length} → ${merged.length}` +
+            (dropped > 0 ? `, ${dropped} dropped not-allowed` : '') +
+            `)`
+        );
+        written++;
+      } else if (key === ERRORS_KEY || key === 'telemetry') {
+        if (!Array.isArray(value)) {
+          results.push(`❌ ${key} (expected array)`);
+          skipped++;
+          continue;
+        }
+        let existing = [];
+        const oldRaw = await env.BOT_KV.get(key);
+        if (oldRaw) {
+          try {
+            existing = decryptData(oldRaw, env.DB_ENCRYPTION_KEY) || [];
+            if (!Array.isArray(existing)) existing = [];
+          } catch { existing = []; }
+        }
+        const cap = key === 'telemetry' ? 30 : 20;
+        const merged = [...value, ...existing].slice(0, cap);
+        await env.BOT_KV.put(
+          key,
+          encryptData(merged, env.DB_ENCRYPTION_KEY)
+        );
+        results.push(`✅ ${key} (merged: ${merged.length} entries)`);
+        written++;
+      } else if (key === CRON_LAST_KEY) {
+        const existing = await env.BOT_KV.get(key);
+        if (existing) {
+          results.push(`⏭ ${key} (already set, kept)`);
+          skipped++;
+        } else {
+          await env.BOT_KV.put(key, raw);
+          results.push(`✅ ${key}`);
+          written++;
+        }
+      } else {
+        results.push(`⏭ ${key} (no merge rule, skipped)`);
+        skipped++;
+      }
+    } catch (e) {
+      results.push(`❌ ${key}: ${e.message}`);
+      skipped++;
+    }
+  }
+
+  let summary =
+    `${RLM}📥 KV import done${merge ? ' (merge)' : ''}\n` +
+    `${RLM}Written: ${written} · Skipped: ${skipped}\n\n` +
+    results.map((r) => `${RLM}${r}`).join('\n');
+  if (summary.length > 4000) summary = summary.slice(0, 3950) + '\n…';
+
+  await sendMessage(
+    env.BOT_TOKEN,
+    msg.chat.id,
+    summary,
+    threadId ?? undefined,
+    { link_preview_options: { is_disabled: true } }
+  );
+
+  await logEvent(env, {
+    ev: 'kv_import',
+    merge,
+    written,
+    skipped,
+    exportedAt: parsed.exportedAt || null,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+//                     COMMAND HANDLER
+// ═══════════════════════════════════════════════════════════
+
+function parseCommand(text) {
+  if (!text || typeof text !== 'string' || !text.startsWith('/')) return null;
+  const first = text.trim().split(/\s+/)[0];
+  return first.split('@')[0].toLowerCase();
+}
+
+async function handleUpdate(update, env) {
+  const msg = update.message || update.channel_post;
+  if (!msg || !msg.text) return;
+  const cmd = parseCommand(msg.text);
+  if (!cmd) return;
+  if (!env.BOT_TOKEN) return;
+
+  const threadId = topicOf(msg) ?? null;
+  const where = !threadId
+    ? msg.chat.type === 'private'
+      ? 'چت خصوصی'
+      : msg.chat.type === 'channel'
+        ? 'کانال'
+        : 'چت'
+    : 'تاپیک';
+
+  switch (cmd) {
+    case '/start': {
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        '<b>RSS Bot — دستورات:</b>\n' +
+          '<b>— RSS —</b>\n' +
+          '/rss &lt;url&gt; — اشتراک فید جدید\n' +
+          '/rssunsub &lt;url&gt; — حذف اشتراک\n' +
+          '/rssunsubdomain &lt;domain&gt; — حذف همه اشتراک‌های یک دامنه\n' +
+          '/rsslist — لیست اشتراک‌های این چت\n' +
+          '/rsssettings &lt;url&gt; | all — تنظیمات نمایش تیتر\n' +
+          '/rsstest &lt;url&gt; — تست دستی یک فید\n' +
+          '/rssexport — خروجی OPML\n' +
+          '/rssimport — ورودی OPML (روی فایل ریپلای کن)\n' +
+          '\n<b>— RSS Pixel —</b>\n' +
+          '/rsspixel &lt;url&gt; &lt;type&gt; — اشتراک PixelMedia\n' +
+          '/rsspixelunsub &lt;url&gt; — حذف اشتراک PixelMedia\n' +
+          '/rsspixellist — لیست اشتراک‌های PixelMedia\n' +
+          '/rsspixeltest &lt;url&gt; &lt;type&gt; — تست دستی یک فید PixelMedia\n' +
+          '\n<b>— Migration —</b>\n' +
+          '/rsskvexport — خروجی KV (فقط owner)\n' +
+          '/rsskvimport — ورودی KV (روی فایل ریپلای کن، فقط owner)\n' +
+          '\n<b>— عمومی —</b>\n' +
+          '/id — نمایش Chat ID و Topic ID\n' +
+          '/ping — تست',
+        threadId ?? undefined,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      await logEvent(env, { ev: 'start_help' });
+      return;
+    }
+
+    case '/ping': {
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `🏓 pong — ${new Date().toISOString()}`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/crondebug': {
+      if (msg.from?.id !== ownerId(env)) return;
+
+      const arg = msg.text
+        .replace(/^\/crondebug(@\w+)?\s*/i, '')
+        .trim()
+        .toLowerCase();
+
+      if (arg === 'run' || arg === 'now' || arg === 'test') {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⏳ Running RSS cron now…',
+          threadId ?? undefined
+        );
+
+        const events = [];
+        const summary = await handleRssCron(env, events);
+        const pixelSummary = await handlePixelRssCron(env, events);
+        await logEvents(env, events);
+
+        await saveCronStatus(env, {
+          at: new Date().toISOString(),
+          cron: 'manual',
+          status: 'done',
+          rss: summary,
+          pixel: pixelSummary,
+        });
+
+        const lines = [];
+        lines.push('🧪 Manual RSS cron result');
+        lines.push('');
+        lines.push(`targets: ${summary.total}`);
+        lines.push(`sent: ${summary.sent}`);
+        lines.push(`failed: ${summary.failed}`);
+        if (summary.error) lines.push(`error: ${summary.error}`);
+        lines.push('');
+        for (const d of summary.details || []) {
+          lines.push(`· ${d.url}`);
+          if (!d.fetchOk) {
+            lines.push(`   ❌ fetch: ${d.reason}`);
+          } else {
+            const flag = d.seeded ? '🌱 seed' : '➡️';
+            lines.push(
+              `   ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+            );
+            lines.push(`      newestGuid=${d.newestGuid || '—'}`);
+          }
+        }
+
+        lines.push('');
+        lines.push('🧪 Pixel RSS result');
+        lines.push('');
+        lines.push(`targets: ${pixelSummary.total}`);
+        lines.push(`sent: ${pixelSummary.sent}`);
+        lines.push(`failed: ${pixelSummary.failed}`);
+        if (pixelSummary.error) lines.push(`error: ${pixelSummary.error}`);
+        lines.push('');
+        for (const d of pixelSummary.details || []) {
+          lines.push(`· [${d.type || '—'}] ${d.url}`);
+          if (!d.fetchOk) {
+            lines.push(`   ❌ fetch: ${d.reason}`);
+          } else {
+            const flag = d.seeded ? '🌱 seed' : '➡️';
+            lines.push(
+              `   ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+            );
+            lines.push(`      newestGuid=${d.newestGuid || '—'}`);
+          }
+        }
+
+        await sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          { html: linesToRichHtml(lines), is_rtl: false },
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const last = await readCronStatus(env);
+      const lines = [];
+      lines.push('🔍 Cron Debug');
+      lines.push('');
+
+      if (!last) {
+        lines.push('⚠️ No cron run recorded yet.');
+        lines.push('');
+        lines.push('Possible causes:');
+        lines.push('• The `[triggers]` block is missing from wrangler.toml');
+        lines.push('• The worker was never re-deployed after adding crons');
+        lines.push('• No cron has fired since the worker was deployed');
+        lines.push('');
+        lines.push('Try: `/crondebug run` to run the RSS cron manually.');
+      } else {
+        lines.push(`at: ${last.at}`);
+        if (last.startedAt) lines.push(`started: ${last.startedAt}`);
+        lines.push(`cron: ${last.cron || '—'}`);
+        lines.push(`status: ${last.status || '—'}`);
+        lines.push('');
+
+        if (last.rss) {
+          lines.push(`📡 RSS`);
+          lines.push(`  targets: ${last.rss.total ?? 0}`);
+          lines.push(`  sent: ${last.rss.sent ?? 0}`);
+          lines.push(`  failed: ${last.rss.failed ?? 0}`);
+          if (last.rss.error) lines.push(`  error: ${last.rss.error}`);
+          for (const d of last.rss.details || []) {
+            lines.push('');
+            lines.push(`  · ${d.url}`);
+            if (!d.fetchOk) {
+              lines.push(`     ❌ ${d.reason}`);
+            } else {
+              const flag = d.seeded ? '🌱 seed' : '➡️';
+              lines.push(
+                `     ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+              );
+              lines.push(`     newestGuid=${d.newestGuid || '—'}`);
+            }
+          }
+          lines.push('');
+        }
+
+        if (last.pixel) {
+          lines.push(`📡 Pixel RSS`);
+          lines.push(`  targets: ${last.pixel.total ?? 0}`);
+          lines.push(`  sent: ${last.pixel.sent ?? 0}`);
+          lines.push(`  failed: ${last.pixel.failed ?? 0}`);
+          if (last.pixel.error) lines.push(`  error: ${last.pixel.error}`);
+          for (const d of last.pixel.details || []) {
+            lines.push('');
+            lines.push(`  · [${d.type || '—'}] ${d.url}`);
+            if (!d.fetchOk) {
+              lines.push(`     ❌ ${d.reason}`);
+            } else {
+              const flag = d.seeded ? '🌱 seed' : '➡️';
+              lines.push(
+                `     ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+              );
+              lines.push(`     newestGuid=${d.newestGuid || '—'}`);
+            }
+          }
+          lines.push('');
+        }
+
+        lines.push('Run `/crondebug run` to trigger the RSS cron manually.');
+      }
+
+      await sendRichMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        { html: linesToRichHtml(lines), is_rtl: false },
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/id': {
+      const lines = [];
+      lines.push(`${RLM}🆔 شناسه‌ها`);
+      lines.push('');
+      lines.push(`${RLM}Chat ID: <code>${msg.chat.id}</code>`);
+      lines.push(`${RLM}Chat type: <code>${msg.chat.type}</code>`);
+
+      if (msg.chat.title) {
+        lines.push(`${RLM}Title: <code>${htmlEsc(msg.chat.title)}</code>`);
+      }
+      if (msg.chat.username) {
+        lines.push(
+          `${RLM}Username: <code>@${htmlEsc(msg.chat.username)}</code>`
+        );
+      }
+
+      if (msg.chat.type === 'supergroup' || msg.chat.type === 'channel') {
+        lines.push(
+          `${RLM}Chat (full): <code>${String(msg.chat.id).replace(
+            /^-100/,
+            ''
+          )}</code>  ← بدون -100`
+        );
+      }
+
+      lines.push('');
+      lines.push(`${RLM}🧵 Topic / Thread`);
+      if (threadId) {
+        lines.push(`${RLM}Thread ID: <code>${threadId}</code>`);
+      } else {
+        lines.push(`${RLM}Thread ID: — (بدون تاپیک)`);
+      }
+
+      if (msg.from) {
+        lines.push('');
+        lines.push(`${RLM}👤 Sender`);
+        lines.push(`${RLM}User ID: <code>${msg.from.id}</code>`);
+        if (msg.from.username) {
+          lines.push(
+            `${RLM}Username: <code>@${htmlEsc(msg.from.username)}</code>`
+          );
+        }
+        const name = [msg.from.first_name, msg.from.last_name]
+          .filter(Boolean)
+          .join(' ');
+        if (name) {
+          lines.push(`${RLM}Name: <code>${htmlEsc(name)}</code>`);
+        }
+      }
+
+      if (msg.is_topic_message) {
+        lines.push('');
+        lines.push(
+          `${RLM}ℹ️ این پیام داخل یک تاپیک ارسال شده.`
+        );
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        lines.join('\n'),
+        threadId ?? undefined,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
+      );
+
+      await logEvent(env, {
+        ev: 'id_cmd',
+        chatId: msg.chat.id,
+        threadId,
+      });
+      return;
+    }
+
+    case '/rss': {
+      const url = msg.text.replace(/^\/rss(@\w+)?\s*/i, '').trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rss <url>`\n\n' +
+            'نام فید از تایتل خود RSS گرفته میشه.\n' +
+            'برای حذف: `/rssunsub <url>`\n' +
+            'برای حذف گروهی بر اساس دامنه: `/rssunsubdomain <domain>`\n' +
+            'برای تنظیمات نمایش تیتر: `/rsssettings <url>` یا `/rsssettings all`\n' +
+            'برای خروجی OPML: `/rssexport`\n' +
+            'برای ورودی OPML: روی فایل `.opml` ریپلای کن و `/rssimport` بزن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const title = r.data.title || 'RSS Feed';
+      const initialGuids = r.data.items
+        .map((i) => rssItemId(i))
+        .filter(Boolean);
+
+      const targets = await readRssTargets(env);
+      const existing = targets.find(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+
+      if (existing) {
+        existing.title = title;
+        existing.sentGuids = initialGuids;
+        existing.seededAt = Date.now();
+        if ('lastGuid' in existing) delete existing.lastGuid;
+        await writeRssTargets(env, targets);
+        await logEvent(env, {
+          ev: 'rss_sub_update',
+          url: url.slice(0, 80),
+          title: title.slice(0, 80),
+        });
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `${RLM}♻️ اشتراک «${title}» به‌روزرسانی شد.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      targets.push({
+        chatId: msg.chat.id,
+        threadId,
+        url,
+        title,
+        sentGuids: initialGuids,
+        seededAt: Date.now(),
+        hideTitle: false,
+      });
+      await writeRssTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_sub',
+        url: url.slice(0, 80),
+        title: title.slice(0, 80),
+        total: targets.length,
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `${RLM}✅ اشتراک «${title}» فعال شد. از این به بعد هر وقت آیتم جدیدی در این فید بیاد، در این ${where} ارسال میشه.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rssunsub': {
+      const url = msg.text.replace(/^\/rssunsub(@\w+)?\s*/i, '').trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ `/rssunsub <url>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const targets = await readRssTargets(env);
+      const idx = targets.findIndex(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+      if (idx === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ اشتراکی با این URL در اینجا پیدا نشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const removed = targets.splice(idx, 1)[0];
+      await writeRssTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_unsub',
+        url: removed.url.slice(0, 80),
+        title: (removed.title || '').slice(0, 80),
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ اشتراک «${removed.title || removed.url}» حذف شد.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rssunsubdomain': {
+      const rawArg = msg.text
+        .replace(/^\/rssunsubdomain(@\w+)?\s*/i, '')
+        .trim();
+
+      if (!rawArg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n`/rssunsubdomain <domain>`\n\n' +
+            'مثال: `/rssunsubdomain shitter.thepixora.com`\n' +
+            'همه اشتراک‌های این ' + where + ' که دامنه‌شون برابر یا زیرمجموعه این دامنه باشه حذف میشن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const domain = normalizeDomainArg(rawArg);
+      if (!domain || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ دامنه معتبر نیست: \`${rawArg}\``,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const targets = await readRssTargets(env);
+      const kept = [];
+      const removed = [];
+      for (const t of targets) {
+        const isMine =
+          t.chatId === msg.chat.id && (t.threadId ?? null) === threadId;
+        if (isMine && urlMatchesDomain(t.url, domain)) {
+          removed.push(t);
+        } else {
+          kept.push(t);
+        }
+      }
+
+      if (!removed.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `ℹ️ هیچ اشتراکی با دامنه «${domain}» در این ${where} پیدا نشد.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      await writeRssTargets(env, kept);
+      await logEvent(env, {
+        ev: 'rss_unsub_domain',
+        domain,
+        count: removed.length,
+        chatId: msg.chat.id,
+        threadId,
+      });
+
+      const s = [];
+      s.push(`${RLM}✅ ${removed.length} اشتراک با دامنه «${domain}» حذف شد.`);
+      s.push('');
+      const preview = removed.slice(0, 10);
+      for (const r of preview) {
+        s.push(`${RLM}• ${r.title || r.url}`);
+      }
+      if (removed.length > preview.length) {
+        s.push(`${RLM}… و ${removed.length - preview.length} مورد دیگر`);
+      }
+
+      let text = s.join('\n');
+      if (text.length > 4000) text = text.slice(0, 3950) + '\n…';
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        text,
+        threadId ?? undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+      return;
+    }
+
+    case '/rsslist': {
+      const targets = await readRssTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
+
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `📭 هیچ RSS ای در این ${where} وجود نداره.\n` +
+            'برای اضافه کردن: `/rss <url>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const s = [];
+      s.push(`${RLM}📡 RSS در این ${where} (${mine.length})`);
+      s.push('');
+
+      mine.forEach((t, i) => {
+        const titleState = t.hideTitle ? '🔕' : '🔔';
+        s.push(`${RLM}${i + 1}. ${titleState} «${t.title || 'RSS'}»`);
+        s.push(`${RLM}   ${t.url}`);
+      });
+
+      s.push('');
+      s.push(`${RLM}🔔 = تیتر آیتم‌ها نمایش داده میشه`);
+      s.push(`${RLM}🔕 = تیتر آیتم‌ها مخفی میشه`);
+      s.push(`${RLM}برای تغییر: /rsssettings <url> یا /rsssettings all`);
+      s.push(`${RLM}برای حذف: /rssunsub <url>`);
+      s.push(`${RLM}برای حذف گروهی: /rssunsubdomain <domain>`);
+
+      let text = s.join('\n');
+      if (text.length > 4000) {
+        text = text.slice(0, 3950) + '\n…';
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        text,
+        threadId ?? undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+
+      await logEvent(env, { ev: 'rss_list', count: mine.length });
+      return;
+    }
+
+    case '/rsssettings': {
+      const arg = msg.text.replace(/^\/rsssettings(@\w+)?\s*/i, '').trim();
+
+      if (!arg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rsssettings all` — تنظیم همه فیدهای این ' + where + '\n' +
+            '`/rsssettings <url>` — تنظیم یک فید خاص\n\n' +
+            'با این تنظیم می‌تونی مشخص کنی تیتر خود آیتم‌ها (item title) توی پیام‌ها نمایش داده بشه یا نه.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const targets = await readRssTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
+
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `📭 هیچ RSS ای در این ${where} وجود نداره. اول با /rss اضافه کن.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      let ref;
+      if (arg.toLowerCase() === 'all') {
+        ref = 'all';
+      } else {
+        if (!/^https?:\/\//i.test(arg)) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            '⚠️ URL باید با http یا https شروع بشه، یا کلمه `all`.',
+            threadId ?? undefined,
+            { parse_mode: 'Markdown' }
+          );
+          return;
+        }
+        const match = mine.find((t) => t.url === arg);
+        if (!match) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            '⚠️ اشتراکی با این URL در اینجا پیدا نشد. از /rsslist استفاده کن.',
+            threadId ?? undefined
+          );
+          return;
+        }
+        ref = simpleHash(match.url);
+      }
+
+      const settings = rssSettingsMessage(mine, ref);
+      if (!settings) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ خطا در ساخت تنظیمات. دوباره تلاش کن.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        settings.text,
+        threadId ?? undefined,
+        { reply_markup: rssSettingsKeyboard(settings) }
+      );
+
+      await logEvent(env, { ev: 'rss_settings_open', ref });
+      return;
+    }
+
+    case '/rsstest': {
+      const url = msg.text.replace(/^\/rsstest(@\w+)?\s*/i, '').trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ `/rsstest <url>`\n\n' +
+            'آخرین آیتم فید رو همین الان برای تست ارسال می‌کنه.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const first = r.data.items[0];
+      if (!first) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ این فید آیتمی نداره.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      try {
+        await sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          buildRssItemRichMessage(first, r.data.title, false),
+          threadId ?? undefined
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در ارسال: ${e.message}`,
+          threadId ?? undefined
+        );
+        return;
+      }
+      await logEvent(env, { ev: 'rss_test', url: url.slice(0, 80) });
+      return;
+    }
+
+    case '/rssexport': {
+      const targets = await readRssTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 اشتراکی در این ' + where + ' وجود نداره.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const opml = buildOpml(mine);
+      try {
+        await sendDocument(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'subscriptions.opml',
+          opml,
+          'text/x-opml',
+          threadId ?? undefined
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ خطا در ارسال فایل OPML: ${e.message}`,
+          threadId ?? undefined
+        );
+        await reportError(env, 'rssexport', e);
+        return;
+      }
+      await logEvent(env, { ev: 'rss_export', count: mine.length });
+      return;
+    }
+
+    case '/rssimport': {
+      const reply = msg.reply_to_message;
+      if (!reply || !reply.document) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ روی یک فایل OPML ریپلای کن و `/rssimport` بزن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      let opml;
+      try {
+        opml = await getFileText(env.BOT_TOKEN, reply.document.file_id);
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ خطا در دریافت فایل: ${e.message}`,
+          threadId ?? undefined
+        );
+        await reportError(env, 'rssimport_fetch', e);
+        return;
+      }
+
+      const feeds = parseOpml(opml);
+      if (!feeds.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ هیچ فید معتبری در OPML پیدا نشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const capped = feeds.slice(0, 50);
+
+      const targets = await readRssTargets(env);
+      let added = 0;
+      let updated = 0;
+      let failed = 0;
+
+      for (const feed of capped) {
+        const r = await fetchRssOnce(feed.url);
+        if (!r.ok) {
+          failed++;
+          continue;
+        }
+        const title = r.data.title || feed.title || feed.url;
+        const initialGuids = r.data.items
+          .map((i) => rssItemId(i))
+          .filter(Boolean);
+
+        const existing = targets.find(
+          (t) =>
+            t.chatId === msg.chat.id &&
+            (t.threadId ?? null) === threadId &&
+            t.url === feed.url
+        );
+        if (existing) {
+          existing.title = title;
+          existing.sentGuids = initialGuids;
+          existing.seededAt = Date.now();
+          if ('lastGuid' in existing) delete existing.lastGuid;
+          updated++;
+        } else {
+          targets.push({
+            chatId: msg.chat.id,
+            threadId,
+            url: feed.url,
+            title,
+            sentGuids: initialGuids,
+            seededAt: Date.now(),
+            hideTitle: false,
+          });
+          added++;
+        }
+      }
+
+      await writeRssTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_import',
+        added,
+        updated,
+        failed,
+        total: capped.length,
+      });
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `${RLM}📥 ایمپورت انجام شد.\n` +
+          `${RLM}✅ ${added} اشتراک جدید، ♻️ ${updated} به‌روزرسانی، ❌ ${failed} ناموفق` +
+          (feeds.length > capped.length
+            ? `\n${RLM}(فقط ${capped.length} فید اول پردازش شد)`
+            : ''),
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rsspixel': {
+      const arg = msg.text.replace(/^\/rsspixel(@\w+)?\s*/i, '').trim();
+      if (!arg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rsspixel <url> <type>`\n\n' +
+            'مثال:\n' +
+            '`/rsspixel https://example.com/feed انیمه`\n\n' +
+            'هر آیتم جدید با این قالب ارسال میشه:\n' +
+            '🟦<b>تریلر جدید &lt;type&gt; &lt;title&gt; منتشر شد</b>\n\n' +
+            '🔹PixelMedia\n' +
+            'به‌همراه یک پیام جداگانه با لینک آیتم.',
+          threadId ?? undefined,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      const sp = arg.indexOf(' ');
+      if (sp === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ باید هم URL و هم type بدی. مثال:\n' +
+            '`/rsspixel https://example.com/feed انیمه`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const url = arg.slice(0, sp).trim();
+      const type = arg.slice(sp + 1).trim();
+
+      if (!url || !/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      if (!type) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ type نمی‌تونه خالی باشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const feedTitle = r.data.title || 'RSS Feed';
+      const initialGuids = r.data.items
+        .map((i) => rssItemId(i))
+        .filter(Boolean);
+
+      const targets = await readPixelTargets(env);
+      const existing = targets.find(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+
+      if (existing) {
+        existing.type = type;
+        existing.title = feedTitle;
+        await writePixelTargets(env, targets);
+        await logEvent(env, {
+          ev: 'rss_pixel_sub_update',
+          url: url.slice(0, 80),
+          type: type.slice(0, 40),
+        });
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `${RLM}♻️ اشتراک PixelMedia برای «${feedTitle}» با type «${type}» به‌روزرسانی شد.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      targets.push({
+        chatId: msg.chat.id,
+        threadId,
+        url,
+        title: feedTitle,
+        type,
+        sentGuids: initialGuids,
+        seededAt: Date.now(),
+      });
+      await writePixelTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_pixel_sub',
+        url: url.slice(0, 80),
+        type: type.slice(0, 40),
+        total: targets.length,
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `${RLM}✅ اشتراک PixelMedia فعال شد.\n` +
+          `${RLM}فید: «${feedTitle}»\n` +
+          `${RLM}type: «${type}»\n\n` +
+          `${RLM}از این به بعد هر آیتم جدید در این ${where} با قالب PixelMedia ارسال میشه.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rsspixelunsub': {
+      const url = msg.text
+        .replace(/^\/rsspixelunsub(@\w+)?\s*/i, '')
+        .trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ `/rsspixelunsub <url>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const targets = await readPixelTargets(env);
+      const idx = targets.findIndex(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+      if (idx === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ اشتراک PixelMedia با این URL پیدا نشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const removed = targets.splice(idx, 1)[0];
+      await writePixelTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_pixel_unsub',
+        url: removed.url.slice(0, 80),
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ اشتراک PixelMedia «${removed.title || removed.url}» حذف شد.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rsspixellist': {
+      const targets = await readPixelTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
+
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `📭 هیچ اشتراک PixelMedia در این ${where} وجود نداره.\n` +
+            'برای اضافه کردن: `/rsspixel <url> <type>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const s = [];
+      s.push(`${RLM}📡 PixelMedia در این ${where} (${mine.length})`);
+      s.push('');
+      mine.forEach((t, i) => {
+        s.push(`${RLM}${i + 1}. [${t.type || '—'}] «${t.title || 'RSS'}»`);
+        s.push(`${RLM}   ${t.url}`);
+      });
+      s.push('');
+      s.push(`${RLM}برای حذف: /rsspixelunsub <url>`);
+
+      let text = s.join('\n');
+      if (text.length > 4000) text = text.slice(0, 3950) + '\n…';
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        text,
+        threadId ?? undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+
+      await logEvent(env, { ev: 'rss_pixel_list', count: mine.length });
+      return;
+    }
+
+    case '/rsspixeltest': {
+      const arg = msg.text.replace(/^\/rsspixeltest(@\w+)?\s*/i, '').trim();
+      if (!arg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rsspixeltest <url> <type>`\n\n' +
+            'آخرین آیتم فید رو با قالب PixelMedia و پیام لینک، همین الان برای تست ارسال می‌کنه.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const sp = arg.indexOf(' ');
+      if (sp === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ باید هم URL و هم type بدی. مثال:\n' +
+            '`/rsspixeltest https://example.com/feed انیمه`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const url = arg.slice(0, sp).trim();
+      const type = arg.slice(sp + 1).trim();
+
+      if (!url || !/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      if (!type) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ type نمی‌تونه خالی باشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const first = r.data.items[0];
+      if (!first) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ این فید آیتمی نداره.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      try {
+        await sendPixelPair(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          threadId ?? undefined,
+          type,
+          first,
+          r.data.title || ''
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در ارسال: ${e.message}`,
+          threadId ?? undefined
+        );
+        return;
+      }
+      await logEvent(env, {
+        ev: 'rss_pixel_test',
+        url: url.slice(0, 80),
+        type: type.slice(0, 40),
+      });
+      return;
+    }
+
+    case '/rsskvexport': {
+      await handleKvExport(env, msg, threadId);
+      return;
+    }
+
+    case '/rsskvimport': {
+      await handleKvImport(env, msg, threadId);
+      return;
+    }
+
+    case '/errors': {
+      if (msg.from?.id !== ownerId(env)) return;
+      const parts = msg.text.trim().split(/\s+/);
+      let n = 10;
+      if (parts[1]) {
+        const parsed = parseInt(parts[1], 10);
+        if (Number.isFinite(parsed) && parsed > 0 && parsed <= 20) n = parsed;
+      }
+      const raw = await env.BOT_KV.get(ERRORS_KEY, { cacheTtl: KV_CACHE_TTL });
+      let list = [];
+      if (raw) {
+        try {
+          list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+          if (!Array.isArray(list)) list = [];
+        } catch { list = []; }
+      }
+      if (!list.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '✅ هیچ خطایی ثبت نشده.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `📋 *${list.length} error(s) recorded. Showing last ${Math.min(n, list.length)}:*`,
+        threadId ?? undefined,
+        { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+      );
+      for (const e of list.slice(0, n)) {
+        const text =
+          `📍 *${e.where}*\n` +
+          `⏰ ${e.t}\n` +
+          `\n*Message:*\n\`${String(e.msg).replace(/`/g, '')}\`` +
+          (e.stack
+            ? `\n\n*Stack:*\n\`\`\`\n${e.stack.slice(0, 900)}\n\`\`\``
+            : '');
+        try {
+          await sendMessage(env.BOT_TOKEN, msg.chat.id, text, threadId ?? undefined, {
+            parse_mode: 'Markdown',
+            link_preview_options: { is_disabled: true },
+          });
+        } catch (err) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            `${e.where} — ${e.msg}\n${e.stack || ''}`,
+            threadId ?? undefined
+          );
+        }
+      }
+      return;
+    }
+
+    case '/clearerrors': {
+      if (msg.from?.id !== ownerId(env)) return;
+      await env.BOT_KV.delete(ERRORS_KEY);
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        '🗑 Error log cleared.',
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/debug': {
+      const send = (lines) =>
+        sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          { html: linesToRichHtml(lines), is_rtl: false },
+          threadId ?? undefined
+        );
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 1/3 — Basic');
+        s.push('');
+        s.push('📍 Chat');
+        s.push(`  type: ${msg.chat.type}`);
+        s.push(`  thread: ${threadId ?? '—'}`);
+        s.push('');
+        s.push('⚙️ Env');
+        s.push(`  BOT_TOKEN: ${env.BOT_TOKEN ? '✅' : '❌'}`);
+        s.push(`  DB_ENCRYPTION_KEY: ${env.DB_ENCRYPTION_KEY ? '✅' : '❌'}`);
+        s.push(`  BOT_KV: ${env.BOT_KV ? '✅' : '❌'}`);
+        s.push(`  OWNER_ID: ${ownerId(env)}`);
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 1/3 — Basic ⚠️ ${e.message}`]);
+      }
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 2/3 — Subscriptions');
+        s.push('');
+
+        try {
+          const rts = await readRssTargets(env);
+          s.push(`📡 RSS total (${rts.length})`);
+          rts.forEach((t, i) => {
+            const flag = t.hideTitle ? '🔕' : '🔔';
+            const tracked = Array.isArray(t.sentGuids)
+              ? t.sentGuids.length
+              : (t.lastGuid ? 1 : 0);
+            const seeded = t.seededAt ? '✅' : '❌';
+            s.push(`  ${i + 1}. ${flag} «${t.title || 'RSS'}»`);
+            s.push(`     chat=${t.chatId} thread=${t.threadId ?? '—'} tracked=${tracked} seeded=${seeded}`);
+            s.push(`     ${t.url}`);
+          });
+          s.push('');
+        } catch (e) {
+          s.push(`📡 RSS ⚠️ ${e.message}`);
+          s.push('');
+        }
+
+        try {
+          const pts = await readPixelTargets(env);
+          s.push(`📡 Pixel total (${pts.length})`);
+          pts.forEach((t, i) => {
+            const tracked = Array.isArray(t.sentGuids)
+              ? t.sentGuids.length
+              : (t.lastGuid ? 1 : 0);
+            const seeded = t.seededAt ? '✅' : '❌';
+            s.push(`  ${i + 1}. [${t.type || '—'}] «${t.title || 'RSS'}»`);
+            s.push(`     chat=${t.chatId} thread=${t.threadId ?? '—'} tracked=${tracked} seeded=${seeded}`);
+            s.push(`     ${t.url}`);
+          });
+          s.push('');
+        } catch (e) {
+          s.push(`📡 Pixel ⚠️ ${e.message}`);
+          s.push('');
+        }
+
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 2/3 — Subscriptions ⚠️ ${e.message}`]);
+      }
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 3/3 — Bot & Webhook');
+        s.push('');
+        s.push('🤖 Bot');
+        try {
+          const me = await telegram(env.BOT_TOKEN, 'getMe');
+          s.push(`  @${me.result.username}`);
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        s.push('');
+        s.push('🪝 Webhook');
+        try {
+          const info = await telegram(env.BOT_TOKEN, 'getWebhookInfo');
+          const r = info.result || {};
+          s.push(`  url: ${r.url ? '✅ set' : '❌'}`);
+          s.push(`  pending: ${r.pending_update_count ?? 0}`);
+          if (r.last_error_message) {
+            s.push(`  ⚠️ ${r.last_error_message}`);
+          } else {
+            s.push('  last_error: none ✅');
+          }
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        s.push('');
+        s.push('🚨 Errors');
+        try {
+          const rawErr = await env.BOT_KV.get(ERRORS_KEY, {
+            cacheTtl: KV_CACHE_TTL,
+          });
+          let errCount = 0;
+          if (rawErr) {
+            try {
+              const list = decryptData(rawErr, env.DB_ENCRYPTION_KEY);
+              errCount = Array.isArray(list) ? list.length : 0;
+            } catch { errCount = 0; }
+          }
+          s.push(`  recorded: ${errCount}`);
+          if (errCount > 0) s.push('  use /errors to view');
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 3/3 — Bot & Webhook ⚠️ ${e.message}`]);
+      }
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//                         WORKER
+// ═══════════════════════════════════════════════════════════
+export default {
+  async fetch(request, env) {
+    try {
+      if (request.method === 'GET') {
+        return new Response('OK', { status: 200 });
+      }
+      if (request.method !== 'POST') {
+        return new Response('OK', { status: 200 });
+      }
+
+      let update;
+      try {
+        update = await request.json();
+      } catch {
+        return new Response('OK', { status: 200 });
+      }
+
+      const gateChatId =
+        update.callback_query?.message?.chat?.id ??
+        update.message?.chat?.id ??
+        update.channel_post?.chat?.id ??
+        update.edited_message?.chat?.id ??
+        update.edited_channel_post?.chat?.id ??
+        null;
+      if (!isAllowedChat(gateChatId)) {
+        console.log(`🚫 Ignored update from disallowed chat: ${gateChatId}`);
+        return new Response('OK', { status: 200 });
+      }
+
+      if (update.callback_query) {
+        const data = update.callback_query.data || '';
+        try {
+          if (data.startsWith('rss:')) {
+            await handleRssCallback(update, env);
+          } else {
+            await answerCallbackQuery(env.BOT_TOKEN, update.callback_query.id);
+          }
+        } catch (err) {
+          await reportError(env, 'fetch.callback', err, { data });
+        }
+        return new Response('OK', { status: 200 });
+      }
+
+      const msg = update.message || update.channel_post;
+      if (!msg) return new Response('OK', { status: 200 });
+
+      try {
+        await handleUpdate(update, env);
+      } catch (err) {
+        await reportError(env, 'handleUpdate', err, {
+          cmd: msg?.text ? parseCommand(msg.text) : null,
+        });
+        if (msg?.chat?.id) {
+          try {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              `❌ خطای داخلی: ${err.message}`,
+              topicOf(msg)
+            );
+          } catch { /* ignore */ }
+        }
+      }
+      return new Response('OK', { status: 200 });
+    } catch (outer) {
+      await reportError(env, 'fetch.outer', outer);
+      return new Response('OK', { status: 200 });
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    console.log(`⏰ Cron fired: ${event.cron} at ${new Date().toISOString()}`);
+
+    if (!env.BOT_TOKEN || !env.DB_ENCRYPTION_KEY || !env.BOT_KV) {
+      console.error('Missing env bindings');
+      return;
+    }
+
+    try {
+      const fired = await env.BOT_KV.get(CRON_FIRED_FLAG_KEY);
+      if (!fired) {
+        await env.BOT_KV.put(CRON_FIRED_FLAG_KEY, '1');
+        await sendMessage(
+          env.BOT_TOKEN,
+          ownerId(env),
+          `✅ Cron is firing!\n\n` +
+            `first fire at: ${new Date().toISOString()}\n` +
+            `cron: \`${event.cron}\``,
+          undefined,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (e) {
+      console.error('first-fire notify failed:', e.message);
+    }
+
+    const startedAt = new Date().toISOString();
+
+    ctx.waitUntil((async () => {
+      const events = [];
+      let rssSummary = null;
+      let pixelSummary = null;
+      try {
+        rssSummary = await handleRssCron(env, events);
+      } catch (e) {
+        console.error('handleRssCron threw:', e);
+        rssSummary = { error: e.message, details: [], total: 0, sent: 0, failed: 0 };
+      }
+      try {
+        pixelSummary = await handlePixelRssCron(env, events);
+      } catch (e) {
+        console.error('handlePixelRssCron threw:', e);
+        pixelSummary = { error: e.message, details: [], total: 0, sent: 0, failed: 0 };
+      }
+
+      await logEvents(env, events);
+
+      await saveCronStatus(env, {
+        at: new Date().toISOString(),
+        startedAt,
+        cron: event.cron,
+        status: 'done',
+        rss: rssSummary,
+        pixel: pixelSummary,
+      });
+    })());
+  },
+};
+
+// ═══════════════════════════════════════════════════════════
+//                    LOW-LEVEL HELPERS
+// ═══════════════════════════════════════════════════════════
+function topicOf(msg) {
+  return msg.is_topic_message && msg.message_thread_id
+    ? msg.message_thread_id
+    : undefined;
+}
+
+async function sendMessage(token, chatId, text, threadId, extra = {}) {
+  const body = { chat_id: chatId, text, ...extra };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function sendRichMessage(token, chatId, richMessage, threadId, extra = {}) {
+  const body = { chat_id: chatId, rich_message: richMessage, ...extra };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/sendRichMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendRichMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function sendDocument(token, chatId, filename, content, mimeType, threadId, extra = {}) {
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (threadId) form.append('message_thread_id', String(threadId));
+  form.append(
+    'document',
+    new Blob([content], { type: mimeType || 'application/octet-stream' }),
+    filename
+  );
+  for (const [k, v] of Object.entries(extra)) {
+    form.append(k, typeof v === 'string' ? v : JSON.stringify(v));
+  }
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/sendDocument`,
+    { method: 'POST', body: form }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendDocument ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function getFileText(token, fileId) {
+  const infoRes = await fetch(
+    `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`
+  );
+  const info = await infoRes.json();
+  if (!info.ok) throw new Error(info.description || 'getFile failed');
+  const filePath = info.result.file_path;
+  const fileRes = await fetch(
+    `https://api.telegram.org/file/bot${token}/${filePath}`
+  );
+  if (!fileRes.ok) throw new Error(`file download HTTP ${fileRes.status}`);
+  return await fileRes.text();
+}
+
+async function editMessageText(token, chatId, messageId, text, extra = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/editMessageText`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        ...extra,
+      }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `editMessageText ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function answerCallbackQuery(token, callbackQueryId, extra = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/answerCallbackQuery`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, ...extra }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `answerCallbackQuery ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function telegram(token, method, params = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/${method}`,
+    Object.keys(params).length
+      ? {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        }
+      : undefined
+  );
+  return res.json();
+  }
