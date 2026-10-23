@@ -12,5 +12,14 @@ crons = ["*/10 * * * *"]   # every 10 minutes
 binding = "BOT_KV"
 id = "37f7bd7abb8347dbba5384578f6b6807"
 
+[[durable_objects.bindings]]
+name       = "ARTTAG_SESSION"
+class_name = "ArtTagSessionDO"
+
+# If you already have migrations, bump to a new tag (v2, v3, ...)
+[[migrations]]
+tag                = "v1"
+new_sqlite_classes = ["ArtTagSessionDO"]
+
 [vars]
 WORKER_URL = "https://shiny-art.ultimatepissofshit.workers.dev"
