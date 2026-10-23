@@ -35,7 +35,7 @@ jobs:
       
       - name: Set Webhook
         run: |
-          WORKER_URL="https://shiny-rs.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev/webhook"
+          WORKER_URL="https://shiny-ep.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev/webhook"
           echo "Setting webhook to: $WORKER_URL"
           curl -sS -X POST \
             "https://api.telegram.org/bot${{ secrets.THIRTEEN_BOT_TOKEN }}/setWebhook" \
