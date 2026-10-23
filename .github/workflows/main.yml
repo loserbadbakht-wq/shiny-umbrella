@@ -33,7 +33,7 @@ jobs:
             --var KEY:${{ secrets.KEY }} \
             --var ID:${{ secrets.ID }}
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TWO }}
       
       - name: Set Webhook
         run: |
