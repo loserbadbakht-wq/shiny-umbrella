@@ -36,7 +36,8 @@ const USER_ID          = process.env.ID  || '';
 const PAGE_SIZE        = 100;
 const MAX_TOTAL_POSTS  = 3000;
 
-const RATING_MAP = { safe: 's', questionable: 'q', explicit: 'e' };
+const RATING_MAP  = { safe: 's', questionable: 'q', explicit: 'e' };
+const RATING_FULL = { safe: 'safe', questionable: 'questionable', explicit: 'explicit' };
 
 // Throttle — stay well under Gelbooru limits
 const SLEEP_PAGE_FETCH = 1500; // ms between API pages
@@ -48,6 +49,23 @@ function clampInt(v, min, max, dflt) {
   const n = parseInt(String(v || ''), 10);
   if (!Number.isFinite(n)) return dflt;
   return Math.max(min, Math.min(max, n));
+}
+
+function stripQuotes(s) {
+  return String(s || '')
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .trim();
+}
+
+function normalizeApiRating(r) {
+  const v = String(r || '').toLowerCase().trim();
+  if (v === 's' || v === 'safe')         return 's';
+  if (v === 'q' || v === 'questionable') return 'q';
+  if (v === 'e' || v === 'explicit')     return 'e';
+  if (v === 'g' || v === 'general')      return 's';
+  if (v === 'sensitive')                 return 'sensitive';
+  return v;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -119,17 +137,21 @@ async function main() {
   // 2. Build query
   const tagParts = [];
   if (TAGS) {
-    tagParts.push(...TAGS.split(/[,\s]+/).map((t) => t.trim()).filter(Boolean));
+    tagParts.push(
+      ...TAGS.split(/[,\s]+/)
+        .map(stripQuotes)
+        .filter(Boolean)
+    );
   }
   if (RATING !== 'all') {
-    if (!RATING_MAP[RATING]) {
+    if (!RATING_FULL[RATING]) {
       throw new Error(`Unknown rating "${RATING}". Use all|safe|questionable|explicit.`);
     }
-    tagParts.push(`rating:${RATING_MAP[RATING]}`);
+    tagParts.push(`rating:${RATING_FULL[RATING]}`);
   }
   const baseQuery = tagParts.join(' ');
   const fullQuery = blockedTags.length
-    ? `${baseQuery} ${blockedTags.map((t) => `-${t}`).join(' ')}`
+    ? `${baseQuery} ${blockedTags.map((t) => `-${stripQuotes(t)}`).join(' ')}`
     : baseQuery;
 
   console.log(`→ Query: ${fullQuery}`);
@@ -179,13 +201,34 @@ async function main() {
 
   // 4. Client-side filters (defense-in-depth)
   let filtered = all;
+
   if (RATING !== 'all') {
     const code = RATING_MAP[RATING];
-    filtered = filtered.filter((p) => p.rating === code);
+
+    const dist = {};
+    for (const p of filtered) {
+      const k = normalizeApiRating(p.rating) || '(empty)';
+      dist[k] = (dist[k] || 0) + 1;
+    }
+    console.log(`  API rating distribution: ${JSON.stringify(dist)}`);
+
+    filtered = filtered.filter((p) => normalizeApiRating(p.rating) === code);
     console.log(`  After rating=${RATING}: ${filtered.length}`);
+
+    if (filtered.length === 0 && all.length > 0) {
+      console.log('  DEBUG sample post keys:', Object.keys(all[0]).join(', '));
+      console.log('  DEBUG sample post:',
+        JSON.stringify({
+          id: all[0].id,
+          rating: all[0].rating,
+          rating_value: all[0].rating_value,
+        }, null, 2)
+      );
+    }
   }
+
   if (blockedTags.length) {
-    const blocked = new Set(blockedTags);
+    const blocked = new Set(blockedTags.map((t) => stripQuotes(t)));
     filtered = filtered.filter((p) => {
       const t = (p.tags || '').split(/\s+/).filter(Boolean);
       return !t.some((x) => blocked.has(x));
@@ -214,7 +257,7 @@ async function main() {
   const failedIds = [];
 
   for (const post of filtered) {
-    const candidates = [post.sample_url]
+    const candidates = [post.file_url, post.sample_url, post.preview_url]
       .filter((u) => typeof u === 'string' && u.length > 0);
 
     if (!candidates.length) {
@@ -255,7 +298,6 @@ async function main() {
         const base = String(post.id).padStart(10, '0');
         fs.writeFileSync(path.join(mediaDir, `${base}.${ext}`), buf);
 
-        // Sidecar metadata
         fs.writeFileSync(
           path.join(mediaDir, `${base}.json`),
           JSON.stringify({
@@ -298,7 +340,6 @@ async function main() {
     return;
   }
 
-  // Record failed IDs for reference (inside the archive)
   if (failedIds.length) {
     fs.writeFileSync(
       path.join(mediaDir, '_failed_ids.json'),
@@ -306,22 +347,14 @@ async function main() {
     );
   }
 
-  // 7. Compress with 7z — full/ultra compression
+  // 7. Compress with 7z
   const archivePath = path.join('archives', `${folderName}.7z`);
   console.log(`→ Compressing to ${archivePath} (level ${COMPRESSION})…`);
 
   const sevenZipArgs = [
-    'a',
-    '-t7z',
-    '-m0=lzma2',
-    `-mx=${COMPRESSION}`,
-    '-mfb=273',      // fast bytes (max)
-    '-md=256m',      // 256 MB dictionary
-    '-ms=on',        // solid archive
-    '-mmt=on',       // multithread
-    '-y',
-    archivePath,
-    mediaDir,
+    'a', '-t7z', '-m0=lzma2', `-mx=${COMPRESSION}`,
+    '-mfb=273', '-md=256m', '-ms=on', '-mmt=on', '-y',
+    archivePath, mediaDir,
   ];
 
   execSync(`7z ${sevenZipArgs.map((a) => JSON.stringify(a)).join(' ')}`, {
