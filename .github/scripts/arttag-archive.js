@@ -1,17 +1,18 @@
 // Fetch Gelbooru posts by tag, download via the Worker proxy,
-// compress with 7z (LZMA2, ultra), and stage for git push.
+// compress with 7z, auto-split into 999000k volumes ONLY when the
+// archive reaches that size (single .7z otherwise), stage for git push.
 //
-// Environment (set by the workflow):
-//   TAGS              - space/comma separated tags
-//   RATING            - all | safe | questionable | explicit
-//   USE_FILTER        - 'true' | 'false'
-//   MAX_PAGES         - integer (100 posts per page)
-//   COMPRESSION_LEVEL - 1..9
-//   KEEP_RAW          - 'true' | 'false'
-//   KEY               - Gelbooru API key (secret)
-//   ID                - Gelbooru user id (secret)
-//   PROXY_URL         - Worker media proxy base URL
-//   FILTER_LIST_URL   - JSON with BLOCKED_TAGS
+// Environment:
+//   TAGS               - space/comma separated tags
+//   RATING             - all | safe | questionable | explicit
+//   USE_FILTER         - 'true' | 'false'
+//   MAX_PAGES          - integer (100 posts per page)
+//   COMPRESSION_PRESET - store | fast | normal | ultra
+//   KEEP_RAW           - 'true' | 'false'
+//   KEY                - Gelbooru API key (secret)
+//   ID                 - Gelbooru user id (secret)
+//   PROXY_URL          - Worker media proxy base URL
+//   FILTER_LIST_URL    - JSON with BLOCKED_TAGS
 
 'use strict';
 
@@ -21,6 +22,11 @@ const { execSync } = require('child_process');
 
 const GELBOORU_API = 'https://gelbooru.com/index.php';
 
+// Split threshold — archives below this stay as a single .7z file;
+// archives at or above this are split into .7z.001, .7z.002, ...
+// 7-Zip treats `k` as 1024 bytes, so 999000k ≈ 976 MiB.
+const VOLUME_SIZE = '999000k';
+
 const PROXY_URL        = process.env.PROXY_URL || '';
 const FILTER_LIST_URL  = process.env.FILTER_LIST_URL || '';
 const TAGS             = (process.env.TAGS || '').trim();
@@ -28,20 +34,35 @@ const RATING           = (process.env.RATING || 'all').trim().toLowerCase();
 const USE_FILTER       = (process.env.USE_FILTER || 'false') === 'true';
 const KEEP_RAW         = (process.env.KEEP_RAW || 'false') === 'true';
 const MAX_PAGES        = clampInt(process.env.MAX_PAGES, 1, 50, 10);
-const COMPRESSION      = clampInt(process.env.COMPRESSION_LEVEL, 1, 9, 9);
 const API_KEY          = process.env.KEY || '';
 const USER_ID          = process.env.ID  || '';
+const PRESET_NAME      = (process.env.COMPRESSION_PRESET || 'fast').trim().toLowerCase();
+
+// 7z presets. Images barely compress — `fast` and `ultra` produce
+// essentially the same size for media archives, but `ultra` is 30× slower.
+const PRESETS = {
+  store:  { mx: 0, ms: 'off', mfb: 32,  md: '16m'  },
+  fast:   { mx: 1, ms: 'on',  mfb: 32,  md: '16m'  },
+  normal: { mx: 5, ms: 'on',  mfb: 64,  md: '64m'  },
+  ultra:  { mx: 9, ms: 'on',  mfb: 273, md: '256m' },
+};
+
+const PRESET = PRESETS[PRESET_NAME];
+if (!PRESET) {
+  console.error(`Unknown COMPRESSION_PRESET "${PRESET_NAME}". Use store|fast|normal|ultra.`);
+  process.exit(1);
+}
 
 // Safety caps
-const PAGE_SIZE        = 100;
-const MAX_TOTAL_POSTS  = 3000;
+const PAGE_SIZE       = 100;
+const MAX_TOTAL_POSTS = 3000;
 
 const RATING_MAP  = { safe: 's', questionable: 'q', explicit: 'e' };
 const RATING_FULL = { safe: 'safe', questionable: 'questionable', explicit: 'explicit' };
 
-// Throttle — stay well under Gelbooru limits
-const SLEEP_PAGE_FETCH = 1500; // ms between API pages
-const SLEEP_DOWNLOAD   = 800;  // ms between media files
+// Throttle
+const SLEEP_PAGE_FETCH = 1500;
+const SLEEP_DOWNLOAD   = 800;
 const SLEEP_ON_429     = 15000;
 
 // ───────────────────────────────────────────── helpers
@@ -118,6 +139,9 @@ async function main() {
     throw new Error('At least one of `tags` or `rating` must be specified.');
   }
   if (!PROXY_URL) throw new Error('PROXY_URL env var is required.');
+
+  console.log(`→ Compression preset: ${PRESET_NAME} (mx=${PRESET.mx}, ms=${PRESET.ms})`);
+  console.log(`→ Auto-split threshold: ${VOLUME_SIZE} (smaller archives stay as single .7z)`);
 
   // 1. Filter list
   let blockedTags = [];
@@ -199,7 +223,7 @@ async function main() {
 
   console.log(`→ Total unique posts: ${all.length}`);
 
-  // 4. Client-side filters (defense-in-depth)
+  // 4. Client-side filters
   let filtered = all;
 
   if (RATING !== 'all') {
@@ -216,14 +240,8 @@ async function main() {
     console.log(`  After rating=${RATING}: ${filtered.length}`);
 
     if (filtered.length === 0 && all.length > 0) {
-      console.log('  DEBUG sample post keys:', Object.keys(all[0]).join(', '));
       console.log('  DEBUG sample post:',
-        JSON.stringify({
-          id: all[0].id,
-          rating: all[0].rating,
-          rating_value: all[0].rating_value,
-        }, null, 2)
-      );
+        JSON.stringify({ id: all[0].id, rating: all[0].rating }, null, 2));
     }
   }
 
@@ -241,7 +259,7 @@ async function main() {
     return;
   }
 
-  // 5. Prepare output dirs
+  // 5. Output dirs
   fs.mkdirSync('archives', { recursive: true });
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -251,7 +269,7 @@ async function main() {
   const mediaDir = path.join('archives', folderName);
   fs.mkdirSync(mediaDir, { recursive: true });
 
-  // 6. Download media
+  // 6. Download
   let downloaded = 0;
   let failed = 0;
   const failedIds = [];
@@ -267,7 +285,6 @@ async function main() {
     }
 
     let ok = false;
-
     for (const target of candidates) {
       try {
         const proxyUrl = `${PROXY_URL.replace(/\/+$/, '')}/${target}`;
@@ -281,7 +298,7 @@ async function main() {
           continue;
         }
         if (!res.ok) {
-          console.warn(`  ${post.id}: ${res.status} on ${target.slice(0, 80)}`);
+          console.warn(`  ${post.id}: ${res.status}`);
           continue;
         }
 
@@ -347,14 +364,21 @@ async function main() {
     );
   }
 
-  // 7. Compress with 7z
+  // 7. Compress with auto-split at VOLUME_SIZE
   const archivePath = path.join('archives', `${folderName}.7z`);
-  console.log(`→ Compressing to ${archivePath} (level ${COMPRESSION})…`);
+  console.log(`→ Compressing (preset=${PRESET_NAME}, mx=${PRESET.mx}, ms=${PRESET.ms}, -v${VOLUME_SIZE})…`);
 
   const sevenZipArgs = [
-    'a', '-t7z', '-m0=lzma2', `-mx=${COMPRESSION}`,
-    '-mfb=273', '-md=256m', '-ms=on', '-mmt=on', '-y',
-    archivePath, mediaDir,
+    'a', '-t7z', '-m0=lzma2',
+    `-mx=${PRESET.mx}`,
+    `-ms=${PRESET.ms}`,
+    `-mfb=${PRESET.mfb}`,
+    `-md=${PRESET.md}`,
+    '-mmt=on',
+    '-y',
+    `-v${VOLUME_SIZE}`,
+    archivePath,
+    mediaDir,
   ];
 
   execSync(`7z ${sevenZipArgs.map((a) => JSON.stringify(a)).join(' ')}`, {
@@ -362,8 +386,47 @@ async function main() {
     shell: '/bin/bash',
   });
 
-  const size = fs.statSync(archivePath).size;
-  console.log(`→ Archive: ${(size / 1024 / 1024).toFixed(2)} MB`);
+  // Detect outputs. 7z with -v produces either one .7z.001 (if the
+  // archive is smaller than VOLUME_SIZE) or multiple .7z.00N files.
+  const archiveDir  = path.dirname(archivePath);
+  const archiveBase = path.basename(archivePath);
+  const entries     = fs.readdirSync(archiveDir);
+
+  const volumes = entries
+    .filter((e) => e.startsWith(archiveBase + '.'))
+    .sort();
+
+  let archiveFiles;
+  if (volumes.length === 1 && volumes[0] === archiveBase + '.001') {
+    // Single volume → rename to plain .7z so it's not treated as split.
+    const singlePath = path.join(archiveDir, volumes[0]);
+    fs.renameSync(singlePath, archivePath);
+    archiveFiles = [archivePath];
+    console.log(`→ Archive < ${VOLUME_SIZE}; saved as single .7z (no split).`);
+  } else if (volumes.length > 1) {
+    archiveFiles = volumes.map((e) => path.join(archiveDir, e));
+    console.log(`→ Archive >= ${VOLUME_SIZE}; split into ${volumes.length} volumes.`);
+  } else if (entries.includes(archiveBase)) {
+    // Safety net (shouldn't happen since -v is always passed)
+    archiveFiles = [archivePath];
+    console.log('→ Archive saved as single .7z.');
+  } else {
+    throw new Error('Archive creation reported success but no output files found.');
+  }
+
+  // Size report
+  let totalSize = 0;
+  for (const f of archiveFiles) {
+    const s = fs.statSync(f).size;
+    totalSize += s;
+    console.log(`  ${path.basename(f)}: ${(s / 1024 / 1024).toFixed(2)} MB`);
+  }
+  console.log(`→ Archive total: ${(totalSize / 1024 / 1024).toFixed(2)} MB (${archiveFiles.length} file${archiveFiles.length > 1 ? 's' : ''})`);
+
+  const sourceSize = fs.readdirSync(mediaDir)
+    .reduce((n, f) => n + fs.statSync(path.join(mediaDir, f)).size, 0);
+  const saved = sourceSize - totalSize;
+  console.log(`→ Source: ${(sourceSize / 1024 / 1024).toFixed(2)} MB, saved ${(saved / 1024 / 1024).toFixed(2)} MB (${(saved / sourceSize * 100).toFixed(1)}%)`);
 
   // 8. Cleanup
   if (!KEEP_RAW) {
