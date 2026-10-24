@@ -27,13 +27,18 @@ on:
         required: true
         default: '10'
         type: string
-      compression_level:
-        description: '7z compression level (1-9, 9 = ultra)'
+      compression_preset:
+        description: '7z preset — images are already compressed; fast ≈ same size as ultra, 30× faster'
         required: true
-        default: '9'
-        type: string
+        default: 'fast'
+        type: choice
+        options:
+          - store
+          - fast
+          - normal
+          - ultra
       keep_raw:
-        description: 'Also push uncompressed files (large!)'
+        description: 'Also push uncompressed files (doubles LFS cost — avoid unless needed)'
         required: true
         default: false
         type: boolean
@@ -55,6 +60,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          lfs: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -68,51 +74,70 @@ jobs:
 
       - name: Fetch, download, compress
         env:
-          TAGS:              ${{ inputs.tags }}
-          RATING:            ${{ inputs.rating }}
-          USE_FILTER:        ${{ inputs.use_filter }}
-          MAX_PAGES:         ${{ inputs.max_pages }}
-          COMPRESSION_LEVEL: ${{ inputs.compression_level }}
-          KEEP_RAW:          ${{ inputs.keep_raw }}
-          KEY:               ${{ secrets.KEY }}
-          ID:                ${{ secrets.ID }}
-          PROXY_URL:         'https://shiny-art.ultimatepissofshit.workers.dev'
-          FILTER_LIST_URL:   'https://raw.githubusercontent.com/loserbadbakht-wq/shiny-umbrella/refs/heads/SG/src/tags_config.json'
-        run: |
-          node .github/scripts/arttag-archive.js
+          TAGS:               ${{ inputs.tags }}
+          RATING:             ${{ inputs.rating }}
+          USE_FILTER:         ${{ inputs.use_filter }}
+          MAX_PAGES:          ${{ inputs.max_pages }}
+          COMPRESSION_PRESET: ${{ inputs.compression_preset }}
+          KEEP_RAW:           ${{ inputs.keep_raw }}
+          KEY:                ${{ secrets.KEY }}
+          ID:                 ${{ secrets.ID }}
+          PROXY_URL:          'https://shiny-art.ultimatepissofshit.workers.dev'
+          FILTER_LIST_URL:    'https://raw.githubusercontent.com/loserbadbakht-wq/shiny-umbrella/refs/heads/SG/src/tags_config.json'
+        run: node .github/scripts/arttag-archive.js
 
-      - name: Verify archive size
+      - name: Verify archive size (LFS limits)
         id: size
         run: |
-          if [ ! -d archives ] || [ -z "$(find archives -name '*.7z' -type f)" ]; then
+          if [ ! -d archives ]; then
             echo "has_archive=false" >> "$GITHUB_OUTPUT"
-            echo "No archives produced — skipping push."
+            echo "No archives directory."
             exit 0
           fi
 
+          FILES=$(find archives -type f \( -name '*.7z' -o -name '*.7z.*' \) | wc -l)
+          if [ "$FILES" -eq 0 ]; then
+            echo "has_archive=false" >> "$GITHUB_OUTPUT"
+            echo "No archives produced."
+            exit 0
+          fi
           echo "has_archive=true" >> "$GITHUB_OUTPUT"
 
-          LARGEST=$(find archives -name '*.7z' -type f -printf '%s %p\n' | sort -nr | head -1)
-          SIZE_BYTES=$(echo "$LARGEST" | awk '{print $1}')
-          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
-          echo "Largest archive: ${SIZE_MB} MB"
+          EXCEEDED=0
+          while IFS=' ' read -r SIZE FILE; do
+            MB=$((SIZE / 1024 / 1024))
+            echo "  $FILE — ${MB} MB"
+            if [ "$SIZE" -gt 2147483648 ]; then
+              echo "::error::$FILE exceeds 2 GB LFS per-file limit (${MB} MB)."
+              EXCEEDED=1
+            elif [ "$SIZE" -gt 52428800 ]; then
+              echo "::warning::$FILE is ${MB} MB (GitHub warns above 50 MB)."
+            fi
+          done < <(find archives -type f \( -name '*.7z' -o -name '*.7z.*' \) -printf '%s %p\n')
+          if [ "$EXCEEDED" -eq 1 ]; then exit 1; fi
 
-          if [ "$SIZE_BYTES" -gt 104857600 ]; then
-            echo "::error::Archive exceeds GitHub's 100 MB per-file limit (${SIZE_MB} MB). Enable Git LFS or lower max_pages."
-            exit 1
-          fi
-          if [ "$SIZE_BYTES" -gt 52428800 ]; then
-            echo "::warning::Archive is ${SIZE_MB} MB — GitHub warns above 50 MB per file."
+          TOTAL=$(find archives -type f \( -name '*.7z' -o -name '*.7z.*' \) -printf '%s\n' | awk '{s+=$1} END {print s+0}')
+          TOTAL_MB=$((TOTAL / 1024 / 1024))
+          echo "Total archive: ${TOTAL_MB} MB"
+          if [ "$TOTAL_MB" -gt 1024 ]; then
+            echo "::warning::Total ${TOTAL_MB} MB exceeds the 1 GB free LFS storage tier. You will need paid LFS data packs for push to succeed."
           fi
 
-      - name: Push archive
+      - name: Push archive (LFS)
         if: steps.size.outputs.has_archive == 'true'
         env:
           TAGS:   ${{ inputs.tags }}
           RATING: ${{ inputs.rating }}
         run: |
+          git lfs install --local
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! grep -q 'archives/' .gitattributes 2>/dev/null; then
+            echo 'archives/** filter=lfs diff=lfs merge=lfs -text' >> .gitattributes
+            git add .gitattributes
+          fi
+
           git add archives/
 
           if git diff --cached --quiet; then
