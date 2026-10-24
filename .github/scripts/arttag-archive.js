@@ -214,7 +214,7 @@ async function main() {
   const failedIds = [];
 
   for (const post of filtered) {
-    const candidates = [post.file_url, post.sample_url, post.preview_url]
+    const candidates = [post.sample_url]
       .filter((u) => typeof u === 'string' && u.length > 0);
 
     if (!candidates.length) {
