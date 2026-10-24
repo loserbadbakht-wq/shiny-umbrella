@@ -37,10 +37,10 @@ jobs:
       
       - name: Set Webhook
         run: |
-          WORKER_URL="https://shiny-rss.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          WORKER_URL="https://shiny-rss.${{ secrets.CLOUDFLARE_USERNAME_TWO }}.workers.dev"
           curl -X POST "https://api.telegram.org/bot${{ secrets.TWELVE_BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
       
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-rss.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          echo "🔗 Worker URL: https://shiny-rss.${{ secrets.CLOUDFLARE_USERNAME_TWO }}.workers.dev"
