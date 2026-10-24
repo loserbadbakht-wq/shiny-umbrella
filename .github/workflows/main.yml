@@ -1,45 +1,125 @@
-name: Deploy to Cloudflare Workers
+name: Arttag Archive
 
 on:
-  push:
-    branches:
-      - main
-      - master
   workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Tags (space or comma separated, AND semantics, e.g. "yuri blue_eyes")'
+        required: true
+        type: string
+      rating:
+        description: 'Rating filter'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - safe
+          - questionable
+          - explicit
+      use_filter:
+        description: 'Apply blocked-tag filter list'
+        required: true
+        default: true
+        type: boolean
+      max_pages:
+        description: 'Max pages to fetch (100 posts per page)'
+        required: true
+        default: '10'
+        type: string
+      compression_level:
+        description: '7z compression level (1-9, 9 = ultra)'
+        required: true
+        default: '9'
+        type: string
+      keep_raw:
+        description: 'Also push uncompressed files (large!)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arttag-archive-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  archive:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 180
+
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 1
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-      
-      - name: Install dependencies
-        run: npm install
-      
-      - name: Install Wrangler
-        run: npm install -g wrangler
-      
-      - name: Deploy to Cloudflare Workers
+
+      - name: Install p7zip
         run: |
-          wrangler deploy \
-            --var BOT_TOKEN:${{ secrets.BOT_TOKEN }} \
-            --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }}
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full
+
+      - name: Fetch, download, compress
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      
-      - name: Set Webhook
+          TAGS:              ${{ inputs.tags }}
+          RATING:            ${{ inputs.rating }}
+          USE_FILTER:        ${{ inputs.use_filter }}
+          MAX_PAGES:         ${{ inputs.max_pages }}
+          COMPRESSION_LEVEL: ${{ inputs.compression_level }}
+          KEEP_RAW:          ${{ inputs.keep_raw }}
+          KEY:               ${{ secrets.KEY }}
+          ID:                ${{ secrets.ID }}
+          PROXY_URL:         'https://shiny-art.ultimatepissofshit.workers.dev'
+          FILTER_LIST_URL:   'https://raw.githubusercontent.com/loserbadbakht-wq/shiny-umbrella/refs/heads/SG/src/tags_config.json'
         run: |
-          WORKER_URL="https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
-      
-      - name: Verify Deployment
+          node .github/scripts/arttag-archive.js
+
+      - name: Verify archive size
+        id: size
         run: |
-          echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-umbrella.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
+          if [ ! -d archives ] || [ -z "$(find archives -name '*.7z' -type f)" ]; then
+            echo "has_archive=false" >> "$GITHUB_OUTPUT"
+            echo "No archives produced — skipping push."
+            exit 0
+          fi
+
+          echo "has_archive=true" >> "$GITHUB_OUTPUT"
+
+          LARGEST=$(find archives -name '*.7z' -type f -printf '%s %p\n' | sort -nr | head -1)
+          SIZE_BYTES=$(echo "$LARGEST" | awk '{print $1}')
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+          echo "Largest archive: ${SIZE_MB} MB"
+
+          if [ "$SIZE_BYTES" -gt 104857600 ]; then
+            echo "::error::Archive exceeds GitHub's 100 MB per-file limit (${SIZE_MB} MB). Enable Git LFS or lower max_pages."
+            exit 1
+          fi
+          if [ "$SIZE_BYTES" -gt 52428800 ]; then
+            echo "::warning::Archive is ${SIZE_MB} MB — GitHub warns above 50 MB per file."
+          fi
+
+      - name: Push archive
+        if: steps.size.outputs.has_archive == 'true'
+        env:
+          TAGS:   ${{ inputs.tags }}
+          RATING: ${{ inputs.rating }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add archives/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          SAFE_TAGS=$(printf '%s' "$TAGS" | tr -s ' \t' '_' | cut -c1-60)
+          git commit -m "chore(arttag): archive \"${SAFE_TAGS}\" rating=${RATING}"
+          git push
