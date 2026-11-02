@@ -25,7 +25,7 @@ const HOUR_KEY = 'hour:targets';
 const UNAME_INDEX_KEY = 'uname:index';
 const ERRORS_KEY = 'errors:recent';
 
-// Server monitor — direct TCP ping via minecraftstatuspinger
+// Server monitor
 const SERVER_HOST = 'deepvalley-ZLKV.aternos.me';
 const SERVER_PORT = 25565;
 const SERVER_TARGETS_KEY = 'server:targets';
@@ -36,10 +36,9 @@ const STATUS_MSG_ONLINE  = `${RLM}سرور ماینکرفت آقا سگه اون
 const STATUS_MSG_OFFLINE = `${RLM}سرور ماینکرفت آقا سگه اونی-چان <b>آفلاین🔴</b> هست`;
 const STATUS_MSG_UNKNOWN = `${RLM}❓ وضعیت سرور ماینکرفت آقا سگه اونی-چان در دسترس نیست (پینگ پاسخگو نیست)`;
 
-// Dollar monitor — scraped from navasan.net
+// Dollar monitor
 const NAVASAN_URL =
   'https://www.navasan.net/dayRates.php?item=usd_sell';
-
 const DOLLAR_TARGETS_KEY = 'dollar:targets';
 const DOLLAR_LAST_KEY = 'dollar:lastPrice';
 const DOLLAR_STEP_TOMAN = 10000;
@@ -49,7 +48,11 @@ const DOLLAR_RETRY_DELAY = 2000;
 // JSON article feeds
 const JSON_TARGETS_KEY = 'json:targets';
 
-// Cold-start retry tuning (server)
+// Chat bridge
+const CHAT_MAP_KEY = 'chat:map';
+const CHAT_TARGET_INDEX_KEY = 'chat:target_index';
+
+// Retries
 const SERVER_RETRIES = 3;
 const SERVER_RETRY_DELAY = 1500;
 const SERVER_TIMEOUT = 8000;
@@ -165,23 +168,15 @@ async function reportError(env, where, err, extra = {}) {
   if (entry.stack) console.error(entry.stack);
 }
 
-// ============= SERVER MONITOR (minecraftstatuspinger) =============
+// ============= SERVER MONITOR =============
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// --- Aternos false-online detection ---
-// The status object from minecraftstatuspinger has:
-//   { version: { name, protocol }, description: string | chat-object, players: {...} }
-// Aternos sometimes answers the SLP handshake while the real server is
-// still booting ("ghost proxy"). The response typically carries
-// "offline", "preparing", or "starting" in the version name or description.
 function extractStatusText(status) {
   if (!status) return '';
-
   const versionName =
     typeof status.version?.name === 'string' ? status.version.name : '';
-
   let descText = '';
   if (typeof status.description === 'string') {
     descText = status.description;
@@ -192,7 +187,6 @@ function extractStatusText(status) {
       .map((x) => (typeof x === 'string' ? x : x?.text || ''))
       .join(' ');
   }
-
   return `${versionName} ${descText}`;
 }
 
@@ -206,8 +200,6 @@ function isAternosGhost(status) {
   );
 }
 
-// Ping the server via minecraftstatuspinger.
-// Returns true (online), false (offline), or null (ambiguous → retry).
 async function pingServerOnce() {
   let result;
   try {
@@ -218,13 +210,9 @@ async function pingServerOnce() {
       throwOnParseError: false,
     });
   } catch {
-    // Network error (ECONNREFUSED / DNS / timeout) → offline
     return false;
   }
-
   if (!result) return null;
-
-  // Even when parsing fails, statusRaw holds the raw text. Check it too.
   const raw = (result.statusRaw || '').toLowerCase();
   if (
     raw.includes('offline') ||
@@ -233,21 +221,15 @@ async function pingServerOnce() {
   ) {
     return false;
   }
-
-  // Aternos ghost check on the parsed status.
   if (result.status && isAternosGhost(result.status)) {
     return false;
   }
-
-  // Valid response with version / players → server is genuinely up.
   if (
     result.status &&
     (result.status.version || result.status.players)
   ) {
     return true;
   }
-
-  // Got a response but couldn't classify it → ambiguous, retry.
   return null;
 }
 
@@ -564,31 +546,20 @@ function buildArticleRichMessage(data, customName) {
     typeof data.description === 'string' ? data.description : '';
 
   const parts = [];
-
-  if (title) {
-    parts.push(`<h1>${htmlEsc(title)}</h1>`);
-  }
-  if (thumbnail) {
-    parts.push(`<img src="${htmlEsc(thumbnail)}" />`);
-  }
-  if (creator) {
-    parts.push(`<p><b>✍️ نویسنده:</b> ${htmlEsc(creator)}</p>`);
-  }
-  if (pubDate) {
-    parts.push(`<p><b>🗓 تاریخ انتشار:</b> ${htmlEsc(formatPubDate(pubDate))}</p>`);
-  }
+  if (title) parts.push(`<h1>${htmlEsc(title)}</h1>`);
+  if (thumbnail) parts.push(`<img src="${htmlEsc(thumbnail)}" />`);
+  if (creator) parts.push(`<p><b>✍️ نویسنده:</b> ${htmlEsc(creator)}</p>`);
+  if (pubDate) parts.push(`<p><b>🗓 تاریخ انتشار:</b> ${htmlEsc(formatPubDate(pubDate))}</p>`);
   if (link) {
     const label = customName ? htmlEsc(customName) : 'مشاهده مطلب';
     parts.push(`<p>🔗 <a href="${htmlEsc(link)}">${label}</a></p>`);
   }
-  if (description) {
-    parts.push(description);
-  }
+  if (description) parts.push(description);
 
   return { html: parts.join('\n'), is_rtl: true };
 }
 
-// ============= DURABLE OBJECT: BUTTON COUNTER =============
+// ============= DURABLE OBJECTS =============
 export class ButtonCounter {
   constructor(state, env) {
     this.state = state;
@@ -612,14 +583,8 @@ export class ButtonCounter {
     }
     if (url.pathname === '/seed') {
       let seed = {};
-      try {
-        seed = await request.json();
-      } catch { /* ignore */ }
-      if (
-        seed &&
-        typeof seed.total === 'number' &&
-        Array.isArray(seed.users)
-      ) {
+      try { seed = await request.json(); } catch { /* ignore */ }
+      if (seed && typeof seed.total === 'number' && Array.isArray(seed.users)) {
         if (!this.cached.users.length && !this.cached.total) {
           this.cached = seed;
           await this.state.storage.put('state', this.cached);
@@ -630,9 +595,7 @@ export class ButtonCounter {
       });
     }
     let body = {};
-    try {
-      body = await request.json();
-    } catch { /* ignore */ }
+    try { body = await request.json(); } catch { /* ignore */ }
     const userId = body.userId;
     const name = body.name || 'User';
     const username = body.username || null;
@@ -660,7 +623,6 @@ export class ButtonCounter {
   }
 }
 
-// ============= DURABLE OBJECT: GAME COUNTER =============
 export class GameCounter {
   constructor(state, env) {
     this.state = state;
@@ -681,9 +643,7 @@ export class GameCounter {
     }
     if (request.method === 'POST' && url.pathname === '/tap') {
       let body = {};
-      try {
-        body = await request.json();
-      } catch { /* ignore */ }
+      try { body = await request.json(); } catch { /* ignore */ }
       const userId = body.userId;
       const name = body.name || 'User';
       const username = body.username || null;
@@ -714,14 +674,8 @@ export class GameCounter {
     }
     if (request.method === 'POST' && url.pathname === '/seed') {
       let seed = {};
-      try {
-        seed = await request.json();
-      } catch { /* ignore */ }
-      if (
-        seed &&
-        typeof seed.total === 'number' &&
-        Array.isArray(seed.users)
-      ) {
+      try { seed = await request.json(); } catch { /* ignore */ }
+      if (seed && typeof seed.total === 'number' && Array.isArray(seed.users)) {
         if (!this.cached.users.length && !this.cached.total) {
           this.cached = seed;
           await this.state.storage.put('state', this.cached);
@@ -932,9 +886,7 @@ async function lookupUsername(env, username) {
   }
 }
 
-// ============= CHAT BRIDGE (/chat) =============
-const CHAT_MAP_KEY = 'chat:map';
-
+// ============= CHAT BRIDGE =============
 async function readChatMap(env) {
   try {
     const raw = await env.BOT_KV.get(CHAT_MAP_KEY, { cacheTtl: KV_CACHE_TTL });
@@ -947,21 +899,23 @@ async function readChatMap(env) {
   }
 }
 
+function pruneMap(map, max, ttlMs) {
+  const cutoff = Date.now() - ttlMs;
+  for (const k of Object.keys(map)) {
+    if (map[k]?.at && map[k].at < cutoff) delete map[k];
+  }
+  const keys = Object.keys(map);
+  if (keys.length > max) {
+    keys.sort((a, b) => (map[a].at || 0) - (map[b].at || 0));
+    for (let i = 0; i < keys.length - max; i++) delete map[keys[i]];
+  }
+}
+
 async function saveChatMapping(env, ownerMsgId, mapping) {
   try {
     const map = await readChatMap(env);
     map[String(ownerMsgId)] = { ...mapping, at: Date.now() };
-    // Prune entries older than 30 days
-    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-    for (const k of Object.keys(map)) {
-      if (map[k]?.at && map[k].at < cutoff) delete map[k];
-    }
-    // Hard cap at 500 entries
-    const keys = Object.keys(map);
-    if (keys.length > 500) {
-      keys.sort((a, b) => (map[a].at || 0) - (map[b].at || 0));
-      for (let i = 0; i < keys.length - 500; i++) delete map[keys[i]];
-    }
+    pruneMap(map, 500, 30 * 24 * 60 * 60 * 1000);
     await env.BOT_KV.put(CHAT_MAP_KEY, encryptData(map, env.DB_ENCRYPTION_KEY));
   } catch (e) {
     console.error('saveChatMapping failed:', e.message);
@@ -973,25 +927,166 @@ async function getChatMapping(env, ownerMsgId) {
   return map[String(ownerMsgId)] || null;
 }
 
-// Deduplicate JSON targets by (chatId, threadId) and keep numbering stable
-function getUniqueChats(jsonTargets) {
-  const seen = new Map();
-  for (const t of jsonTargets) {
-    const key = `${t.chatId}:${t.threadId ?? 'main'}`;
-    if (!seen.has(key)) {
-      seen.set(key, {
-        chatId: t.chatId,
-        threadId: t.threadId ?? null,
-        names: [t.customName],
-      });
-    } else {
-      seen.get(key).names.push(t.customName);
-    }
+async function readChatTargetIndex(env) {
+  try {
+    const raw = await env.BOT_KV.get(CHAT_TARGET_INDEX_KEY, {
+      cacheTtl: KV_CACHE_TTL,
+    });
+    if (!raw) return {};
+    const obj = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (e) {
+    console.error('readChatTargetIndex failed:', e.message);
+    return {};
   }
-  return Array.from(seen.values());
 }
 
-// Owner reply handler — returns true if it was a reply to a /chat notification
+async function registerChatTarget(env, chatId, threadId, msgId, meta = {}) {
+  try {
+    const idx = await readChatTargetIndex(env);
+    const key = `${chatId}:${threadId ?? 'main'}:${msgId}`;
+    idx[key] = {
+      chatId,
+      threadId: threadId ?? null,
+      msgId,
+      at: Date.now(),
+      ...meta,
+    };
+    pruneMap(idx, 500, 30 * 24 * 60 * 60 * 1000);
+    await env.BOT_KV.put(
+      CHAT_TARGET_INDEX_KEY,
+      encryptData(idx, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('registerChatTarget failed:', e.message);
+  }
+}
+
+async function lookupChatTarget(env, chatId, threadId, msgId) {
+  const idx = await readChatTargetIndex(env);
+  const key = `${chatId}:${threadId ?? 'main'}:${msgId}`;
+  return idx[key] || null;
+}
+
+function formatSenderName(from) {
+  if (!from) return 'Unknown';
+  if (from.username) return `@${from.username}`;
+  return (
+    [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Unknown'
+  );
+}
+
+// Handles replies made IN A TARGET CHAT to a message the bot sent via /chat
+// (or via a bridged owner reply). Forwards the reply to OWNER_ID and registers
+// an owner-side mapping so owner's reply can travel back.
+async function handleTargetReply(msg, env) {
+  // Skip owner-originated messages — avoids echo loops and self-forwards
+  if (msg.from?.id === OWNER_ID) return false;
+  if (msg.from?.is_bot) return false;
+  if (msg.chat.id === OWNER_ID) return false;
+
+  const replyTo = msg.reply_to_message;
+  if (!replyTo) return false;
+  if (!replyTo.from?.is_bot) return false;
+
+  const threadId = topicOf(msg) ?? null;
+  const target = await lookupChatTarget(
+    env,
+    msg.chat.id,
+    threadId,
+    replyTo.message_id
+  );
+  if (!target) return false;
+
+  const isMedia =
+    msg.photo || msg.video || msg.document || msg.audio ||
+    msg.voice || msg.sticker || msg.animation || msg.video_note;
+
+  const chatLoc = threadId
+    ? `${msg.chat.id}/${threadId}`
+    : String(msg.chat.id);
+  const senderName = formatSenderName(msg.from);
+
+  try {
+    let ownerMsgId = null;
+
+    if (msg.text) {
+      const notification =
+        `📩 پاسخ در chat (${chatLoc})\n` +
+        `از: ${senderName}\n\n` +
+        `${msg.text}\n\n` +
+        `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
+      const res = await sendMessage(
+        env.BOT_TOKEN,
+        OWNER_ID,
+        notification,
+        undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+      ownerMsgId = res.result?.message_id;
+    } else if (isMedia || !msg.text) {
+      // Context header
+      const headerRes = await sendMessage(
+        env.BOT_TOKEN,
+        OWNER_ID,
+        `📩 پاسخ در chat (${chatLoc})\n` +
+          `از: ${senderName}\n` +
+          `↩️ روی پیام بعدی (کپی محتوا) ریپلای کن تا جوابت به همون چت بره.`,
+        undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+      const headerId = headerRes.result?.message_id;
+
+      // Copy the actual reply (media/text/caption preserved)
+      const copyRes = await copyMessage(
+        env.BOT_TOKEN,
+        OWNER_ID,
+        msg.chat.id,
+        msg.message_id,
+        undefined
+      );
+      ownerMsgId = copyRes.result?.message_id;
+
+      // Map BOTH so owner can reply to whichever they click
+      const mapping = {
+        targetChatId: msg.chat.id,
+        targetThreadId: threadId,
+        targetMsgId: msg.message_id,
+        sourceChatId: msg.chat.id,
+        sourceThreadId: threadId,
+        sourceMsgId: msg.message_id,
+        isBridgedReply: true,
+      };
+      if (headerId) await saveChatMapping(env, headerId, mapping);
+    }
+
+    if (ownerMsgId) {
+      await saveChatMapping(env, ownerMsgId, {
+        targetChatId: msg.chat.id,
+        targetThreadId: threadId,
+        targetMsgId: msg.message_id,
+        sourceChatId: msg.chat.id,
+        sourceThreadId: threadId,
+        sourceMsgId: msg.message_id,
+        isBridgedReply: true,
+      });
+    }
+
+    await logEvent(env, {
+      ev: 'chat_target_reply',
+      targetChat: msg.chat.id,
+      targetMsgId: msg.message_id,
+      kind: msg.text ? 'text' : 'media',
+    });
+  } catch (e) {
+    await reportError(env, 'handleTargetReply', e, {
+      targetChat: msg.chat.id,
+    });
+  }
+  return true;
+}
+
+// Owner replies to a notification in DM — routes back to the target chat.
 async function handleOwnerReply(msg, env) {
   if (msg.chat.id !== OWNER_ID) return false;
   if (msg.text && msg.text.startsWith('/')) return false;
@@ -1006,8 +1101,10 @@ async function handleOwnerReply(msg, env) {
     msg.voice || msg.sticker || msg.animation || msg.video_note;
 
   try {
+    let newTargetMsgId = null;
+
     if (isMedia || (!msg.text && msg.media_group_id)) {
-      await copyMessage(
+      const res = await copyMessage(
         env.BOT_TOKEN,
         mapping.targetChatId,
         msg.chat.id,
@@ -1015,8 +1112,9 @@ async function handleOwnerReply(msg, env) {
         mapping.targetThreadId ?? undefined,
         mapping.targetMsgId
       );
+      newTargetMsgId = res.result?.message_id;
     } else if (msg.text) {
-      await sendMessage(
+      const res = await sendMessage(
         env.BOT_TOKEN,
         mapping.targetChatId,
         msg.text,
@@ -1026,8 +1124,9 @@ async function handleOwnerReply(msg, env) {
           link_preview_options: { is_disabled: true },
         }
       );
+      newTargetMsgId = res.result?.message_id;
     } else {
-      await copyMessage(
+      const res = await copyMessage(
         env.BOT_TOKEN,
         mapping.targetChatId,
         msg.chat.id,
@@ -1035,10 +1134,26 @@ async function handleOwnerReply(msg, env) {
         mapping.targetThreadId ?? undefined,
         mapping.targetMsgId
       );
+      newTargetMsgId = res.result?.message_id;
     }
 
-    await sendMessage(env.BOT_TOKEN, OWNER_ID,
-      `✅ پاسخ شما به chat ${mapping.targetChatId} ارسال شد.`);
+    // Register the new target message so subsequent replies in the target
+    // chat keep bridging back to owner (round trips keep working).
+    if (newTargetMsgId) {
+      await registerChatTarget(
+        env,
+        mapping.targetChatId,
+        mapping.targetThreadId,
+        newTargetMsgId,
+        { ownerReply: true }
+      );
+    }
+
+    await sendMessage(
+      env.BOT_TOKEN,
+      OWNER_ID,
+      `✅ پاسخ شما به chat ${mapping.targetChatId} ارسال شد.`
+    );
 
     await logEvent(env, {
       ev: 'chat_owner_reply',
@@ -1046,8 +1161,11 @@ async function handleOwnerReply(msg, env) {
       targetMsgId: mapping.targetMsgId,
     });
   } catch (e) {
-    await sendMessage(env.BOT_TOKEN, OWNER_ID,
-      `❌ خطا در ارسال پاسخ به chat ${mapping.targetChatId}: ${e.message}`);
+    await sendMessage(
+      env.BOT_TOKEN,
+      OWNER_ID,
+      `❌ خطا در ارسال پاسخ به chat ${mapping.targetChatId}: ${e.message}`
+    );
     await reportError(env, 'chat.ownerReply', e);
   }
   return true;
@@ -1136,15 +1254,6 @@ async function readIndex(env) {
 
 async function writeIndex(env, ids) {
   await writeIfChanged(env, INDEX_KEY, ids);
-}
-
-async function addToIndex(env, id) {
-  const ids = await readIndex(env);
-  const s = String(id);
-  if (!ids.includes(s)) {
-    ids.push(s);
-    await writeIndex(env, ids);
-  }
 }
 
 async function readLord(env, username) {
@@ -1753,9 +1862,7 @@ function jsonResponse(data, status = 200) {
 async function handleState(request, env) {
   try {
     let body = {};
-    try {
-      body = await request.json();
-    } catch { /* ignore */ }
+    try { body = await request.json(); } catch { /* ignore */ }
     const user = await validateInitData(body.initData, env.BOT_TOKEN);
     if (!user) return jsonResponse({ error: 'unauthorized' }, 401);
     await ensureGameSeeded(env);
@@ -1773,9 +1880,7 @@ async function handleState(request, env) {
 async function handleTap(request, env) {
   try {
     let body = {};
-    try {
-      body = await request.json();
-    } catch { /* ignore */ }
+    try { body = await request.json(); } catch { /* ignore */ }
     const user = await validateInitData(body.initData, env.BOT_TOKEN);
     if (!user) return jsonResponse({ error: 'unauthorized' }, 401);
     await ensureGameSeeded(env);
@@ -1909,7 +2014,6 @@ export default {
       const url = new URL(request.url);
       const path = url.pathname;
 
-      // ─── /serverstatus — public JSON endpoint ───
       if (request.method === 'GET' && path === '/serverstatus') {
         try {
           const raw = await mc.lookup({
@@ -1925,8 +2029,8 @@ export default {
           const payload = {
             host: SERVER_HOST,
             port: SERVER_PORT,
-            online: classified,               // true | false | null
-            ghost,                            // true if Aternos returned a booting stub
+            online: classified,
+            ghost,
             raw: raw
               ? {
                   version: raw.status?.version || null,
@@ -2235,7 +2339,14 @@ async function handleUpdate(update, env, origin) {
   const msg = update.message || update.channel_post;
   if (!msg) return;
 
-  // Owner replying to a /chat notification — must run before the text-only gate
+  // 1) Replies made in a target chat to a /chat message → forward to owner
+  try {
+    if (await handleTargetReply(msg, env)) return;
+  } catch (e) {
+    await reportError(env, 'handleTargetReply', e);
+  }
+
+  // 2) Owner replying in DM to a forwarded notification → route to target
   try {
     if (await handleOwnerReply(msg, env)) return;
   } catch (e) {
@@ -2438,6 +2549,7 @@ async function handleUpdate(update, env, origin) {
         existing.url = url;
         existing.lastHash = hash;
         await writeJsonTargets(env, targets);
+        const myIdx = targets.indexOf(existing);
         await logEvent(env, {
           ev: 'json_sub_update',
           url: url.slice(0, 80),
@@ -2446,7 +2558,8 @@ async function handleUpdate(update, env, origin) {
         await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
-          `${RLM}♻️ اشتراک «${customName}» به‌روزرسانی شد. از این به بعد این ${where} با همین نام چک میشه.`,
+          `${RLM}♻️ اشتراک «${customName}» به‌روزرسانی شد. از این به بعد این ${where} با همین نام چک میشه.\n` +
+            `${RLM}شماره‌اش در /chat: chat ${myIdx + 1}`,
           threadId ?? undefined
         );
         return;
@@ -2461,6 +2574,8 @@ async function handleUpdate(update, env, origin) {
       });
       await writeJsonTargets(env, targets);
 
+      const myChatNum = targets.length;
+
       await logEvent(env, {
         ev: 'json_sub',
         url: url.slice(0, 80),
@@ -2472,6 +2587,7 @@ async function handleUpdate(update, env, origin) {
         env.BOT_TOKEN,
         msg.chat.id,
         `${RLM}✅ اشتراک «${customName}» فعال شد. از این به بعد هر وقت محتوای JSON تغییر کنه، در این ${where} ارسال میشه.\n` +
+          `${RLM}شماره‌اش در /chat: chat ${myChatNum}\n` +
           `${RLM}برای ارسال دستی همین الان: /jsontest ${customName}`,
         threadId ?? undefined
       );
@@ -2584,23 +2700,58 @@ async function handleUpdate(update, env, origin) {
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
-        `✅ اشتراک «${name}» حذف شد.`,
+        `✅ اشتراک «${name}» حذف شد.\n` +
+          `⚠️ شماره‌های /chat بعد از chat ${idx + 1} یک واحد جابجا میشن.`,
         threadId ?? undefined
       );
       return;
     }
 
     case '/chat': {
+      // OWNER ONLY
+      if (msg.from?.id !== OWNER_ID) return;
+
       const rawArgs = msg.text.replace(/^\/chat(@\w+)?\s*/i, '').trim();
-      const match = rawArgs.match(/^chat\s+(\d+)(?:\s+([\s\S]*))?$/i);
-      if (!match) {
+
+      const subs = await readJsonTargets(env);
+
+      const buildTargetList = () => {
+        if (!subs.length) {
+          return '📭 هیچ اشتراکی در JSON targets نیست. اول با `/json <url> <name>` اضافه کن.';
+        }
+        const lines = ['📋 اشتراک‌های موجود (chat N):'];
+        subs.forEach((t, i) => {
+          const loc = t.threadId ? `${t.chatId}/${t.threadId}` : String(t.chatId);
+          const here =
+            t.chatId === msg.chat.id &&
+            (t.threadId ?? null) === (threadId ?? null)
+              ? ' ← اینجا'
+              : '';
+          lines.push(`• chat ${i + 1} «${t.customName}» (${loc})${here}`);
+        });
+        return lines.join('\n');
+      };
+
+      if (!rawArgs || /^(help|list)$/i.test(rawArgs)) {
         await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
           'ℹ️ استفاده:\n' +
             '`/chat chat N <پیام>`\n' +
             'یا روی یک پیام / مدیا / مدیا-با-کپشن ریپلای کن و بنویس `/chat chat N`\n\n' +
-            'شماره‌ها همان شماره‌های JSON targets در `/debug` هستند (بدون تکرار).',
+            buildTargetList(),
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const match = rawArgs.match(/^chat\s+(\d+)(?:\s+([\s\S]*))?$/i);
+      if (!match) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ فرمت درست:\n`/chat chat N <پیام>`\n\n' + buildTargetList(),
           threadId ?? undefined,
           { parse_mode: 'Markdown' }
         );
@@ -2612,40 +2763,55 @@ async function handleUpdate(update, env, origin) {
       const reply = msg.reply_to_message;
 
       if (!textContent && !reply) {
-        await sendMessage(
-          env.BOT_TOKEN,
-          msg.chat.id,
-          '⚠️ یا باید متن پیام بدی، یا روی یک پیام / مدیا ریپلای کنی.',
-          threadId ?? undefined
-        );
+        if (chatNum >= 1 && chatNum <= subs.length) {
+          const t = subs[chatNum - 1];
+          const loc = t.threadId ? `${t.chatId}/${t.threadId}` : String(t.chatId);
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            `ℹ️ chat ${chatNum} «${t.customName}»:\n` +
+              `📍 مقصد: ${loc}\n` +
+              `🔗 اشتراک: ${t.url}\n\n` +
+              `برای ارسال: \`/chat chat ${chatNum} <متن>\`\n` +
+              `یا روی یک پیام/مدیا ریپلای کن و بنویس \`/chat chat ${chatNum}\``,
+            threadId ?? undefined,
+            { parse_mode: 'Markdown' }
+          );
+        } else {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            `⚠️ chat ${chatNum} وجود نداره.\n\n${buildTargetList()}`,
+            threadId ?? undefined,
+            { parse_mode: 'Markdown' }
+          );
+        }
         return;
       }
 
-      const jsonTargets = await readJsonTargets(env);
-      const unique = getUniqueChats(jsonTargets);
-
-      if (!unique.length) {
+      if (!subs.length) {
         await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
-          '⚠️ هیچ چتی در JSON targets نیست. اول با `/json <url> <name>` اضافه کن.',
+          '⚠️ هیچ اشتراکی در JSON targets نیست. اول با `/json <url> <name>` اضافه کن.',
           threadId ?? undefined,
           { parse_mode: 'Markdown' }
         );
         return;
       }
 
-      if (chatNum < 1 || chatNum > unique.length) {
+      if (chatNum < 1 || chatNum > subs.length) {
         await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
-          `⚠️ chat ${chatNum} وجود نداره. محدوده معتبر: 1 تا ${unique.length}`,
-          threadId ?? undefined
+          `⚠️ chat ${chatNum} وجود نداره.\n\n${buildTargetList()}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
         );
         return;
       }
 
-      const target = unique[chatNum - 1];
+      const target = subs[chatNum - 1];
       let targetMsgId;
 
       try {
@@ -2682,67 +2848,24 @@ async function handleUpdate(update, env, origin) {
         return;
       }
 
+      // Register the sent target message so replies in the target chat
+      // (by anyone) get bridged back to OWNER_ID.
+      if (targetMsgId) {
+        await registerChatTarget(
+          env,
+          target.chatId,
+          target.threadId,
+          targetMsgId,
+          { fromChatCmd: true }
+        );
+      }
+
       await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
-        `✅ به chat ${chatNum} ارسال شد.`,
+        `✅ به chat ${chatNum} «${target.customName}» ارسال شد.`,
         threadId ?? undefined
       );
-
-      // Notify owner (skip if owner is already the sender)
-      if (msg.chat.id !== OWNER_ID) {
-        try {
-          const fromName =
-            (msg.from?.username
-              ? `@${msg.from.username}`
-              : [msg.from?.first_name, msg.from?.last_name]
-                  .filter(Boolean)
-                  .join(' ')) ||
-            msg.chat.title ||
-            'Unknown';
-
-          const srcLoc = threadId
-            ? `${msg.chat.id}/${threadId}`
-            : String(msg.chat.id);
-          const dstLoc = target.threadId
-            ? `${target.chatId}/${target.threadId}`
-            : String(target.chatId);
-          const names = target.names.filter(Boolean).join(', ');
-
-          let notification = `📨 پیام /chat\n`;
-          notification += `از: ${fromName}\n`;
-          notification += `مبدا: ${srcLoc}\n`;
-          notification += `مقصد: chat ${chatNum}${names ? ` «${names}»` : ''} (${dstLoc})\n`;
-          if (reply) {
-            notification += `نوع: ریپلای به پیام ${reply.message_id}\n`;
-          } else {
-            notification += `متن: ${textContent.slice(0, 300)}\n`;
-          }
-          notification += `\n↩️ به همین پیام ریپلای کن تا جوابت به chat ${chatNum} بره.`;
-
-          const ownerRes = await sendMessage(
-            env.BOT_TOKEN,
-            OWNER_ID,
-            notification,
-            undefined,
-            { link_preview_options: { is_disabled: true } }
-          );
-          const ownerMsgId = ownerRes.result?.message_id;
-
-          if (ownerMsgId && targetMsgId) {
-            await saveChatMapping(env, ownerMsgId, {
-              targetChatId: target.chatId,
-              targetThreadId: target.threadId ?? null,
-              targetMsgId,
-              sourceChatId: msg.chat.id,
-              sourceThreadId: threadId ?? null,
-              sourceMsgId: msg.message_id,
-            });
-          }
-        } catch (e) {
-          await reportError(env, 'chat.notify', e);
-        }
-      }
 
       await logEvent(env, {
         ev: 'chat_send',
@@ -3860,6 +3983,18 @@ async function handleUpdate(update, env, origin) {
         }
 
         try {
+          const tIdx = await readChatTargetIndex(env);
+          const cMap = await readChatMap(env);
+          lines.push('🌉 Chat bridge');
+          lines.push(`  target msgs tracked: ${Object.keys(tIdx).length}`);
+          lines.push(`  owner mappings: ${Object.keys(cMap).length}`);
+          lines.push('');
+        } catch (e) {
+          lines.push(`🌉 Chat bridge ⚠️ ${e.message}`);
+          lines.push('');
+        }
+
+        try {
           const users = await listUsers(env);
           const total = users.reduce((s, u) => s + u.count, 0);
           const lords = users.filter((u) => u.lord).length;
@@ -3945,7 +4080,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /server  /status');
       lines.push('  /serverdollar  /statusdollar');
       lines.push('  /json  /jsontest  /jsonend');
-      lines.push('  /chat chat N <text> | reply + /chat chat N');
+      lines.push('  /chat chat N <text> | reply + /chat chat N  (owner)');
       lines.push('  /hourstart @username | /hourstart any text  /hourend [force]');
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
