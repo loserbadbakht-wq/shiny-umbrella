@@ -932,6 +932,127 @@ async function lookupUsername(env, username) {
   }
 }
 
+// ============= CHAT BRIDGE (/chat) =============
+const CHAT_MAP_KEY = 'chat:map';
+
+async function readChatMap(env) {
+  try {
+    const raw = await env.BOT_KV.get(CHAT_MAP_KEY, { cacheTtl: KV_CACHE_TTL });
+    if (!raw) return {};
+    const obj = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (e) {
+    console.error('readChatMap failed:', e.message);
+    return {};
+  }
+}
+
+async function saveChatMapping(env, ownerMsgId, mapping) {
+  try {
+    const map = await readChatMap(env);
+    map[String(ownerMsgId)] = { ...mapping, at: Date.now() };
+    // Prune entries older than 30 days
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    for (const k of Object.keys(map)) {
+      if (map[k]?.at && map[k].at < cutoff) delete map[k];
+    }
+    // Hard cap at 500 entries
+    const keys = Object.keys(map);
+    if (keys.length > 500) {
+      keys.sort((a, b) => (map[a].at || 0) - (map[b].at || 0));
+      for (let i = 0; i < keys.length - 500; i++) delete map[keys[i]];
+    }
+    await env.BOT_KV.put(CHAT_MAP_KEY, encryptData(map, env.DB_ENCRYPTION_KEY));
+  } catch (e) {
+    console.error('saveChatMapping failed:', e.message);
+  }
+}
+
+async function getChatMapping(env, ownerMsgId) {
+  const map = await readChatMap(env);
+  return map[String(ownerMsgId)] || null;
+}
+
+// Deduplicate JSON targets by (chatId, threadId) and keep numbering stable
+function getUniqueChats(jsonTargets) {
+  const seen = new Map();
+  for (const t of jsonTargets) {
+    const key = `${t.chatId}:${t.threadId ?? 'main'}`;
+    if (!seen.has(key)) {
+      seen.set(key, {
+        chatId: t.chatId,
+        threadId: t.threadId ?? null,
+        names: [t.customName],
+      });
+    } else {
+      seen.get(key).names.push(t.customName);
+    }
+  }
+  return Array.from(seen.values());
+}
+
+// Owner reply handler — returns true if it was a reply to a /chat notification
+async function handleOwnerReply(msg, env) {
+  if (msg.chat.id !== OWNER_ID) return false;
+  if (msg.text && msg.text.startsWith('/')) return false;
+  const replyTo = msg.reply_to_message;
+  if (!replyTo) return false;
+
+  const mapping = await getChatMapping(env, replyTo.message_id);
+  if (!mapping) return false;
+
+  const isMedia =
+    msg.photo || msg.video || msg.document || msg.audio ||
+    msg.voice || msg.sticker || msg.animation || msg.video_note;
+
+  try {
+    if (isMedia || (!msg.text && msg.media_group_id)) {
+      await copyMessage(
+        env.BOT_TOKEN,
+        mapping.targetChatId,
+        msg.chat.id,
+        msg.message_id,
+        mapping.targetThreadId ?? undefined,
+        mapping.targetMsgId
+      );
+    } else if (msg.text) {
+      await sendMessage(
+        env.BOT_TOKEN,
+        mapping.targetChatId,
+        msg.text,
+        mapping.targetThreadId ?? undefined,
+        {
+          reply_to_message_id: mapping.targetMsgId,
+          link_preview_options: { is_disabled: true },
+        }
+      );
+    } else {
+      await copyMessage(
+        env.BOT_TOKEN,
+        mapping.targetChatId,
+        msg.chat.id,
+        msg.message_id,
+        mapping.targetThreadId ?? undefined,
+        mapping.targetMsgId
+      );
+    }
+
+    await sendMessage(env.BOT_TOKEN, OWNER_ID,
+      `✅ پاسخ شما به chat ${mapping.targetChatId} ارسال شد.`);
+
+    await logEvent(env, {
+      ev: 'chat_owner_reply',
+      targetChat: mapping.targetChatId,
+      targetMsgId: mapping.targetMsgId,
+    });
+  } catch (e) {
+    await sendMessage(env.BOT_TOKEN, OWNER_ID,
+      `❌ خطا در ارسال پاسخ به chat ${mapping.targetChatId}: ${e.message}`);
+    await reportError(env, 'chat.ownerReply', e);
+  }
+  return true;
+}
+
 function displayLink(entry) {
   if (entry.displayName) {
     return htmlEsc(entry.displayName);
@@ -1497,7 +1618,7 @@ html, body {
   <button id="tap" dir="ltr">/start</button>
   <div class="mine">امتیاز تو: <span id="mine">0</span></div>
   <div class="board">
-    <h2>🏆 برترینها</h2>
+    <h2>🏆 برترین‌ها</h2>
     <div id="list"></div>
   </div>
 </div>
@@ -2112,7 +2233,16 @@ export default {
 // ============= UPDATE HANDLER =============
 async function handleUpdate(update, env, origin) {
   const msg = update.message || update.channel_post;
-  if (!msg || !msg.text) return;
+  if (!msg) return;
+
+  // Owner replying to a /chat notification — must run before the text-only gate
+  try {
+    if (await handleOwnerReply(msg, env)) return;
+  } catch (e) {
+    await reportError(env, 'handleOwnerReply', e);
+  }
+
+  if (!msg.text) return;
   const cmd = parseCommand(msg.text);
   if (!cmd) return;
   if (!env.BOT_TOKEN) return;
@@ -2460,6 +2590,169 @@ async function handleUpdate(update, env, origin) {
       return;
     }
 
+    case '/chat': {
+      const rawArgs = msg.text.replace(/^\/chat(@\w+)?\s*/i, '').trim();
+      const match = rawArgs.match(/^chat\s+(\d+)(?:\s+([\s\S]*))?$/i);
+      if (!match) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/chat chat N <پیام>`\n' +
+            'یا روی یک پیام / مدیا / مدیا-با-کپشن ریپلای کن و بنویس `/chat chat N`\n\n' +
+            'شماره‌ها همان شماره‌های JSON targets در `/debug` هستند (بدون تکرار).',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const chatNum = parseInt(match[1], 10);
+      const textContent = (match[2] || '').trim();
+      const reply = msg.reply_to_message;
+
+      if (!textContent && !reply) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ یا باید متن پیام بدی، یا روی یک پیام / مدیا ریپلای کنی.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const jsonTargets = await readJsonTargets(env);
+      const unique = getUniqueChats(jsonTargets);
+
+      if (!unique.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ هیچ چتی در JSON targets نیست. اول با `/json <url> <name>` اضافه کن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      if (chatNum < 1 || chatNum > unique.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ chat ${chatNum} وجود نداره. محدوده معتبر: 1 تا ${unique.length}`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const target = unique[chatNum - 1];
+      let targetMsgId;
+
+      try {
+        if (reply) {
+          const result = await copyMessage(
+            env.BOT_TOKEN,
+            target.chatId,
+            reply.chat.id,
+            reply.message_id,
+            target.threadId ?? undefined
+          );
+          targetMsgId = result.result?.message_id;
+        } else {
+          const result = await sendMessage(
+            env.BOT_TOKEN,
+            target.chatId,
+            textContent,
+            target.threadId ?? undefined,
+            { link_preview_options: { is_disabled: true } }
+          );
+          targetMsgId = result.result?.message_id;
+        }
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ ارسال به chat ${chatNum} ناموفق: ${e.message}`,
+          threadId ?? undefined
+        );
+        await reportError(env, 'chat.send', e, {
+          chatNum,
+          targetChat: target.chatId,
+        });
+        return;
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ به chat ${chatNum} ارسال شد.`,
+        threadId ?? undefined
+      );
+
+      // Notify owner (skip if owner is already the sender)
+      if (msg.chat.id !== OWNER_ID) {
+        try {
+          const fromName =
+            (msg.from?.username
+              ? `@${msg.from.username}`
+              : [msg.from?.first_name, msg.from?.last_name]
+                  .filter(Boolean)
+                  .join(' ')) ||
+            msg.chat.title ||
+            'Unknown';
+
+          const srcLoc = threadId
+            ? `${msg.chat.id}/${threadId}`
+            : String(msg.chat.id);
+          const dstLoc = target.threadId
+            ? `${target.chatId}/${target.threadId}`
+            : String(target.chatId);
+          const names = target.names.filter(Boolean).join(', ');
+
+          let notification = `📨 پیام /chat\n`;
+          notification += `از: ${fromName}\n`;
+          notification += `مبدا: ${srcLoc}\n`;
+          notification += `مقصد: chat ${chatNum}${names ? ` «${names}»` : ''} (${dstLoc})\n`;
+          if (reply) {
+            notification += `نوع: ریپلای به پیام ${reply.message_id}\n`;
+          } else {
+            notification += `متن: ${textContent.slice(0, 300)}\n`;
+          }
+          notification += `\n↩️ به همین پیام ریپلای کن تا جوابت به chat ${chatNum} بره.`;
+
+          const ownerRes = await sendMessage(
+            env.BOT_TOKEN,
+            OWNER_ID,
+            notification,
+            undefined,
+            { link_preview_options: { is_disabled: true } }
+          );
+          const ownerMsgId = ownerRes.result?.message_id;
+
+          if (ownerMsgId && targetMsgId) {
+            await saveChatMapping(env, ownerMsgId, {
+              targetChatId: target.chatId,
+              targetThreadId: target.threadId ?? null,
+              targetMsgId,
+              sourceChatId: msg.chat.id,
+              sourceThreadId: threadId ?? null,
+              sourceMsgId: msg.message_id,
+            });
+          }
+        } catch (e) {
+          await reportError(env, 'chat.notify', e);
+        }
+      }
+
+      await logEvent(env, {
+        ev: 'chat_send',
+        chatNum,
+        hasReply: !!reply,
+        hasText: !!textContent,
+      });
+      return;
+    }
+
     case '/debugdollar': {
       if (msg.from?.id !== OWNER_ID) return;
       const r = await fetchNavasanOnce(NAVASAN_URL);
@@ -2492,7 +2785,7 @@ async function handleUpdate(update, env, origin) {
           'ℹ️ استفاده:\n' +
             '`/hourstart @username` — لینکدار\n' +
             '`/hourstart هر متن دلخواهی` — متن ساده\n\n' +
-            'هر ساعت دقیقه ۰۰ به وقت ایران پیام ارسال میشود.',
+            'هر ساعت دقیقه ۰۰ به وقت ایران پیام ارسال می‌شود.',
           threadId ?? undefined
         );
         return;
@@ -2574,7 +2867,7 @@ async function handleUpdate(update, env, origin) {
         env.BOT_TOKEN,
         msg.chat.id,
         `${RLM}⏰ ساعت شمار در این ${where} برای ${link} فعال شد.\n` +
-          `${RLM}پیام هر ساعت دقیقه ۰۰ به وقت ایران ارسال میشود.`,
+          `${RLM}پیام هر ساعت دقیقه ۰۰ به وقت ایران ارسال می‌شود.`,
         threadId ?? undefined,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
@@ -3652,6 +3945,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /server  /status');
       lines.push('  /serverdollar  /statusdollar');
       lines.push('  /json  /jsontest  /jsonend');
+      lines.push('  /chat chat N <text> | reply + /chat chat N');
       lines.push('  /hourstart @username | /hourstart any text  /hourend [force]');
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
@@ -3737,13 +4031,14 @@ async function sendPhoto(token, chatId, photoUrl, caption, threadId, extra = {})
   return data;
 }
 
-async function copyMessage(token, chatId, fromChatId, messageId, threadId) {
+async function copyMessage(token, chatId, fromChatId, messageId, threadId, replyToMessageId) {
   const body = {
     chat_id: chatId,
     from_chat_id: fromChatId,
     message_id: messageId,
   };
   if (threadId) body.message_thread_id = threadId;
+  if (replyToMessageId) body.reply_parameters = { message_id: replyToMessageId };
   const res = await fetch(
     `https://api.telegram.org/bot${token}/copyMessage`,
     {
@@ -3837,4 +4132,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-  }
+}
