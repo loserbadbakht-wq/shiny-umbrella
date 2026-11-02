@@ -51,6 +51,7 @@ const JSON_TARGETS_KEY = 'json:targets';
 // Chat bridge
 const CHAT_MAP_KEY = 'chat:map';
 const CHAT_TARGET_INDEX_KEY = 'chat:target_index';
+const REACTION_LOG_KEY = 'reactions:recent';
 
 // Retries
 const SERVER_RETRIES = 3;
@@ -1160,6 +1161,55 @@ async function handleTargetReply(msg, env) {
   return true;
 }
 
+// ============= REACTION LOG =============
+async function logReactionUpdate(env, r, result) {
+  try {
+    const raw = await env.BOT_KV.get(REACTION_LOG_KEY, {
+      cacheTtl: KV_CACHE_TTL,
+    });
+    let list = [];
+    if (raw) {
+      try {
+        list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(list)) list = [];
+      } catch { list = []; }
+    }
+    list.unshift({
+      t: new Date().toISOString(),
+      chatId: r.chat?.id ?? null,
+      messageId: r.message_id ?? null,
+      userId: r.user?.id ?? null,
+      userIsBot: r.user?.is_bot ?? null,
+      actorChatId: r.actor_chat?.id ?? null,
+      newCount: (r.new_reaction || []).length,
+      newEmojis: (r.new_reaction || [])
+        .filter((x) => x && x.type === 'emoji')
+        .map((x) => x.emoji),
+      result,
+    });
+    list = list.slice(0, 50);
+    await env.BOT_KV.put(
+      REACTION_LOG_KEY,
+      encryptData(list, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('logReactionUpdate failed:', e.message);
+  }
+}
+
+async function readReactionLog(env) {
+  try {
+    const raw = await env.BOT_KV.get(REACTION_LOG_KEY, {
+      cacheTtl: KV_CACHE_TTL,
+    });
+    if (!raw) return [];
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
 // Fires when the OWNER reacts to a notification message in their DM.
 // Looks up the target message via chat:map and mirrors the reaction.
 async function handleOwnerReaction(update, env) {
@@ -1204,34 +1254,70 @@ async function handleTargetReaction(update, env) {
   const r = update.message_reaction;
   if (!r) return false;
   if (r.chat?.id === OWNER_ID) return false;
-  if (r.user?.id === OWNER_ID) return false;
-  if (r.user?.is_bot) return false;
 
-  const threadId = r.message_thread_id ?? null;
-  const target = await lookupChatTarget(
-    env,
-    r.chat.id,
-    threadId,
-    r.message_id
-  );
-  if (!target) return false;
+  const actorUser = r.user || null;
+  const actorChat = r.actor_chat || null;
+  const messageId = r.message_id;
 
+  // Determine sender display — user, or anonymous-admin chat fallback
+  let senderDisplay;
+  if (actorUser) senderDisplay = formatSenderLink(actorUser);
+  else if (actorChat) {
+    const name = actorChat.title || 'Anonymous';
+    senderDisplay = actorChat.username
+      ? `<a href="https://t.me/${htmlEsc(actorChat.username)}">${htmlEsc(name)}</a>`
+      : htmlEsc(name);
+  } else senderDisplay = 'Unknown';
+
+  // Skip owner's / bot's own reactions
+  if (actorUser?.id === OWNER_ID) {
+    await logReactionUpdate(env, r, 'skip:owner');
+    return false;
+  }
+  if (actorUser?.is_bot) {
+    await logReactionUpdate(env, r, 'skip:bot');
+    return false;
+  }
+
+  // Only notify on added/changed reactions, not removals
   const newEmojis = (r.new_reaction || [])
     .filter((x) => x && x.type === 'emoji' && x.emoji)
     .map((x) => x.emoji);
+  if (!newEmojis.length) {
+    await logReactionUpdate(env, r, 'skip:removal');
+    return false;
+  }
 
-  // Ignore pure removals — only notify on added/changed reactions
-  if (!newEmojis.length) return false;
+  // Look up the target — try null-threadId first (regular groups)
+  let target = await lookupChatTarget(env, r.chat.id, null, messageId);
 
+  // Fallback: scan index for any threadId under this chat
+  if (!target) {
+    const idx = await readChatTargetIndex(env);
+    const prefix = `${r.chat.id}:`;
+    const suffix = `:${messageId}`;
+    for (const k of Object.keys(idx)) {
+      if (k.startsWith(prefix) && k.endsWith(suffix)) {
+        target = idx[k];
+        break;
+      }
+    }
+  }
+
+  if (!target) {
+    await logReactionUpdate(env, r, 'miss:not-tracked');
+    return false;
+  }
+
+  const threadId = target.threadId ?? null;
   const chatLoc = threadId
     ? `${r.chat.id}/${threadId}`
     : String(r.chat.id);
-  const senderLink = formatSenderLink(r.user);
   const originalPreview = target.preview || '(بدون پیش‌نمایش)';
 
   try {
     const headerText =
-      `${senderLink} reacted ${newEmojis.join(' ')} to this message:\n` +
+      `${senderDisplay} reacted ${newEmojis.join(' ')} to this message:\n` +
       `${originalPreview}\n\n` +
       `chat (${chatLoc})\n` +
       `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
@@ -1241,10 +1327,7 @@ async function handleTargetReaction(update, env) {
       OWNER_ID,
       headerText,
       undefined,
-      {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      }
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
     const ownerMsgId = headerRes.result?.message_id;
 
@@ -1252,21 +1335,23 @@ async function handleTargetReaction(update, env) {
       await saveChatMapping(env, ownerMsgId, {
         targetChatId: r.chat.id,
         targetThreadId: threadId,
-        targetMsgId: r.message_id,
+        targetMsgId: messageId,
         sourceChatId: r.chat.id,
         sourceThreadId: threadId,
-        sourceMsgId: r.message_id,
+        sourceMsgId: messageId,
         isReactionNotify: true,
       });
     }
 
+    await logReactionUpdate(env, r, 'notified');
     await logEvent(env, {
       ev: 'chat_target_reaction',
       targetChat: r.chat.id,
-      targetMsgId: r.message_id,
+      targetMsgId: messageId,
       emojis: newEmojis,
     });
   } catch (e) {
+    await logReactionUpdate(env, r, 'error:send:' + e.message);
     await reportError(env, 'handleTargetReaction', e, {
       targetChat: r.chat.id,
     });
@@ -3127,6 +3212,38 @@ async function handleUpdate(update, env, origin) {
       return;
     }
 
+    case '/debugreactions': {
+      if (msg.from?.id !== OWNER_ID) return;
+      const log = await readReactionLog(env);
+      if (!log.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 هیچ reaction update ثبت نشده.\n' +
+            'اگر انتظار داری اینجا چیزی باشه، یعنی updateها اصلاً به Worker نمی‌رسن — `allowed_updates` رو چک کن.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const lines = [`🧪 *Last ${log.length} reaction updates:*`, ''];
+      for (const e of log.slice(0, 20)) {
+        const who = e.userId
+          ? `user ${e.userId}${e.userIsBot ? ' (bot)' : ''}`
+          : e.actorChatId
+            ? `actor chat ${e.actorChatId}`
+            : 'unknown';
+        const emo = (e.newEmojis || []).join(' ') || '—';
+        lines.push(
+          `• \`${e.result}\` — chat ${e.chatId} msg ${e.messageId} · ${who} · ${emo}`
+        );
+      }
+      await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
+        parse_mode: 'Markdown',
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
+
     case '/hourstart': {
       const parts = msg.text.trim().split(/\s+/);
       if (parts.length < 2) {
@@ -4223,6 +4340,23 @@ async function handleUpdate(update, env, origin) {
         }
 
         try {
+          const rLog = await readReactionLog(env);
+          lines.push('🧪 Reactions');
+          lines.push(`  recorded: ${rLog.length}`);
+          if (rLog.length) {
+            const last = rLog[0];
+            lines.push(
+              `  latest: ${last.result} · chat ${last.chatId} msg ${last.messageId}`
+            );
+          }
+          lines.push('  use /debugreactions to view');
+          lines.push('');
+        } catch (e) {
+          lines.push(`🧪 Reactions ⚠️ ${e.message}`);
+          lines.push('');
+        }
+
+        try {
           const users = await listUsers(env);
           const total = users.reduce((s, u) => s + u.count, 0);
           const lords = users.filter((u) => u.lord).length;
@@ -4325,6 +4459,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
       lines.push('  /errors [N]  /clearerrors  (owner)');
+      lines.push('  /debugreactions  (owner)');
       lines.push('  /debugdollar  (owner)');
       lines.push('  /buttonlord @username <text>  (owner)');
       lines.push('  /editcounter <number>  (owner)');
@@ -4562,4 +4697,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-  }
+}
