@@ -2825,13 +2825,38 @@ async function handleUpdate(update, env, origin) {
 
       try {
         if (reply) {
-          const result = await copyMessage(
-            env.BOT_TOKEN,
-            target.chatId,
-            reply.chat.id,
-            reply.message_id,
-            target.threadId ?? undefined
-          );
+          let result;
+          if (isForwardedMessage(reply)) {
+            // Preserve the original "Forwarded from …" header
+            try {
+              result = await forwardMessage(
+                env.BOT_TOKEN,
+                target.chatId,
+                reply.chat.id,
+                reply.message_id,
+                target.threadId ?? undefined
+              );
+            } catch (fwdErr) {
+              console.warn(
+                `forwardMessage failed (${fwdErr.message}), falling back to copyMessage`
+              );
+              result = await copyMessage(
+                env.BOT_TOKEN,
+                target.chatId,
+                reply.chat.id,
+                reply.message_id,
+                target.threadId ?? undefined
+              );
+            }
+          } else {
+            result = await copyMessage(
+              env.BOT_TOKEN,
+              target.chatId,
+              reply.chat.id,
+              reply.message_id,
+              target.threadId ?? undefined
+            );
+          }
           targetMsgId = result.result?.message_id;
         } else {
           const result = await sendMessage(
@@ -4117,6 +4142,14 @@ function topicOf(msg) {
     : undefined;
 }
 
+function isForwardedMessage(m) {
+  if (!m) return false;
+  if (m.forward_origin) return true;
+  if (m.forward_from || m.forward_from_chat || m.forward_sender_name) return true;
+  if (m.forward_date) return true;
+  return false;
+}
+
 async function sendMessage(token, chatId, text, threadId, extra = {}) {
   const body = { chat_id: chatId, text, ...extra };
   if (threadId) body.message_thread_id = threadId;
@@ -4195,6 +4228,30 @@ async function copyMessage(token, chatId, fromChatId, messageId, threadId, reply
   if (!res.ok || !data.ok) {
     throw new Error(
       `copyMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function forwardMessage(token, chatId, fromChatId, messageId, threadId) {
+  const body = {
+    chat_id: chatId,
+    from_chat_id: fromChatId,
+    message_id: messageId,
+  };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/forwardMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `forwardMessage ${res.status}: ${data.description || JSON.stringify(data)}`
     );
   }
   return data;
