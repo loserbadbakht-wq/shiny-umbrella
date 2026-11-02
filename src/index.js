@@ -968,23 +968,31 @@ async function lookupChatTarget(env, chatId, threadId, msgId) {
   return idx[key] || null;
 }
 
-function formatSenderName(from) {
+// Returns an HTML anchor for the sender: full name hyperlinked to their
+// profile. Falls back to @username, then to plain escaped name.
+function formatSenderLink(from) {
   if (!from) return 'Unknown';
-  if (from.username) return `@${from.username}`;
-  return (
-    [from.first_name, from.last_name].filter(Boolean).join(' ') || 'Unknown'
-  );
+  const fullName = [from.first_name, from.last_name]
+    .filter(Boolean)
+    .join(' ');
+  const display =
+    fullName || (from.username ? `@${from.username}` : 'Unknown');
+  if (from.username) {
+    return `<a href="https://t.me/${htmlEsc(from.username)}">${htmlEsc(display)}</a>`;
+  }
+  if (from.id != null) {
+    return `<a href="tg://user?id=${htmlEsc(from.id)}">${htmlEsc(display)}</a>`;
+  }
+  return htmlEsc(display);
 }
 
-// Handles replies made IN A TARGET CHAT to a message the bot sent via /chat
-// (or via a bridged owner reply). Forwards the reply to OWNER_ID and registers
-// an owner-side mapping so owner's reply can travel back.
+// Handles replies made IN A TARGET CHAT to a tracked bot message.
+// Forwards the reply to OWNER_ID with the sender's full name hyperlinked
+// on top, and registers an owner-side mapping so the owner's reply can
+// travel back to the target chat.
 async function handleTargetReply(msg, env) {
-  // Skip owner-originated messages — avoids echo loops and self-forwards
-  if (msg.from?.id === OWNER_ID) return false;
-  if (msg.from?.is_bot) return false;
+  // Skip owner's DM — that path is handled by handleOwnerReply
   if (msg.chat.id === OWNER_ID) return false;
-
   const replyTo = msg.reply_to_message;
   if (!replyTo) return false;
   if (!replyTo.from?.is_bot) return false;
@@ -1005,39 +1013,43 @@ async function handleTargetReply(msg, env) {
   const chatLoc = threadId
     ? `${msg.chat.id}/${threadId}`
     : String(msg.chat.id);
-  const senderName = formatSenderName(msg.from);
+  const senderLink = formatSenderLink(msg.from);
 
   try {
     let ownerMsgId = null;
 
     if (msg.text) {
       const notification =
-        `📩 پاسخ در chat (${chatLoc})\n` +
-        `از: ${senderName}\n\n` +
-        `${msg.text}\n\n` +
+        `${senderLink}\n` +
+        `📩 پاسخ در chat (${chatLoc})\n\n` +
+        `${htmlEsc(msg.text)}\n\n` +
         `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
       const res = await sendMessage(
         env.BOT_TOKEN,
         OWNER_ID,
         notification,
         undefined,
-        { link_preview_options: { is_disabled: true } }
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
       );
       ownerMsgId = res.result?.message_id;
     } else if (isMedia || !msg.text) {
-      // Context header
       const headerRes = await sendMessage(
         env.BOT_TOKEN,
         OWNER_ID,
-        `📩 پاسخ در chat (${chatLoc})\n` +
-          `از: ${senderName}\n` +
+        `${senderLink}\n` +
+          `📩 پاسخ در chat (${chatLoc})\n` +
           `↩️ روی پیام بعدی (کپی محتوا) ریپلای کن تا جوابت به همون چت بره.`,
         undefined,
-        { link_preview_options: { is_disabled: true } }
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
       );
       const headerId = headerRes.result?.message_id;
 
-      // Copy the actual reply (media/text/caption preserved)
       const copyRes = await copyMessage(
         env.BOT_TOKEN,
         OWNER_ID,
@@ -1047,7 +1059,6 @@ async function handleTargetReply(msg, env) {
       );
       ownerMsgId = copyRes.result?.message_id;
 
-      // Map BOTH so owner can reply to whichever they click
       const mapping = {
         targetChatId: msg.chat.id,
         targetThreadId: threadId,
@@ -1137,8 +1148,6 @@ async function handleOwnerReply(msg, env) {
       newTargetMsgId = res.result?.message_id;
     }
 
-    // Register the new target message so subsequent replies in the target
-    // chat keep bridging back to owner (round trips keep working).
     if (newTargetMsgId) {
       await registerChatTarget(
         env,
@@ -2849,7 +2858,7 @@ async function handleUpdate(update, env, origin) {
       }
 
       // Register the sent target message so replies in the target chat
-      // (by anyone) get bridged back to OWNER_ID.
+      // get bridged back to OWNER_ID.
       if (targetMsgId) {
         await registerChatTarget(
           env,
@@ -4267,4 +4276,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-}
+  }
