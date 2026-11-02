@@ -928,11 +928,11 @@ async function getChatMapping(env, ownerMsgId) {
   return map[String(ownerMsgId)] || null;
 }
 
+// NOTE: cacheTtl: 0 for chat:target_index reads — bypasses local KV cache
+// so freshly-registered targets are visible immediately within the same PoP.
 async function readChatTargetIndex(env) {
   try {
-    const raw = await env.BOT_KV.get(CHAT_TARGET_INDEX_KEY, {
-      cacheTtl: KV_CACHE_TTL,
-    });
+    const raw = await env.BOT_KV.get(CHAT_TARGET_INDEX_KEY, { cacheTtl: 0 });
     if (!raw) return {};
     const obj = decryptData(raw, env.DB_ENCRYPTION_KEY);
     return obj && typeof obj === 'object' ? obj : {};
@@ -967,6 +967,47 @@ async function lookupChatTarget(env, chatId, threadId, msgId) {
   const idx = await readChatTargetIndex(env);
   const key = `${chatId}:${threadId ?? 'main'}:${msgId}`;
   return idx[key] || null;
+}
+
+// Scans the index for any key that matches `chatId:*:msgId`, regardless of
+// which threadId it was registered under. Used as a fallback because
+// `message_reaction` updates do NOT include `message_thread_id`.
+function findChatTargetByScan(idx, chatId, msgId) {
+  const prefix = `${chatId}:`;
+  const suffix = `:${msgId}`;
+  for (const k of Object.keys(idx)) {
+    if (k.startsWith(prefix) && k.endsWith(suffix)) {
+      return idx[k];
+    }
+  }
+  return null;
+}
+
+// Retries the lookup across a short window to tolerate Workers KV's
+// eventual consistency across PoPs (write may not be visible instantly).
+async function lookupChatTargetWithRetry(env, chatId, msgId) {
+  // Attempt 1
+  let idx = await readChatTargetIndex(env);
+  let hit = idx[`${chatId}:main:${msgId}`] ||
+            idx[`${chatId}:null:${msgId}`] ||
+            findChatTargetByScan(idx, chatId, msgId);
+  if (hit) return hit;
+
+  // Attempt 2 after short delay (cross-PoP propagation)
+  await sleep(1500);
+  idx = await readChatTargetIndex(env);
+  hit = idx[`${chatId}:main:${msgId}`] ||
+        idx[`${chatId}:null:${msgId}`] ||
+        findChatTargetByScan(idx, chatId, msgId);
+  if (hit) return hit;
+
+  // Attempt 3 after longer delay
+  await sleep(3000);
+  idx = await readChatTargetIndex(env);
+  hit = idx[`${chatId}:main:${msgId}`] ||
+        idx[`${chatId}:null:${msgId}`] ||
+        findChatTargetByScan(idx, chatId, msgId);
+  return hit || null;
 }
 
 // Returns an HTML anchor for the sender: full name hyperlinked to their
@@ -1162,11 +1203,9 @@ async function handleTargetReply(msg, env) {
 }
 
 // ============= REACTION LOG =============
-async function logReactionUpdate(env, r, result) {
+async function logReactionUpdate(env, r, result, extra = {}) {
   try {
-    const raw = await env.BOT_KV.get(REACTION_LOG_KEY, {
-      cacheTtl: KV_CACHE_TTL,
-    });
+    const raw = await env.BOT_KV.get(REACTION_LOG_KEY, { cacheTtl: 0 });
     let list = [];
     if (raw) {
       try {
@@ -1185,7 +1224,10 @@ async function logReactionUpdate(env, r, result) {
       newEmojis: (r.new_reaction || [])
         .filter((x) => x && x.type === 'emoji')
         .map((x) => x.emoji),
+      newCustomCount: (r.new_reaction || [])
+        .filter((x) => x && x.type === 'custom_emoji').length,
       result,
+      ...extra,
     });
     list = list.slice(0, 50);
     await env.BOT_KV.put(
@@ -1199,9 +1241,7 @@ async function logReactionUpdate(env, r, result) {
 
 async function readReactionLog(env) {
   try {
-    const raw = await env.BOT_KV.get(REACTION_LOG_KEY, {
-      cacheTtl: KV_CACHE_TTL,
-    });
+    const raw = await env.BOT_KV.get(REACTION_LOG_KEY, { cacheTtl: 0 });
     if (!raw) return [];
     const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
     return Array.isArray(arr) ? arr : [];
@@ -1248,64 +1288,61 @@ async function handleOwnerReaction(update, env) {
 }
 
 // Fires when someone reacts IN A TARGET CHAT to a tracked bot message.
-// Notifies OWNER_ID with "(sender) reacted <emoji> to this message:" plus a
-// preview, and registers a chat:map entry so the owner's reply routes back.
 async function handleTargetReaction(update, env) {
   const r = update.message_reaction;
   if (!r) return false;
+
+  // Skip owner's own DM — handleOwnerReaction owns that path
   if (r.chat?.id === OWNER_ID) return false;
 
   const actorUser = r.user || null;
   const actorChat = r.actor_chat || null;
   const messageId = r.message_id;
 
-  // Determine sender display — user, or anonymous-admin chat fallback
-  let senderDisplay;
-  if (actorUser) senderDisplay = formatSenderLink(actorUser);
-  else if (actorChat) {
-    const name = actorChat.title || 'Anonymous';
-    senderDisplay = actorChat.username
-      ? `<a href="https://t.me/${htmlEsc(actorChat.username)}">${htmlEsc(name)}</a>`
-      : htmlEsc(name);
-  } else senderDisplay = 'Unknown';
+  // ---- FILTERS ----
 
-  // Skip owner's / bot's own reactions
-  if (actorUser?.id === OWNER_ID) {
+  // Owner reacted using their own account (not anonymous)
+  if (actorUser?.id === OWNER_ID && !actorChat) {
     await logReactionUpdate(env, r, 'skip:owner');
     return false;
   }
-  if (actorUser?.is_bot) {
+
+  // Bot reacted — BUT anonymous admins surface as the anonymous bot with
+  // actor_chat set. Those are real users, so don't skip when actor_chat exists.
+  if (actorUser?.is_bot && !actorChat) {
     await logReactionUpdate(env, r, 'skip:bot');
     return false;
   }
 
-  // Only notify on added/changed reactions, not removals
+  // Collect emoji reactions (both standard emoji and custom emoji count)
   const newEmojis = (r.new_reaction || [])
     .filter((x) => x && x.type === 'emoji' && x.emoji)
     .map((x) => x.emoji);
-  if (!newEmojis.length) {
+  const newCustomCount = (r.new_reaction || [])
+    .filter((x) => x && x.type === 'custom_emoji').length;
+
+  if (!newEmojis.length && !newCustomCount) {
     await logReactionUpdate(env, r, 'skip:removal');
     return false;
   }
 
-  // Look up the target — try null-threadId first (regular groups)
-  let target = await lookupChatTarget(env, r.chat.id, null, messageId);
+  const emojiDisplay = newEmojis.length
+    ? newEmojis.join(' ')
+    : `[${newCustomCount} custom emoji]`;
 
-  // Fallback: scan index for any threadId under this chat
+  // ---- LOOKUP (with retries for KV eventual consistency) ----
+  const target = await lookupChatTargetWithRetry(env, r.chat.id, messageId);
+
   if (!target) {
+    // Extra diagnostics: show how many entries are indexed for this chat
     const idx = await readChatTargetIndex(env);
-    const prefix = `${r.chat.id}:`;
-    const suffix = `:${messageId}`;
-    for (const k of Object.keys(idx)) {
-      if (k.startsWith(prefix) && k.endsWith(suffix)) {
-        target = idx[k];
-        break;
-      }
-    }
-  }
-
-  if (!target) {
-    await logReactionUpdate(env, r, 'miss:not-tracked');
+    const keysForChat = Object.keys(idx).filter((k) =>
+      k.startsWith(`${r.chat.id}:`)
+    );
+    await logReactionUpdate(env, r, 'miss:not-tracked', {
+      indexKeysForChat: keysForChat.length,
+      sampleKeys: keysForChat.slice(0, 3),
+    });
     return false;
   }
 
@@ -1315,9 +1352,22 @@ async function handleTargetReaction(update, env) {
     : String(r.chat.id);
   const originalPreview = target.preview || '(بدون پیش‌نمایش)';
 
+  // Sender display — user, or actor_chat fallback for anonymous admins
+  let senderDisplay;
+  if (actorUser && !actorUser.is_bot) {
+    senderDisplay = formatSenderLink(actorUser);
+  } else if (actorChat) {
+    const name = actorChat.title || 'Anonymous';
+    senderDisplay = actorChat.username
+      ? `<a href="https://t.me/${htmlEsc(actorChat.username)}">${htmlEsc(name)}</a>`
+      : htmlEsc(name);
+  } else {
+    senderDisplay = 'Unknown';
+  }
+
   try {
     const headerText =
-      `${senderDisplay} reacted ${newEmojis.join(' ')} to this message:\n` +
+      `${senderDisplay} reacted ${emojiDisplay} to this message:\n` +
       `${originalPreview}\n\n` +
       `chat (${chatLoc})\n` +
       `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
@@ -1343,12 +1393,13 @@ async function handleTargetReaction(update, env) {
       });
     }
 
-    await logReactionUpdate(env, r, 'notified');
+    await logReactionUpdate(env, r, 'notified', { ownerMsgId });
     await logEvent(env, {
       ev: 'chat_target_reaction',
       targetChat: r.chat.id,
       targetMsgId: messageId,
       emojis: newEmojis,
+      customCount: newCustomCount,
     });
   } catch (e) {
     await logReactionUpdate(env, r, 'error:send:' + e.message);
@@ -2365,12 +2416,19 @@ export default {
         return new Response('OK', { status: 200 });
       }
       if (update.message_reaction) {
+        // Isolated dispatch: a failure in one handler must not block the other.
+        let handledByOwner = false;
         try {
-          if (!(await handleOwnerReaction(update, env))) {
-            await handleTargetReaction(update, env);
-          }
+          handledByOwner = await handleOwnerReaction(update, env);
         } catch (err) {
-          await reportError(env, 'fetch.reaction', err);
+          await reportError(env, 'fetch.ownerReaction', err);
+        }
+        if (!handledByOwner) {
+          try {
+            await handleTargetReaction(update, env);
+          } catch (err) {
+            await reportError(env, 'fetch.targetReaction', err);
+          }
         }
         return new Response('OK', { status: 200 });
       }
@@ -3212,29 +3270,192 @@ async function handleUpdate(update, env, origin) {
       return;
     }
 
-    case '/debugreactions': {
+    case '/setwebhook': {
       if (msg.from?.id !== OWNER_ID) return;
-      const log = await readReactionLog(env);
-      if (!log.length) {
+      try {
+        const workerUrl = origin.endsWith('/')
+          ? origin.slice(0, -1)
+          : origin;
+        const payload = {
+          url: workerUrl,
+          allowed_updates: [
+            'message',
+            'edited_message',
+            'channel_post',
+            'edited_channel_post',
+            'callback_query',
+            'message_reaction',
+          ],
+          drop_pending_updates: false,
+        };
+        const res = await fetch(
+          `https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!data.ok) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            `❌ setWebhook failed: ${data.description || 'unknown'}`,
+            threadId ?? undefined
+          );
+          return;
+        }
+        const info = await telegram(env.BOT_TOKEN, 'getWebhookInfo');
+        const r = info.result || {};
         await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
-          '📭 هیچ reaction update ثبت نشده.\n' +
-            'اگر انتظار داری اینجا چیزی باشه، یعنی updateها اصلاً به Worker نمی‌رسن — `allowed_updates` رو چک کن.',
+          '✅ Webhook updated\n' +
+            `url: ${r.url}\n` +
+            `allowed_updates: ${(r.allowed_updates || []).join(', ')}\n` +
+            `message_reaction: ${
+              (r.allowed_updates || []).includes('message_reaction') ? '✅' : '❌'
+            }`,
+          threadId ?? undefined,
+          { link_preview_options: { is_disabled: true } }
+        );
+      } catch (e) {
+        await reportError(env, 'setwebhook', e);
+      }
+      return;
+    }
+
+    case '/testreaction': {
+      if (msg.from?.id !== OWNER_ID) return;
+      // Manually trigger the notification pipeline for the most recently
+      // registered target message. Tells you whether the notify path works,
+      // independent of whether message_reaction updates are arriving.
+      const idx = await readChatTargetIndex(env);
+      const keys = Object.keys(idx);
+      if (!keys.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 chat:target_index is empty — no /chat-sent message has been tracked yet.\n\n' +
+            'Send `/chat chat N hello` first, then react to that message in the target chat.',
           threadId ?? undefined
         );
         return;
       }
-      const lines = [`🧪 *Last ${log.length} reaction updates:*`, ''];
+      // Pick the newest by `at`
+      keys.sort((a, b) => (idx[b].at || 0) - (idx[a].at || 0));
+      const newest = idx[keys[0]];
+      const chatLoc = newest.threadId
+        ? `${newest.chatId}/${newest.threadId}`
+        : String(newest.chatId);
+      const preview = newest.preview || '(بدون پیش‌نمایش)';
+      try {
+        const headerRes = await sendMessage(
+          env.BOT_TOKEN,
+          OWNER_ID,
+          `<b>Test reaction notification</b>\n` +
+            `chat (${chatLoc}) · msg ${newest.msgId}\n\n` +
+            `↩️ در پاسخ به:\n${preview}\n\n` +
+            `(This was triggered manually by /testreaction — no real user reacted.)`,
+          undefined,
+          { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+        );
+        const ownerMsgId = headerRes.result?.message_id;
+        if (ownerMsgId) {
+          await saveChatMapping(env, ownerMsgId, {
+            targetChatId: newest.chatId,
+            targetThreadId: newest.threadId ?? null,
+            targetMsgId: newest.msgId,
+            sourceChatId: newest.chatId,
+            sourceThreadId: newest.threadId ?? null,
+            sourceMsgId: newest.msgId,
+            isReactionNotify: true,
+          });
+        }
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '✅ Sent test notification to your DM.\n' +
+            'If you got it, the notify path works — the problem is elsewhere ' +
+            '(message_reaction updates not arriving, or lookup failing).',
+          threadId ?? undefined
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ Test failed: ${e.message}`,
+          threadId ?? undefined
+        );
+        await reportError(env, 'testreaction', e);
+      }
+      return;
+    }
+
+    case '/debugreactions': {
+      if (msg.from?.id !== OWNER_ID) return;
+      const log = await readReactionLog(env);
+      const info = await telegram(env.BOT_TOKEN, 'getWebhookInfo');
+      const r = info.result || {};
+      const allowed = Array.isArray(r.allowed_updates) ? r.allowed_updates : [];
+
+      const lines = ['🧪 *Reaction diagnostics*', ''];
+      lines.push('🪝 Webhook');
+      lines.push(
+        `  url: ${r.url ? '✅' : '❌'}  pending: ${r.pending_update_count ?? 0}`
+      );
+      lines.push(
+        `  message_reaction: ${
+          allowed.includes('message_reaction') ? '✅ enabled' : '❌ MISSING'
+        }`
+      );
+      if (!allowed.includes('message_reaction')) {
+        lines.push('  → run /setwebhook to fix');
+      }
+      lines.push('');
+
+      const idx = await readChatTargetIndex(env);
+      const idxKeys = Object.keys(idx);
+      lines.push('📇 chat:target_index');
+      lines.push(`  total entries: ${idxKeys.length}`);
+      if (idxKeys.length) {
+        idxKeys.sort((a, b) => (idx[b].at || 0) - (idx[a].at || 0));
+        const newest = idx[idxKeys[0]];
+        const ago = Math.round((Date.now() - (newest.at || 0)) / 1000);
+        lines.push(
+          `  newest: chat ${newest.chatId} msg ${newest.msgId} (${ago}s ago)`
+        );
+      } else {
+        lines.push('  (empty — /chat messages are not being tracked)');
+      }
+      lines.push('');
+
+      if (!log.length) {
+        lines.push('📭 No reaction updates received yet.');
+        lines.push('');
+        lines.push('If you just reacted and this is empty:');
+        lines.push('• /setwebhook');
+        lines.push('• Confirm the chat is a group/channel (not a private chat)');
+        lines.push('• Try /testreaction to verify the notify path independently');
+        await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
+          parse_mode: 'Markdown',
+          link_preview_options: { is_disabled: true },
+        });
+        return;
+      }
+
+      lines.push(`📊 Last ${Math.min(log.length, 20)} of ${log.length} updates:`);
       for (const e of log.slice(0, 20)) {
         const who = e.userId
-          ? `user ${e.userId}${e.userIsBot ? ' (bot)' : ''}`
+          ? `u${e.userId}${e.userIsBot ? '🤖' : ''}`
           : e.actorChatId
-            ? `actor chat ${e.actorChatId}`
-            : 'unknown';
+            ? `actor:${e.actorChatId}`
+            : '?';
         const emo = (e.newEmojis || []).join(' ') || '—';
+        const t = (e.t || '').slice(11, 19);
         lines.push(
-          `• \`${e.result}\` — chat ${e.chatId} msg ${e.messageId} · ${who} · ${emo}`
+          `• ${t} \`${e.result}\` · c${e.chatId} m${e.messageId} · ${who} · ${emo}`
         );
       }
       await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
@@ -4459,7 +4680,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
       lines.push('  /errors [N]  /clearerrors  (owner)');
-      lines.push('  /debugreactions  (owner)');
+      lines.push('  /debugreactions  /testreaction  /setwebhook  (owner)');
       lines.push('  /debugdollar  (owner)');
       lines.push('  /buttonlord @username <text>  (owner)');
       lines.push('  /editcounter <number>  (owner)');
