@@ -986,10 +986,70 @@ function formatSenderLink(from) {
   return htmlEsc(display);
 }
 
+// Short human-readable preview of any Telegram message.
+// Handles forwarded origin, text, caption, and common media types.
+function buildMessagePreview(m) {
+  if (!m) return '(بدون محتوا)';
+  const parts = [];
+
+  if (isForwardedMessage(m)) {
+    let from = 'ناشناس';
+    const o = m.forward_origin;
+    if (o) {
+      if (o.type === 'user' && o.sender_user) {
+        from = formatSenderLink(o.sender_user);
+      } else if (o.type === 'hidden_user') {
+        from = htmlEsc(o.sender_user_name || 'کاربر مخفی');
+      } else if (o.type === 'channel' && o.chat) {
+        from = htmlEsc(o.chat.title || 'کانال');
+      } else if (o.type === 'chat' && o.sender_chat) {
+        from = htmlEsc(o.sender_chat.title || 'چت');
+      }
+    } else if (m.forward_from) {
+      from = formatSenderLink(m.forward_from);
+    } else if (m.forward_from_chat) {
+      from = htmlEsc(m.forward_from_chat.title || 'کانال');
+    } else if (m.forward_sender_name) {
+      from = htmlEsc(m.forward_sender_name);
+    }
+    parts.push(`↪️ فوروارد از ${from}`);
+  }
+
+  if (m.text) {
+    const t = m.text.length > 200 ? m.text.slice(0, 200) + '…' : m.text;
+    parts.push(`«${htmlEsc(t)}»`);
+  } else if (m.caption) {
+    const c = m.caption.length > 200 ? m.caption.slice(0, 200) + '…' : m.caption;
+    parts.push(`«${htmlEsc(c)}»`);
+  }
+
+  if (!m.text) {
+    let type = '';
+    if (m.photo) type = '📷 عکس';
+    else if (m.video) type = '🎥 ویدیو';
+    else if (m.video_note) type = '📹 ویدیو نوت';
+    else if (m.document) type = '📄 فایل';
+    else if (m.audio) type = '🎵 صدا';
+    else if (m.voice) type = '🎤 ویس';
+    else if (m.animation) type = '🎞 گیف';
+    else if (m.sticker) {
+      type = m.sticker.emoji ? `🎨 استیکر ${m.sticker.emoji}` : '🎨 استیکر';
+    } else if (m.poll) type = '📊 نظرسنجی';
+    else if (m.contact) type = '👤 مخاطب';
+    else if (m.venue) type = '📌 مکان';
+    else if (m.location) type = '📍 موقعیت';
+    else if (m.dice) type = '🎲 تاس';
+    if (type) parts.push(type);
+  }
+
+  if (!parts.length) return '(بدون محتوا)';
+  return parts.join('\n');
+}
+
 // Handles replies made IN A TARGET CHAT to a tracked bot message.
 // Forwards the reply to OWNER_ID with the sender's full name hyperlinked
-// on top, and registers an owner-side mapping so the owner's reply can
-// travel back to the target chat.
+// on top, plus a preview of the message the user replied to. Registers an
+// owner-side mapping so the owner's reply can travel back to the target chat.
 async function handleTargetReply(msg, env) {
   // Skip owner's DM — that path is handled by handleOwnerReply
   if (msg.chat.id === OWNER_ID) return false;
@@ -1014,6 +1074,7 @@ async function handleTargetReply(msg, env) {
     ? `${msg.chat.id}/${threadId}`
     : String(msg.chat.id);
   const senderLink = formatSenderLink(msg.from);
+  const originalPreview = buildMessagePreview(replyTo);
 
   try {
     let ownerMsgId = null;
@@ -1022,7 +1083,8 @@ async function handleTargetReply(msg, env) {
       const notification =
         `${senderLink}\n` +
         `📩 پاسخ در chat (${chatLoc})\n\n` +
-        `${htmlEsc(msg.text)}\n\n` +
+        `↩️ در پاسخ به:\n${originalPreview}\n\n` +
+        `💬 پاسخ:\n${htmlEsc(msg.text)}\n\n` +
         `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
       const res = await sendMessage(
         env.BOT_TOKEN,
@@ -1040,8 +1102,9 @@ async function handleTargetReply(msg, env) {
         env.BOT_TOKEN,
         OWNER_ID,
         `${senderLink}\n` +
-          `📩 پاسخ در chat (${chatLoc})\n` +
-          `↩️ روی پیام بعدی (کپی محتوا) ریپلای کن تا جوابت به همون چت بره.`,
+          `📩 پاسخ در chat (${chatLoc})\n\n` +
+          `↩️ در پاسخ به:\n${originalPreview}\n\n` +
+          `👇 روی پیام بعدی (کپی محتوا) ریپلای کن تا جوابت به همون چت بره.`,
         undefined,
         {
           parse_mode: 'HTML',
@@ -4333,4 +4396,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-  }
+}
