@@ -1160,6 +1160,120 @@ async function handleTargetReply(msg, env) {
   return true;
 }
 
+// Fires when the OWNER reacts to a notification message in their DM.
+// Looks up the target message via chat:map and mirrors the reaction.
+async function handleOwnerReaction(update, env) {
+  const r = update.message_reaction;
+  if (!r) return false;
+  if (r.chat?.id !== OWNER_ID) return false;
+  if (r.user?.id !== OWNER_ID) return false;
+
+  const mapping = await getChatMapping(env, r.message_id);
+  if (!mapping) return false;
+
+  const emojis = (r.new_reaction || [])
+    .filter((x) => x && x.type === 'emoji' && x.emoji)
+    .map((x) => x.emoji);
+
+  try {
+    await setMessageReaction(
+      env.BOT_TOKEN,
+      mapping.targetChatId,
+      mapping.targetMsgId,
+      emojis
+    );
+    await logEvent(env, {
+      ev: 'chat_reaction_mirror',
+      targetChat: mapping.targetChatId,
+      targetMsgId: mapping.targetMsgId,
+      emojis,
+    });
+  } catch (e) {
+    await reportError(env, 'chat.ownerReaction', e, {
+      targetChat: mapping.targetChatId,
+      emojis,
+    });
+  }
+  return true;
+}
+
+// Fires when someone reacts IN A TARGET CHAT to a tracked bot message.
+// Notifies OWNER_ID with "(sender) reacted <emoji> to this message:" plus a
+// preview, and registers a chat:map entry so the owner's reply routes back.
+async function handleTargetReaction(update, env) {
+  const r = update.message_reaction;
+  if (!r) return false;
+  if (r.chat?.id === OWNER_ID) return false;
+  if (r.user?.id === OWNER_ID) return false;
+  if (r.user?.is_bot) return false;
+
+  const threadId = r.message_thread_id ?? null;
+  const target = await lookupChatTarget(
+    env,
+    r.chat.id,
+    threadId,
+    r.message_id
+  );
+  if (!target) return false;
+
+  const newEmojis = (r.new_reaction || [])
+    .filter((x) => x && x.type === 'emoji' && x.emoji)
+    .map((x) => x.emoji);
+
+  // Ignore pure removals — only notify on added/changed reactions
+  if (!newEmojis.length) return false;
+
+  const chatLoc = threadId
+    ? `${r.chat.id}/${threadId}`
+    : String(r.chat.id);
+  const senderLink = formatSenderLink(r.user);
+  const originalPreview = target.preview || '(بدون پیش‌نمایش)';
+
+  try {
+    const headerText =
+      `${senderLink} reacted ${newEmojis.join(' ')} to this message:\n` +
+      `${originalPreview}\n\n` +
+      `chat (${chatLoc})\n` +
+      `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
+
+    const headerRes = await sendMessage(
+      env.BOT_TOKEN,
+      OWNER_ID,
+      headerText,
+      undefined,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      }
+    );
+    const ownerMsgId = headerRes.result?.message_id;
+
+    if (ownerMsgId) {
+      await saveChatMapping(env, ownerMsgId, {
+        targetChatId: r.chat.id,
+        targetThreadId: threadId,
+        targetMsgId: r.message_id,
+        sourceChatId: r.chat.id,
+        sourceThreadId: threadId,
+        sourceMsgId: r.message_id,
+        isReactionNotify: true,
+      });
+    }
+
+    await logEvent(env, {
+      ev: 'chat_target_reaction',
+      targetChat: r.chat.id,
+      targetMsgId: r.message_id,
+      emojis: newEmojis,
+    });
+  } catch (e) {
+    await reportError(env, 'handleTargetReaction', e, {
+      targetChat: r.chat.id,
+    });
+  }
+  return true;
+}
+
 // Owner replies to a notification in DM — routes back to the target chat.
 async function handleOwnerReply(msg, env) {
   if (msg.chat.id !== OWNER_ID) return false;
@@ -1212,12 +1326,15 @@ async function handleOwnerReply(msg, env) {
     }
 
     if (newTargetMsgId) {
+      const preview = msg.text
+        ? `«${msg.text.slice(0, 200)}${msg.text.length > 200 ? '…' : ''}»`
+        : buildMessagePreview(msg);
       await registerChatTarget(
         env,
         mapping.targetChatId,
         mapping.targetThreadId,
         newTargetMsgId,
-        { ownerReply: true }
+        { ownerReply: true, preview }
       );
     }
 
@@ -2162,6 +2279,16 @@ export default {
         }
         return new Response('OK', { status: 200 });
       }
+      if (update.message_reaction) {
+        try {
+          if (!(await handleOwnerReaction(update, env))) {
+            await handleTargetReaction(update, env);
+          }
+        } catch (err) {
+          await reportError(env, 'fetch.reaction', err);
+        }
+        return new Response('OK', { status: 200 });
+      }
       const msg = update.message || update.channel_post;
       try {
         if (msg?.from && msg.from.username) {
@@ -2945,15 +3072,19 @@ async function handleUpdate(update, env, origin) {
         return;
       }
 
-      // Register the sent target message so replies in the target chat
-      // get bridged back to OWNER_ID.
+      // Register the sent target message so replies/reactions in the target
+      // chat get bridged back to OWNER_ID. Store a preview for later use in
+      // reaction notifications.
       if (targetMsgId) {
+        const preview = reply
+          ? buildMessagePreview(reply)
+          : `«${textContent.slice(0, 200)}${textContent.length > 200 ? '…' : ''}»`;
         await registerChatTarget(
           env,
           target.chatId,
           target.threadId,
           targetMsgId,
-          { fromChatCmd: true }
+          { fromChatCmd: true, preview }
         );
       }
 
@@ -4163,6 +4294,17 @@ async function handleUpdate(update, env, origin) {
         const r = info.result || {};
         lines.push(`  url: ${r.url ? '✅ set' : '❌'}`);
         lines.push(`  pending: ${r.pending_update_count ?? 0}`);
+        const allowed = Array.isArray(r.allowed_updates) ? r.allowed_updates : [];
+        lines.push(
+          `  allowed_updates: ${
+            allowed.length ? allowed.join(',') : '(default)'
+          }`
+        );
+        if (allowed.length && !allowed.includes('message_reaction')) {
+          lines.push('  ⚠️ message_reaction NOT enabled — reactions won\'t bridge');
+        } else if (allowed.includes('message_reaction')) {
+          lines.push('  message_reaction: ✅');
+        }
         if (r.last_error_message) {
           lines.push(`  ⚠️ ${r.last_error_message}`);
         } else {
@@ -4178,6 +4320,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /serverdollar  /statusdollar');
       lines.push('  /json  /jsontest  /jsonend');
       lines.push('  /chat chat N <text> | reply + /chat chat N  (owner)');
+      lines.push('  reply + react (in target) → notif  ·  react on notif → mirrors');
       lines.push('  /hourstart @username | /hourstart any text  /hourend [force]');
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
@@ -4320,6 +4463,29 @@ async function forwardMessage(token, chatId, fromChatId, messageId, threadId) {
   return data;
 }
 
+async function setMessageReaction(token, chatId, messageId, emojis) {
+  const body = {
+    chat_id: chatId,
+    message_id: messageId,
+    reaction: (emojis || []).map((emoji) => ({ type: 'emoji', emoji })),
+  };
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/setMessageReaction`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `setMessageReaction ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
 async function editMessageText(token, chatId, messageId, text, extra = {}) {
   const res = await fetch(
     `https://api.telegram.org/bot${token}/editMessageText`,
@@ -4396,4 +4562,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-}
+  }
