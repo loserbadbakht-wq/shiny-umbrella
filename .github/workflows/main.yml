@@ -36,7 +36,33 @@ jobs:
       - name: Set Webhook
         run: |
           WORKER_URL="https://shiny-scam.${{ secrets.CLOUDFLARE_USERNAME }}.workers.dev"
-          curl -X POST "https://api.telegram.org/bot${{ secrets.SIX_BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
+          curl -sS -f -X POST "https://api.telegram.org/bot${{ secrets.SIX_BOT_TOKEN }}/setWebhook" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"url\": \"${WORKER_URL}\",
+              \"allowed_updates\": [
+                \"message\",
+                \"edited_message\",
+                \"channel_post\",
+                \"edited_channel_post\",
+                \"callback_query\",
+                \"message_reaction\"
+              ],
+              \"drop_pending_updates\": false
+            }"
+          echo ""
+      
+      - name: Verify Webhook
+        run: |
+          INFO=$(curl -sS -f "https://api.telegram.org/bot${{ secrets.SIX_BOT_TOKEN }}/getWebhookInfo")
+          echo "$INFO"
+          echo ""
+          if echo "$INFO" | grep -q '"message_reaction"'; then
+            echo "✅ message_reaction is enabled"
+          else
+            echo "❌ message_reaction is NOT in allowed_updates"
+            exit 1
+          fi
       
       - name: Verify Deployment
         run: |
