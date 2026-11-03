@@ -1303,6 +1303,9 @@ async function handleTargetReaction(update, env) {
   return true;
 }
 
+// Owner replies to a notification in DM — routes back to the target chat.
+// The confirmation message itself is tracked in chat:map so that replying
+// or reacting to the confirmation continues the bridge.
 async function handleOwnerReply(msg, env) {
   if (msg.chat.id !== OWNER_ID) return false;
   if (msg.text && msg.text.startsWith('/')) return false;
@@ -1315,6 +1318,10 @@ async function handleOwnerReply(msg, env) {
   const isMedia =
     msg.photo || msg.video || msg.document || msg.audio ||
     msg.voice || msg.sticker || msg.animation || msg.video_note;
+
+  const preview = msg.text
+    ? `«${htmlEsc(msg.text.slice(0, 200))}${msg.text.length > 200 ? '…' : ''}»`
+    : buildMessagePreview(msg);
 
   try {
     let newTargetMsgId = null;
@@ -1354,9 +1361,6 @@ async function handleOwnerReply(msg, env) {
     }
 
     if (newTargetMsgId) {
-      const preview = msg.text
-        ? `«${msg.text.slice(0, 200)}${msg.text.length > 200 ? '…' : ''}»`
-        : buildMessagePreview(msg);
       await registerChatTarget(
         env,
         mapping.targetChatId,
@@ -1366,11 +1370,32 @@ async function handleOwnerReply(msg, env) {
       );
     }
 
-    await sendMessage(
+    const effectiveTargetMsgId = newTargetMsgId || mapping.targetMsgId;
+
+    // Confirmation to owner — includes a preview and is itself tracked so
+    // replying / reacting to the confirmation keeps the bridge alive.
+    const confirmRes = await sendMessage(
       env.BOT_TOKEN,
       OWNER_ID,
-      `✅ پاسخ شما به chat ${mapping.targetChatId} ارسال شد.`
+      `✅ پاسخ شما به chat ${mapping.targetChatId} ارسال شد.\n\n` +
+        `↩️ پیام ارسال‌شده:\n${preview || '(بدون محتوا)'}\n\n` +
+        `💡 روی همین پیام ریپلای کن یا ری‌اکشن بزن تا ادامه‌ی گفتگو به همون چت بره.`,
+      undefined,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
+    const confirmMsgId = confirmRes.result?.message_id;
+
+    if (confirmMsgId) {
+      await saveChatMapping(env, confirmMsgId, {
+        targetChatId: mapping.targetChatId,
+        targetThreadId: mapping.targetThreadId,
+        targetMsgId: effectiveTargetMsgId,
+        sourceChatId: mapping.sourceChatId,
+        sourceThreadId: mapping.sourceThreadId,
+        sourceMsgId: mapping.sourceMsgId,
+        isConfirmation: true,
+      });
+    }
 
     await logEvent(env, {
       ev: 'chat_owner_reply',
@@ -4767,4 +4792,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-}
+  }
