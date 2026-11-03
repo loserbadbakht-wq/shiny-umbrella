@@ -101,6 +101,16 @@ function htmlEsc(s) {
   );
 }
 
+// Safe text slice that never splits surrogate pairs (emojis).
+function safeSlice(s, max) {
+  if (typeof s !== 'string') return '';
+  if (s.length <= max) return s;
+  let end = max;
+  const code = s.charCodeAt(end - 1);
+  if (code >= 0xD800 && code <= 0xDBFF) end -= 1; // high surrogate at end
+  return s.slice(0, end) + '…';
+}
+
 // ============= CONDITIONAL KV WRITE =============
 async function writeIfChanged(env, key, data, options = {}) {
   const newRaw = encryptData(data, env.DB_ENCRYPTION_KEY);
@@ -883,7 +893,7 @@ async function lookupUsername(env, username) {
   }
 }
 
-// ============= BOT INFO (always fresh) =============
+// ============= BOT INFO =============
 async function getBotInfo(env) {
   try {
     const res = await telegram(env.BOT_TOKEN, 'getMe');
@@ -1175,11 +1185,9 @@ function buildMessagePreview(m) {
   }
 
   if (m.text) {
-    const t = m.text.length > 200 ? m.text.slice(0, 200) + '…' : m.text;
-    parts.push(`«${htmlEsc(t)}»`);
+    parts.push(`«${htmlEsc(safeSlice(m.text, 200))}»`);
   } else if (m.caption) {
-    const c = m.caption.length > 200 ? m.caption.slice(0, 200) + '…' : m.caption;
-    parts.push(`«${htmlEsc(c)}»`);
+    parts.push(`«${htmlEsc(safeSlice(m.caption, 200))}»`);
   }
 
   if (!m.text) {
@@ -1206,12 +1214,8 @@ function buildMessagePreview(m) {
 }
 
 // ============= COMMAND NOTIFIER =============
-// Sends a DM to owner whenever ANYONE (including owner and bots) uses a
-// command in a GROUP / CHANNEL / TOPIC. Skips all DMs entirely.
 async function handleCommandNotify(msg, env, cmd) {
   if (!msg || !cmd) return false;
-
-  // Skip any DM — command notifications only make sense in groups/channels
   if (msg.chat.type === 'private') return false;
 
   const threadId = topicOf(msg) ?? null;
@@ -1227,9 +1231,7 @@ async function handleCommandNotify(msg, env, cmd) {
         : htmlEsc(msg.sender_chat.title || 'Channel'))
       : 'Unknown';
 
-  const textPreview = msg.text.length > 500
-    ? msg.text.slice(0, 500) + '…'
-    : msg.text;
+  const textPreview = safeSlice(msg.text, 500);
 
   try {
     const notification =
@@ -1273,10 +1275,8 @@ async function handleCommandNotify(msg, env, cmd) {
 // ============= MENTION HANDLER =============
 async function handleMention(msg, env, botInfo) {
   if (!msg || !botInfo) return false;
-
   if (msg.from?.id === botInfo.id) return false;
   if (msg.sender_chat?.id === botInfo.id) return false;
-
   if (!messageMentionsBot(msg, botInfo)) return false;
 
   const threadId = topicOf(msg) ?? null;
@@ -1309,12 +1309,11 @@ async function handleMention(msg, env, botInfo) {
     let headerId = null;
 
     if (msg.text) {
-      const t = msg.text.length > 500 ? msg.text.slice(0, 500) + '…' : msg.text;
       const text =
         `${senderLink}\n` +
         `📣 منشن در chat (${chatLoc})\n\n` +
         replyContext +
-        `💬 پیام:\n«${htmlEsc(t)}»\n\n` +
+        `💬 پیام:\n«${htmlEsc(safeSlice(msg.text, 500))}»\n\n` +
         `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
       const res = await sendMessage(
         env.BOT_TOKEN, OWNER_ID, text, undefined,
@@ -1323,7 +1322,7 @@ async function handleMention(msg, env, botInfo) {
       ownerMsgId = res.result?.message_id;
     } else {
       const capPreview = msg.caption
-        ? `«${htmlEsc(msg.caption.length > 500 ? msg.caption.slice(0, 500) + '…' : msg.caption)}»`
+        ? `«${htmlEsc(safeSlice(msg.caption, 500))}»`
         : buildMessagePreview(msg);
       const headerText =
         `${senderLink}\n` +
@@ -1518,7 +1517,6 @@ async function handleOwnerReaction(update, env) {
 async function handleTargetReaction(update, env) {
   const r = update.message_reaction;
   if (!r) return false;
-
   if (r.chat?.id === OWNER_ID) return false;
 
   const actorUser = r.user || null;
@@ -1615,7 +1613,7 @@ async function handleOwnerReply(msg, env) {
     msg.voice || msg.sticker || msg.animation || msg.video_note;
 
   const preview = msg.text
-    ? `«${htmlEsc(msg.text.slice(0, 200))}${msg.text.length > 200 ? '…' : ''}»`
+    ? `«${htmlEsc(safeSlice(msg.text, 200))}»`
     : buildMessagePreview(msg);
 
   try {
@@ -3291,7 +3289,6 @@ async function handleUpdate(update, env, origin) {
 
       const rawArgs = msg.text.replace(/^\/chat(@\w+)?\s*/i, '').trim();
 
-      // ───────── 1. Empty → register current location ─────────
       if (!rawArgs) {
         const key = makeChatKey(msg.chat.id, threadId);
         const registry = await readChatRegistry(env);
@@ -3394,7 +3391,6 @@ async function handleUpdate(update, env, origin) {
         return;
       }
 
-      // ───────── 2. `/chat name <identifier> [<newName>]` ─────────
       const nameMatch = rawArgs.match(/^name\s+(\S+)(?:\s+([\s\S]+))?$/i);
       if (nameMatch) {
         const identifier = nameMatch[1];
@@ -3472,7 +3468,6 @@ async function handleUpdate(update, env, origin) {
         return;
       }
 
-      // ───────── 3. Legacy `/chat chat N [...]` (JSON targets) ─────────
       const chatNMatch = rawArgs.match(/^chat\s+(\d+)(?:\s+([\s\S]*))?$/i);
       if (chatNMatch) {
         const subs = await readJsonTargets(env);
@@ -3610,7 +3605,7 @@ async function handleUpdate(update, env, origin) {
         if (targetMsgId) {
           const preview = reply
             ? buildMessagePreview(reply)
-            : `«${htmlEsc(textContent.slice(0, 200))}${textContent.length > 200 ? '…' : ''}»`;
+            : `«${htmlEsc(safeSlice(textContent, 200))}»`;
           await registerChatTarget(
             env,
             target.chatId,
@@ -3622,7 +3617,7 @@ async function handleUpdate(update, env, origin) {
 
         const chatPreview = reply
           ? buildMessagePreview(reply)
-          : `«${htmlEsc(textContent.slice(0, 200))}${textContent.length > 200 ? '…' : ''}»`;
+          : `«${htmlEsc(safeSlice(textContent, 200))}»`;
         const confirmRes = await sendMessage(
           env.BOT_TOKEN,
           msg.chat.id,
@@ -3656,7 +3651,6 @@ async function handleUpdate(update, env, origin) {
         return;
       }
 
-      // ───────── 4. New `/chat <identifier> [<msg>]` ─────────
       const sendMatch = rawArgs.match(/^(\S+)(?:\s+([\s\S]*))?$/i);
       if (!sendMatch) return;
 
@@ -3760,7 +3754,7 @@ async function handleUpdate(update, env, origin) {
       if (targetMsgId) {
         const preview = reply
           ? buildMessagePreview(reply)
-          : `«${htmlEsc(textContent.slice(0, 200))}${textContent.length > 200 ? '…' : ''}»`;
+          : `«${htmlEsc(safeSlice(textContent, 200))}»`;
         await registerChatTarget(
           env,
           target.chatId,
@@ -3772,7 +3766,7 @@ async function handleUpdate(update, env, origin) {
 
       const chatPreview = reply
         ? buildMessagePreview(reply)
-        : `«${htmlEsc(textContent.slice(0, 200))}${textContent.length > 200 ? '…' : ''}»`;
+        : `«${htmlEsc(safeSlice(textContent, 200))}»`;
       const confirmRes = await sendMessage(
         env.BOT_TOKEN,
         msg.chat.id,
@@ -3894,7 +3888,10 @@ async function handleUpdate(update, env, origin) {
         const info = fresh?.result || {};
         lines.push('`getMe` (fresh):');
         lines.push(`  id: \`${info.id ?? 'undefined'}\``);
-        lines.push(`  username: ${info.username ? `\`@${info.username}\`` : '❌ missing'}`);
+        lines.push(
+          '  username: ' +
+            (info.username ? '`@' + info.username + '`' : '❌ missing')
+        );
       } catch (e) {
         lines.push(`❌ getMe failed: ${e.message}`);
       }
@@ -3903,7 +3900,13 @@ async function handleUpdate(update, env, origin) {
       try {
         const raw = await env.BOT_KV.get(BOT_INFO_KEY);
         lines.push('`bot:info` (cached):');
-        lines.push(raw ? `  \`${raw}\`` : '  (empty)');
+        if (raw) {
+          const truncated = safeSlice(raw, 120);
+          const safe = truncated.replace(/`/g, "'");
+          lines.push(`  \`${safe}\``);
+        } else {
+          lines.push('  (empty)');
+        }
       } catch (e) {
         lines.push(`❌ cache read failed: ${e.message}`);
       }
@@ -3944,8 +3947,9 @@ async function handleUpdate(update, env, origin) {
         lines.push('');
         lines.push('Mention entities:');
         for (const m of allMentions) {
+          const safeText = String(m.text || '').replace(/`/g, "'");
           lines.push(
-            `  • [${m.where}] type: \`${m.type}\` · text: \`${m.text}\`` +
+            `  • [${m.where}] type: \`${m.type}\` · text: \`${safeText}\`` +
               (m.user ? ` · user id: ${m.user}` : '')
           );
         }
@@ -3954,7 +3958,9 @@ async function handleUpdate(update, env, origin) {
         if (bi) {
           const match = messageMentionsBot(target, bi);
           lines.push('');
-          lines.push(`Match against \`@${bi.username}\` (id ${bi.id}): ${match ? '✅ YES' : '❌ NO'}`);
+          lines.push(
+            `Match against \`@${bi.username}\` (id ${bi.id}): ${match ? '✅ YES' : '❌ NO'}`
+          );
           if (!match) {
             lines.push('');
             lines.push("If NO: check that one of the entities equals your bot's current username.");
@@ -5426,6 +5432,9 @@ function isForwardedMessage(m) {
   return false;
 }
 
+// Sends a message. If a parse-mode is set and Telegram rejects the body due
+// to a "can't parse entities" error, retries once as plain text so the
+// message is not lost.
 async function sendMessage(token, chatId, text, threadId, extra = {}) {
   const body = { chat_id: chatId, text, ...extra };
   if (threadId) body.message_thread_id = threadId;
@@ -5436,9 +5445,36 @@ async function sendMessage(token, chatId, text, threadId, extra = {}) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) {
-    throw new Error(
-      `sendMessage ${res.status}: ${data.description || JSON.stringify(data)}`
-    );
+    const desc = data.description || JSON.stringify(data);
+    if (extra.parse_mode && /can't parse entities/i.test(desc)) {
+      console.warn(
+        `sendMessage: parse error with ${extra.parse_mode}, retrying plain.`
+      );
+      console.warn(
+        'Original text (first 500 chars):',
+        String(text).slice(0, 500)
+      );
+      const fallback = { ...body };
+      delete fallback.parse_mode;
+      const retryRes = await fetch(
+        `https://api.telegram.org/bot${token}/sendMessage`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fallback),
+        }
+      );
+      const retryData = await retryRes.json().catch(() => ({}));
+      if (!retryRes.ok || !retryData.ok) {
+        throw new Error(
+          `sendMessage (retry) ${retryRes.status}: ${
+            retryData.description || 'unknown'
+          }`
+        );
+      }
+      return retryData;
+    }
+    throw new Error(`sendMessage ${res.status}: ${desc}`);
   }
   return data;
 }
@@ -5477,9 +5513,30 @@ async function sendPhoto(token, chatId, photoUrl, caption, threadId, extra = {})
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) {
-    throw new Error(
-      `sendPhoto ${res.status}: ${data.description || JSON.stringify(data)}`
-    );
+    const desc = data.description || JSON.stringify(data);
+    if (extra.parse_mode && /can't parse entities/i.test(desc)) {
+      console.warn('sendPhoto: parse error, retrying plain.');
+      const fallback = { ...body };
+      delete fallback.parse_mode;
+      const retryRes = await fetch(
+        `https://api.telegram.org/bot${token}/sendPhoto`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fallback),
+        }
+      );
+      const retryData = await retryRes.json().catch(() => ({}));
+      if (!retryRes.ok || !retryData.ok) {
+        throw new Error(
+          `sendPhoto (retry) ${retryRes.status}: ${
+            retryData.description || 'unknown'
+          }`
+        );
+      }
+      return retryData;
+    }
+    throw new Error(`sendPhoto ${res.status}: ${desc}`);
   }
   return data;
 }
@@ -5632,4 +5689,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-}
+  }
