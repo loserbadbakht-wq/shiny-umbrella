@@ -26,7 +26,6 @@ const UNAME_INDEX_KEY = 'uname:index';
 const ERRORS_KEY = 'errors:recent';
 const BOT_INFO_KEY = 'bot:info';
 
-// Server monitor
 const SERVER_HOST = 'deepvalley-ZLKV.aternos.me';
 const SERVER_PORT = 25565;
 const SERVER_TARGETS_KEY = 'server:targets';
@@ -37,7 +36,6 @@ const STATUS_MSG_ONLINE  = `${RLM}سرور ماینکرفت آقا سگه اون
 const STATUS_MSG_OFFLINE = `${RLM}سرور ماینکرفت آقا سگه اونی-چان <b>آفلاین🔴</b> هست`;
 const STATUS_MSG_UNKNOWN = `${RLM}❓ وضعیت سرور ماینکرفت آقا سگه اونی-چان در دسترس نیست (پینگ پاسخگو نیست)`;
 
-// Dollar monitor
 const NAVASAN_URL =
   'https://www.navasan.net/dayRates.php?item=usd_sell';
 const DOLLAR_TARGETS_KEY = 'dollar:targets';
@@ -46,15 +44,12 @@ const DOLLAR_STEP_TOMAN = 10000;
 const DOLLAR_RETRIES = 4;
 const DOLLAR_RETRY_DELAY = 2000;
 
-// JSON article feeds
 const JSON_TARGETS_KEY = 'json:targets';
 
-// Chat bridge
 const CHAT_MAP_KEY = 'chat:map';
 const CHAT_TARGET_INDEX_KEY = 'chat:target_index';
 const CHAT_REGISTRY_KEY = 'chat:registry';
 
-// Retries
 const SERVER_RETRIES = 3;
 const SERVER_RETRY_DELAY = 1500;
 const SERVER_TIMEOUT = 8000;
@@ -888,32 +883,43 @@ async function lookupUsername(env, username) {
   }
 }
 
-// ============= BOT INFO CACHE =============
+// ============= BOT INFO (always fresh) =============
 async function getBotInfo(env) {
+  // Always fetch fresh — stale cache is the #1 cause of mention failures.
+  // KV is only a fallback when getMe itself is unreachable.
   try {
-    const raw = await env.BOT_KV.get(BOT_INFO_KEY, { cacheTtl: 3600 });
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.id && parsed.username) return parsed;
-      } catch { /* fall through */ }
-    }
     const res = await telegram(env.BOT_TOKEN, 'getMe');
     const info = res?.result || {};
-    if (info.id && info.username) {
+    if (info.id && typeof info.username === 'string' && info.username) {
       const stored = { id: info.id, username: info.username };
       try {
-        await env.BOT_KV.put(BOT_INFO_KEY, JSON.stringify(stored), {
-          expirationTtl: 3600,
-        });
+        await env.BOT_KV.put(
+          BOT_INFO_KEY,
+          JSON.stringify(stored),
+          { expirationTtl: 86400 }
+        );
       } catch { /* ignore */ }
       return stored;
     }
-    return null;
+    console.error('getMe returned invalid info:', JSON.stringify(info));
   } catch (e) {
-    console.error('getBotInfo failed:', e.message);
-    return null;
+    console.error('getBotInfo: getMe failed:', e.message);
   }
+  try {
+    const raw = await env.BOT_KV.get(BOT_INFO_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        parsed.id &&
+        typeof parsed.username === 'string' &&
+        parsed.username
+      ) {
+        return parsed;
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
 function hasPotentialMention(msg) {
@@ -927,16 +933,21 @@ function hasPotentialMention(msg) {
 
 function messageMentionsBot(msg, botInfo) {
   if (!msg || !botInfo) return false;
-  const uname = botInfo.username.toLowerCase();
+  if (typeof botInfo.username !== 'string' || !botInfo.username) {
+    console.error('messageMentionsBot: botInfo has no username');
+    return false;
+  }
+  const expected = `@${botInfo.username.toLowerCase()}`;
   const check = (text, entities) => {
-    if (!text || !entities) return false;
+    if (!text || !entities || !entities.length) return false;
     for (const e of entities) {
-      if (e.type === 'text_mention' && e.user?.id === botInfo.id) {
+      if (!e) continue;
+      if (e.type === 'text_mention' && e.user && e.user.id === botInfo.id) {
         return true;
       }
       if (e.type === 'mention') {
         const mentionText = text.slice(e.offset, e.offset + e.length);
-        if (mentionText.toLowerCase() === `@${uname}`) {
+        if (mentionText.toLowerCase() === expected) {
           return true;
         }
       }
@@ -1196,10 +1207,77 @@ function buildMessagePreview(m) {
   return parts.join('\n');
 }
 
+// ============= COMMAND NOTIFIER =============
+// Sends a DM to owner whenever ANYONE (including owner and bots) uses a
+// command in a chat where the bot is present. Skips only owner's own DM
+// (that's where the notifications go, so notifying there would be noise).
+async function handleCommandNotify(msg, env, cmd) {
+  if (!msg || !cmd) return false;
+
+  // Skip in owner's own DM — that IS the notification inbox
+  if (msg.chat.type === 'private' && msg.chat.id === OWNER_ID) return false;
+
+  const threadId = topicOf(msg) ?? null;
+  const chatLoc = threadId
+    ? `${msg.chat.id}/${threadId}`
+    : String(msg.chat.id);
+
+  const senderLink = msg.from
+    ? formatSenderLink(msg.from)
+    : msg.sender_chat
+      ? (msg.sender_chat.username
+        ? `<a href="https://t.me/${htmlEsc(msg.sender_chat.username)}">${htmlEsc(msg.sender_chat.title || 'Channel')}</a>`
+        : htmlEsc(msg.sender_chat.title || 'Channel'))
+      : 'Unknown';
+
+  const textPreview = msg.text.length > 500
+    ? msg.text.slice(0, 500) + '…'
+    : msg.text;
+
+  try {
+    const notification =
+      `${senderLink}\n` +
+      `⚙️ دستور \`${cmd}\` در chat (${chatLoc})\n\n` +
+      `💬 پیام:\n«${htmlEsc(textPreview)}»\n\n` +
+      `↩️ به همین پیام ریپلای کن یا ری‌اکشن بزن تا به همون چت بره.`;
+
+    const res = await sendMessage(
+      env.BOT_TOKEN,
+      OWNER_ID,
+      notification,
+      undefined,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+
+    const ownerMsgId = res.result?.message_id;
+    if (ownerMsgId) {
+      await saveChatMapping(env, ownerMsgId, {
+        targetChatId: msg.chat.id,
+        targetThreadId: threadId,
+        targetMsgId: msg.message_id,
+        sourceChatId: msg.chat.id,
+        sourceThreadId: threadId,
+        sourceMsgId: msg.message_id,
+        isCommandNotify: true,
+      });
+    }
+
+    await logEvent(env, {
+      ev: 'command_notify',
+      chat: msg.chat.id,
+      cmd,
+    });
+  } catch (e) {
+    console.error('handleCommandNotify failed:', e.message);
+  }
+  return true;
+}
+
 // ============= MENTION HANDLER =============
 async function handleMention(msg, env, botInfo) {
   if (!msg || !botInfo) return false;
 
+  // Skip only bot's own messages (prevents infinite loop)
   if (msg.from?.id === botInfo.id) return false;
   if (msg.sender_chat?.id === botInfo.id) return false;
 
@@ -1298,6 +1376,7 @@ async function handleMention(msg, env, botInfo) {
 
 async function handleTargetReply(msg, env) {
   if (msg.chat.id === OWNER_ID) return false;
+  if (msg.text && msg.text.startsWith('/')) return false;
   const replyTo = msg.reply_to_message;
   if (!replyTo) return false;
   if (!replyTo.from?.is_bot) return false;
@@ -2819,7 +2898,17 @@ async function handleUpdate(update, env, origin) {
   if (hasPotentialMention(msg)) {
     try {
       const botInfo = await getBotInfo(env);
-      if (await handleMention(msg, env, botInfo)) return;
+      if (!botInfo) {
+        console.warn('Mention detected but no botInfo available. chat:', msg.chat.id);
+      } else {
+        const matched = await handleMention(msg, env, botInfo);
+        if (matched) return;
+        console.warn(
+          'Mention detected but not matched. chat:', msg.chat.id,
+          'expected @' + botInfo.username,
+          'entities:', JSON.stringify(msg.entities || msg.caption_entities)
+        );
+      }
     } catch (e) {
       await reportError(env, 'handleMention', e);
     }
@@ -2843,6 +2932,14 @@ async function handleUpdate(update, env, origin) {
   const cmd = parseCommand(msg.text);
   if (!cmd) return;
   if (!env.BOT_TOKEN) return;
+
+  // 3) Notify owner about command usage — runs for any user, including
+  //    owner and bots. Skips only owner's own DM (that IS the inbox).
+  try {
+    await handleCommandNotify(msg, env, cmd);
+  } catch (e) {
+    console.error('handleCommandNotify failed:', e.message);
+  }
 
   const threadId = topicOf(msg) ?? null;
   const where = !threadId
@@ -3789,6 +3886,116 @@ async function handleUpdate(update, env, origin) {
         { parse_mode: 'Markdown' }
       );
       await logEvent(env, { ev: 'chat_unregister', key });
+      return;
+    }
+
+    case '/debugmention': {
+      if (msg.from?.id !== OWNER_ID) return;
+      const lines = ['🔍 *Mention diagnostics*', ''];
+
+      try {
+        const fresh = await telegram(env.BOT_TOKEN, 'getMe');
+        const info = fresh?.result || {};
+        lines.push('`getMe` (fresh):');
+        lines.push(`  id: \`${info.id ?? 'undefined'}\``);
+        lines.push(`  username: ${info.username ? `\`@${info.username}\`` : '❌ missing'}`);
+      } catch (e) {
+        lines.push(`❌ getMe failed: ${e.message}`);
+      }
+      lines.push('');
+
+      try {
+        const raw = await env.BOT_KV.get(BOT_INFO_KEY);
+        lines.push('`bot:info` (cached):');
+        lines.push(raw ? `  \`${raw}\`` : '  (empty)');
+      } catch (e) {
+        lines.push(`❌ cache read failed: ${e.message}`);
+      }
+      lines.push('');
+
+      const target = msg.reply_to_message || msg;
+      const ents = target.entities || [];
+      const capEnts = target.caption_entities || [];
+      lines.push('Message being checked:');
+      lines.push(`  ${target === msg ? '(this command)' : '(reply)'}`);
+      lines.push(`  has text: ${!!target.text}`);
+      lines.push(`  has caption: ${!!target.caption}`);
+      lines.push(`  entities: ${ents.length}`);
+      lines.push(`  caption_entities: ${capEnts.length}`);
+
+      const allMentions = [];
+      for (const e of ents) {
+        if (e.type === 'mention' || e.type === 'text_mention') {
+          const t = target.text
+            ? target.text.slice(e.offset, e.offset + e.length)
+            : '';
+          allMentions.push({ where: 'text', type: e.type, text: t, user: e.user?.id });
+        }
+      }
+      for (const e of capEnts) {
+        if (e.type === 'mention' || e.type === 'text_mention') {
+          const t = target.caption
+            ? target.caption.slice(e.offset, e.offset + e.length)
+            : '';
+          allMentions.push({ where: 'caption', type: e.type, text: t, user: e.user?.id });
+        }
+      }
+
+      if (!allMentions.length) {
+        lines.push('');
+        lines.push('❌ No mention entities found in the checked message.');
+      } else {
+        lines.push('');
+        lines.push('Mention entities:');
+        for (const m of allMentions) {
+          lines.push(
+            `  • [${m.where}] type: \`${m.type}\` · text: \`${m.text}\`` +
+              (m.user ? ` · user id: ${m.user}` : '')
+          );
+        }
+
+        const bi = await getBotInfo(env);
+        if (bi) {
+          const match = messageMentionsBot(target, bi);
+          lines.push('');
+          lines.push(`Match against \`@${bi.username}\` (id ${bi.id}): ${match ? '✅ YES' : '❌ NO'}`);
+          if (!match) {
+            lines.push('');
+            lines.push('If NO: check that one of the entities equals your bot\\'s current username.');
+            lines.push('Run `/clearbotinfo` to force fresh cache, then retry.');
+          }
+        } else {
+          lines.push('');
+          lines.push('❌ Could not fetch botInfo');
+        }
+      }
+
+      await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
+        parse_mode: 'Markdown',
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
+
+    case '/clearbotinfo': {
+      if (msg.from?.id !== OWNER_ID) return;
+      try {
+        await env.BOT_KV.delete(BOT_INFO_KEY);
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '🗑 `bot:info` cache cleared. Next mention will use fresh `getMe`.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ ${e.message}`,
+          threadId ?? undefined
+        );
+      }
       return;
     }
 
@@ -5191,7 +5398,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
       lines.push('  /errors [N]  /clearerrors  (owner)');
-      lines.push('  /testreaction  /setwebhook  /dumpkv  (owner)');
+      lines.push('  /testreaction  /setwebhook  /dumpkv  /debugmention  /clearbotinfo  (owner)');
       lines.push('  /debugdollar  (owner)');
       lines.push('  /buttonlord @username <text>  (owner)');
       lines.push('  /editcounter <number>  (owner)');
@@ -5429,4 +5636,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-  }
+}
