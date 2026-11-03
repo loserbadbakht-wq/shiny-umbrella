@@ -885,8 +885,6 @@ async function lookupUsername(env, username) {
 
 // ============= BOT INFO (always fresh) =============
 async function getBotInfo(env) {
-  // Always fetch fresh — stale cache is the #1 cause of mention failures.
-  // KV is only a fallback when getMe itself is unreachable.
   try {
     const res = await telegram(env.BOT_TOKEN, 'getMe');
     const info = res?.result || {};
@@ -1209,13 +1207,12 @@ function buildMessagePreview(m) {
 
 // ============= COMMAND NOTIFIER =============
 // Sends a DM to owner whenever ANYONE (including owner and bots) uses a
-// command in a chat where the bot is present. Skips only owner's own DM
-// (that's where the notifications go, so notifying there would be noise).
+// command in a GROUP / CHANNEL / TOPIC. Skips all DMs entirely.
 async function handleCommandNotify(msg, env, cmd) {
   if (!msg || !cmd) return false;
 
-  // Skip in owner's own DM — that IS the notification inbox
-  if (msg.chat.type === 'private' && msg.chat.id === OWNER_ID) return false;
+  // Skip any DM — command notifications only make sense in groups/channels
+  if (msg.chat.type === 'private') return false;
 
   const threadId = topicOf(msg) ?? null;
   const chatLoc = threadId
@@ -1277,7 +1274,6 @@ async function handleCommandNotify(msg, env, cmd) {
 async function handleMention(msg, env, botInfo) {
   if (!msg || !botInfo) return false;
 
-  // Skip only bot's own messages (prevents infinite loop)
   if (msg.from?.id === botInfo.id) return false;
   if (msg.sender_chat?.id === botInfo.id) return false;
 
@@ -2934,7 +2930,7 @@ async function handleUpdate(update, env, origin) {
   if (!env.BOT_TOKEN) return;
 
   // 3) Notify owner about command usage — runs for any user, including
-  //    owner and bots. Skips only owner's own DM (that IS the inbox).
+  //    owner and bots, but never in any DM.
   try {
     await handleCommandNotify(msg, env, cmd);
   } catch (e) {
@@ -3961,7 +3957,7 @@ async function handleUpdate(update, env, origin) {
           lines.push(`Match against \`@${bi.username}\` (id ${bi.id}): ${match ? '✅ YES' : '❌ NO'}`);
           if (!match) {
             lines.push('');
-            lines.push('If NO: check that one of the entities equals your bot\\'s current username.');
+            lines.push("If NO: check that one of the entities equals your bot's current username.");
             lines.push('Run `/clearbotinfo` to force fresh cache, then retry.');
           }
         } else {
