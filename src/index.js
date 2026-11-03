@@ -25,6 +25,7 @@ const HOUR_KEY = 'hour:targets';
 const UNAME_INDEX_KEY = 'uname:index';
 const ERRORS_KEY = 'errors:recent';
 const BOT_INFO_KEY = 'bot:info';
+const MENTION_LOG_KEY = 'mention:log';
 
 const SERVER_HOST = 'deepvalley-ZLKV.aternos.me';
 const SERVER_PORT = 25565;
@@ -101,13 +102,12 @@ function htmlEsc(s) {
   );
 }
 
-// Safe text slice that never splits surrogate pairs (emojis).
 function safeSlice(s, max) {
   if (typeof s !== 'string') return '';
   if (s.length <= max) return s;
   let end = max;
   const code = s.charCodeAt(end - 1);
-  if (code >= 0xD800 && code <= 0xDBFF) end -= 1; // high surrogate at end
+  if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
   return s.slice(0, end) + '…';
 }
 
@@ -173,6 +173,39 @@ async function reportError(env, where, err, extra = {}) {
 
   console.error(`[${entry.where}]`, entry.msg);
   if (entry.stack) console.error(entry.stack);
+}
+
+// ============= MENTION LOG =============
+async function logMention(env, entry) {
+  try {
+    const raw = await env.BOT_KV.get(MENTION_LOG_KEY);
+    let list = [];
+    if (raw) {
+      try {
+        list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(list)) list = [];
+      } catch { list = []; }
+    }
+    list.unshift({ t: new Date().toISOString(), ...entry });
+    list = list.slice(0, 20);
+    await env.BOT_KV.put(
+      MENTION_LOG_KEY,
+      encryptData(list, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('logMention failed:', e.message);
+  }
+}
+
+async function readMentionLog(env) {
+  try {
+    const raw = await env.BOT_KV.get(MENTION_LOG_KEY);
+    if (!raw) return [];
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
 }
 
 // ============= SERVER MONITOR =============
@@ -931,11 +964,12 @@ async function getBotInfo(env) {
 }
 
 function hasPotentialMention(msg) {
-  const e1 = msg.entities || [];
-  const e2 = msg.caption_entities || [];
+  if (!msg) return false;
+  const e1 = Array.isArray(msg.entities) ? msg.entities : [];
+  const e2 = Array.isArray(msg.caption_entities) ? msg.caption_entities : [];
   return (
-    e1.some((e) => e.type === 'mention' || e.type === 'text_mention') ||
-    e2.some((e) => e.type === 'mention' || e.type === 'text_mention')
+    e1.some((e) => e && (e.type === 'mention' || e.type === 'text_mention')) ||
+    e2.some((e) => e && (e.type === 'mention' || e.type === 'text_mention'))
   );
 }
 
@@ -1274,10 +1308,25 @@ async function handleCommandNotify(msg, env, cmd) {
 
 // ============= MENTION HANDLER =============
 async function handleMention(msg, env, botInfo) {
-  if (!msg || !botInfo) return false;
-  if (msg.from?.id === botInfo.id) return false;
-  if (msg.sender_chat?.id === botInfo.id) return false;
-  if (!messageMentionsBot(msg, botInfo)) return false;
+  if (!msg || !botInfo) {
+    await logMention(env, {
+      chatId: msg?.chat?.id ?? null,
+      result: 'early:no_msg_or_info',
+    });
+    return false;
+  }
+  if (msg.from?.id === botInfo.id) {
+    await logMention(env, { chatId: msg.chat.id, result: 'early:from_bot' });
+    return false;
+  }
+  if (msg.sender_chat?.id === botInfo.id) {
+    await logMention(env, { chatId: msg.chat.id, result: 'early:sender_bot' });
+    return false;
+  }
+  if (!messageMentionsBot(msg, botInfo)) {
+    await logMention(env, { chatId: msg.chat.id, result: 'early:no_match' });
+    return false;
+  }
 
   const threadId = topicOf(msg) ?? null;
   const chatLoc = threadId
@@ -1355,6 +1404,13 @@ async function handleMention(msg, env, botInfo) {
     if (headerId) await saveChatMapping(env, headerId, mapping);
     if (ownerMsgId) await saveChatMapping(env, ownerMsgId, mapping);
 
+    await logMention(env, {
+      chatId: msg.chat.id,
+      fromId: msg.from?.id ?? null,
+      result: 'sent',
+      ownerMsgId,
+      headerId,
+    });
     await logEvent(env, {
       ev: 'chat_mention',
       targetChat: msg.chat.id,
@@ -1362,6 +1418,11 @@ async function handleMention(msg, env, botInfo) {
       kind: msg.text ? 'text' : 'media',
     });
   } catch (e) {
+    await logMention(env, {
+      chatId: msg.chat.id,
+      fromId: msg.from?.id ?? null,
+      result: 'error:' + String(e.message || '').slice(0, 150),
+    });
     await reportError(env, 'handleMention', e, {
       targetChat: msg.chat.id,
     });
@@ -2888,7 +2949,6 @@ async function handleUpdate(update, env, origin) {
   const msg = update.message || update.channel_post;
   if (!msg) return;
 
-  // 0) Mentions — runs first so a mention of the bot always wins
   if (hasPotentialMention(msg)) {
     try {
       const botInfo = await getBotInfo(env);
@@ -2897,25 +2957,18 @@ async function handleUpdate(update, env, origin) {
       } else {
         const matched = await handleMention(msg, env, botInfo);
         if (matched) return;
-        console.warn(
-          'Mention detected but not matched. chat:', msg.chat.id,
-          'expected @' + botInfo.username,
-          'entities:', JSON.stringify(msg.entities || msg.caption_entities)
-        );
       }
     } catch (e) {
       await reportError(env, 'handleMention', e);
     }
   }
 
-  // 1) Replies made in a target chat to a /chat message → forward to owner
   try {
     if (await handleTargetReply(msg, env)) return;
   } catch (e) {
     await reportError(env, 'handleTargetReply', e);
   }
 
-  // 2) Owner replying in DM to a forwarded notification → route to target
   try {
     if (await handleOwnerReply(msg, env)) return;
   } catch (e) {
@@ -2927,8 +2980,6 @@ async function handleUpdate(update, env, origin) {
   if (!cmd) return;
   if (!env.BOT_TOKEN) return;
 
-  // 3) Notify owner about command usage — runs for any user, including
-  //    owner and bots, but never in any DM.
   try {
     await handleCommandNotify(msg, env, cmd);
   } catch (e) {
@@ -3972,6 +4023,76 @@ async function handleUpdate(update, env, origin) {
         }
       }
 
+      await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
+        parse_mode: 'Markdown',
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
+
+    case '/mentiontest': {
+      if (msg.from?.id !== OWNER_ID) return;
+
+      const target = msg.reply_to_message || msg;
+      const lines = ['🧪 *Mention test*', ''];
+
+      const bi = await getBotInfo(env);
+      if (!bi) {
+        lines.push('❌ botInfo unavailable');
+        await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, { parse_mode: 'Markdown' });
+        return;
+      }
+      lines.push(`Bot: \`@${bi.username}\` (id ${bi.id})`);
+      lines.push(`Chat: \`${target.chat.id}\` (${target.chat.type})`);
+      lines.push(`From: \`${target.from?.id ?? 'n/a'}\` (is_bot=${target.from?.is_bot ?? 'n/a'})`);
+      lines.push(`Thread: ${target.message_thread_id ?? '—'}`);
+      lines.push('');
+
+      const hp = hasPotentialMention(target);
+      lines.push(`hasPotentialMention: ${hp ? '✅' : '❌'}`);
+
+      const mm = messageMentionsBot(target, bi);
+      lines.push(`messageMentionsBot: ${mm ? '✅' : '❌'}`);
+      lines.push('');
+
+      let result;
+      try {
+        result = await handleMention(target, env, bi);
+      } catch (e) {
+        result = 'THREW: ' + e.message;
+        await reportError(env, 'mentiontest.manual', e);
+      }
+      lines.push(`handleMention: \`${result}\``);
+      lines.push('');
+      lines.push('Watch your DM. If a message arrived, sending works.');
+
+      await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
+        parse_mode: 'Markdown',
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
+
+    case '/mentionlog': {
+      if (msg.from?.id !== OWNER_ID) return;
+      const log = await readMentionLog(env);
+      if (!log.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 mention:log is empty — no mention attempts recorded yet.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const lines = [`🧪 *Last ${log.length} mention attempts*`, ''];
+      for (const e of log) {
+        const t = (e.t || '').slice(11, 19);
+        const chat = e.chatId != null ? String(e.chatId) : '—';
+        const from = e.fromId != null ? String(e.fromId) : '—';
+        const result = String(e.result || '?');
+        lines.push(`\`${t}\` c:${chat} f:${from} → ${result}`);
+      }
       await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
         parse_mode: 'Markdown',
         link_preview_options: { is_disabled: true },
@@ -5286,10 +5407,12 @@ async function handleUpdate(update, env, origin) {
           const tIdx = await readChatTargetIndex(env);
           const cMap = await readChatMap(env);
           const cReg = await readChatRegistry(env);
+          const mLog = await readMentionLog(env);
           lines.push('🌉 Chat bridge');
           lines.push(`  target msgs tracked: ${Object.keys(tIdx).length}`);
           lines.push(`  owner mappings: ${Object.keys(cMap).length}`);
           lines.push(`  registered chats: ${Object.keys(cReg).length}`);
+          lines.push(`  mention attempts: ${mLog.length}`);
           lines.push('');
         } catch (e) {
           lines.push(`🌉 Chat bridge ⚠️ ${e.message}`);
@@ -5400,7 +5523,7 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
       lines.push('  /errors [N]  /clearerrors  (owner)');
-      lines.push('  /testreaction  /setwebhook  /dumpkv  /debugmention  /clearbotinfo  (owner)');
+      lines.push('  /testreaction  /setwebhook  /dumpkv  /debugmention  /mentiontest  /mentionlog  /clearbotinfo  (owner)');
       lines.push('  /debugdollar  (owner)');
       lines.push('  /buttonlord @username <text>  (owner)');
       lines.push('  /editcounter <number>  (owner)');
@@ -5432,9 +5555,6 @@ function isForwardedMessage(m) {
   return false;
 }
 
-// Sends a message. If a parse-mode is set and Telegram rejects the body due
-// to a "can't parse entities" error, retries once as plain text so the
-// message is not lost.
 async function sendMessage(token, chatId, text, threadId, extra = {}) {
   const body = { chat_id: chatId, text, ...extra };
   if (threadId) body.message_thread_id = threadId;
@@ -5689,4 +5809,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-  }
+}
