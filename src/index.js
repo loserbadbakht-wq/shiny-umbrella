@@ -904,7 +904,7 @@ async function getBotInfo(env) {
       const stored = { id: info.id, username: info.username };
       try {
         await env.BOT_KV.put(BOT_INFO_KEY, JSON.stringify(stored), {
-          expirationTtl: 86400,
+          expirationTtl: 3600,
         });
       } catch { /* ignore */ }
       return stored;
@@ -917,8 +917,12 @@ async function getBotInfo(env) {
 }
 
 function hasPotentialMention(msg) {
-  const ents = msg.entities || msg.caption_entities || [];
-  return ents.some((e) => e.type === 'mention' || e.type === 'text_mention');
+  const e1 = msg.entities || [];
+  const e2 = msg.caption_entities || [];
+  return (
+    e1.some((e) => e.type === 'mention' || e.type === 'text_mention') ||
+    e2.some((e) => e.type === 'mention' || e.type === 'text_mention')
+  );
 }
 
 function messageMentionsBot(msg, botInfo) {
@@ -1058,7 +1062,7 @@ async function lookupChatTargetWithRetry(env, chatId, msgId) {
   return hit || null;
 }
 
-// ============= CHAT REGISTRY (new /chat system) =============
+// ============= CHAT REGISTRY =============
 function makeChatKey(chatId, threadId) {
   return threadId ? `${chatId}/${threadId}` : String(chatId);
 }
@@ -1105,9 +1109,6 @@ async function ensureChatRegistered(env, chatId, threadId) {
   return registry[key];
 }
 
-// Resolves an identifier to { chatId, threadId }.
-// Order: name (case-insensitive) → chat_id form.
-// This way names shadow numeric identifiers only when they exist.
 async function resolveChatIdentifier(env, identifier) {
   const registry = await readChatRegistry(env);
   const lower = identifier.toLowerCase();
@@ -1200,8 +1201,6 @@ async function handleMention(msg, env, botInfo) {
   if (!msg || !botInfo) return false;
 
   if (msg.from?.id === botInfo.id) return false;
-  if (msg.from?.is_bot) return false;
-  if (msg.from?.id === OWNER_ID) return false;
   if (msg.sender_chat?.id === botInfo.id) return false;
 
   if (!messageMentionsBot(msg, botInfo)) return false;
@@ -3204,22 +3203,49 @@ async function handleUpdate(update, env, origin) {
         const key = makeChatKey(msg.chat.id, threadId);
         const registry = await readChatRegistry(env);
         const existing = registry[key];
+        const isOwnerDM =
+          msg.chat.id === OWNER_ID && msg.chat.type === 'private';
 
         if (existing) {
-          await sendMessage(
-            env.BOT_TOKEN,
-            msg.chat.id,
-            `✅ اینجا قبلاً ثبت شده.\n` +
-              `chat id: \`${key}\`\n` +
-              `نام: ${existing.name || '(بدون نام)'}\n\n` +
-              `از هر جایی می‌تونی پیام بفرستی:\n` +
-              `\`/chat ${key} <متن>\`\n` +
-              (existing.name
-                ? `یا با نام: \`/chat ${existing.name} <متن>\``
-                : `برای نام‌گذاری: \`/chat name ${key} <نام>\``),
-            threadId ?? undefined,
-            { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
-          );
+          if (isOwnerDM) {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              `✅ اینجا قبلاً ثبت شده.\n` +
+                `chat id: \`${key}\`\n` +
+                `نام: ${existing.name || '(بدون نام)'}\n\n` +
+                `از هر جایی می‌تونی پیام بفرستی:\n` +
+                `\`/chat ${key} <متن>\`\n` +
+                (existing.name
+                  ? `یا با نام: \`/chat ${existing.name} <متن>\``
+                  : `برای نام‌گذاری: \`/chat name ${key} <نام>\``),
+              threadId ?? undefined,
+              {
+                parse_mode: 'Markdown',
+                link_preview_options: { is_disabled: true },
+              }
+            );
+          } else {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              '✅ اینجا قبلاً ثبت شده.',
+              threadId ?? undefined
+            );
+            try {
+              await sendMessage(
+                env.BOT_TOKEN,
+                OWNER_ID,
+                `ℹ️ \`${key}\` قبلاً ثبت شده بود.\n` +
+                  `نام: ${existing.name || '(بدون نام)'}`,
+                undefined,
+                {
+                  parse_mode: 'Markdown',
+                  link_preview_options: { is_disabled: true },
+                }
+              );
+            } catch { /* ignore */ }
+          }
         } else {
           registry[key] = {
             chatId: msg.chat.id,
@@ -3228,20 +3254,49 @@ async function handleUpdate(update, env, origin) {
             at: Date.now(),
           };
           await writeChatRegistry(env, registry);
-          await sendMessage(
-            env.BOT_TOKEN,
-            msg.chat.id,
-            `✅ اینجا ثبت شد!\n` +
-              `chat id: \`${key}\`\n\n` +
-              `از هر جایی می‌تونی پیام بفرستی:\n` +
-              `• \`/chat ${key} <متن>\`\n` +
-              `• یا روی یک پیام/مدیا ریپلای کن و بنویس \`/chat ${key}\`\n\n` +
-              `برای نام‌گذاری (تا راحت‌تر صداش کنی):\n` +
-              `\`/chat name ${key} <نام>\``,
-            threadId ?? undefined,
-            { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
-          );
+
+          if (isOwnerDM) {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              `✅ اینجا ثبت شد!\n` +
+                `chat id: \`${key}\`\n\n` +
+                `از هر جایی می‌تونی پیام بفرستی:\n` +
+                `• \`/chat ${key} <متن>\`\n` +
+                `• یا روی یک پیام/مدیا ریپلای کن و بنویس \`/chat ${key}\`\n\n` +
+                `برای نام‌گذاری (تا راحت‌تر صداش کنی):\n` +
+                `\`/chat name ${key} <نام>\``,
+              threadId ?? undefined,
+              {
+                parse_mode: 'Markdown',
+                link_preview_options: { is_disabled: true },
+              }
+            );
+          } else {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              '✅ اینجا ثبت شد!',
+              threadId ?? undefined
+            );
+            try {
+              await sendMessage(
+                env.BOT_TOKEN,
+                OWNER_ID,
+                `✅ \`${key}\` ثبت شد.\n\n` +
+                  `از هر جایی:\n` +
+                  `• \`/chat ${key} <متن>\`\n` +
+                  `• نام‌گذاری: \`/chat name ${key} <نام>\``,
+                undefined,
+                {
+                  parse_mode: 'Markdown',
+                  link_preview_options: { is_disabled: true },
+                }
+              );
+            } catch { /* ignore */ }
+          }
         }
+
         await logEvent(env, { ev: 'chat_register', key });
         return;
       }
@@ -3294,7 +3349,6 @@ async function handleUpdate(update, env, origin) {
           return;
         }
 
-        // Uniqueness check (case-insensitive, excluding self)
         for (const [k, v] of Object.entries(registry)) {
           if (k !== key && v.name && v.name.toLowerCase() === newName.toLowerCase()) {
             await sendMessage(
@@ -3608,7 +3662,6 @@ async function handleUpdate(update, env, origin) {
         return;
       }
 
-      // Auto-register on first use
       await ensureChatRegistered(env, target.chatId, target.threadId);
 
       if (targetMsgId) {
