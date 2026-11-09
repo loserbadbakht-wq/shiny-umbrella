@@ -22,16 +22,16 @@
 // + FIX: newest-first queue order + retire stale (>1h or 6 tries)
 // + FIX: 400/403 treated as permanent
 // + FIX: handleEnqueue re-arms alarm to +100ms on new items
-// + FIX: MERGE pending items by animeKey + 45s grace period so
-//        batches that arrive incrementally across cron ticks
-//        become ONE combined message instead of N individual ones
-// + FIX: processPending re-reads schedule and upgrades stale
-//        batch metadata before sending
+// + FIX: MERGE pending items by animeKey + 45s grace period
+// + FIX: processPending re-reads schedule and upgrades batches
 // + NEW: /doflush reports per-chat failure reasons in Telegram
 // + NEW: /doself, /dodoctor, verbose [DO] logs
 // + NEW: /ultimatecatchrecipe — auto-responder that sends the
 //        per-chat tag list with a Tag me button whenever a
-//        message containing the trigger phrase is seen
+//        message containing the trigger phrase is seen.
+//        Catch reply is a PLAIN message (no reply_to_message_id)
+//        so bot-to-bot flow isn't broken.
+// + NO: channel_post support (only update.message is handled)
 // ============================================================
 
 import PROFANITY_ANIMATIONS from './gifs.json';
@@ -401,8 +401,10 @@ async function sendCatchMessage(env, chatId, sourceMsg) {
     const lang = await getLang(env, chatId);
     const list = await getCatchList(env, chatId);
     const text = formatCatchListText(list, lang);
+    // Plain standalone message — no reply_to_message_id. Replying to a
+    // bot's message can trigger its reply-handler and break bot-to-bot
+    // flow (loops, error storms). Sending as a plain message is neutral.
     return await sendMessage(env, chatId, text, {
-        reply_to_message_id: sourceMsg.message_id,
         reply_markup: buildCatchKeyboard(lang),
     });
 }
@@ -439,9 +441,9 @@ async function handleUltimateCatchRecipe(env, msg) {
     if (!botStatus.isAdmin) {
         await sendMessage(env, chatId, lang === 'fa'
             ? '❌ برای فعال‌سازی، ربات باید ادمین این گروه/کانال باشد.\n' +
-              '📌 اگر گروه است، حتماً از @BotFather گزینه Privacy Mode را غیرفعال کنید تا پیام‌های عادی را ببیند.'
+              '📌 ربات را ادمین کنید و دوباره تلاش کنید.'
             : '❌ To enable this, the bot must be an admin of this group/channel.\n' +
-              '📌 If it\'s a group, also disable Privacy Mode via @BotFather so the bot can see regular messages.');
+              '📌 Promote the bot to admin and try again.');
         return;
     }
 
@@ -458,16 +460,10 @@ async function handleUltimateCatchRecipe(env, msg) {
 
     await env.RSS_BOT_KV.put(key, 'on');
     const trigPreview = `<code>${escapeHtml(CATCH_TRIGGER)}</code>`;
-    let note = '';
-    if (chatType === 'group' || chatType === 'supergroup') {
-        note = lang === 'fa'
-            ? '\n\n⚠️ در گروه‌ها باید Privacy Mode از @BotFather غیرفعال باشد.'
-            : '\n\n⚠️ In groups, Privacy Mode must be disabled via @BotFather.';
-    }
 
     await sendMessage(env, chatId, lang === 'fa'
-        ? `🍳 <b>حالت Catch روشن شد.</b>\n\nبه هر پیامی که شامل این عبارت باشد پاسخ می‌دهم:\n${trigPreview}${note}\n\n<code>/ultimatecatchrecipe</code> → خاموش کردن\n<code>/ultimatecatchrecipe clear</code> → پاک کردن لیست`
-        : `🍳 <b>Catch mode enabled.</b>\n\nI'll respond to any message containing:\n${trigPreview}${note}\n\n<code>/ultimatecatchrecipe</code> → disable\n<code>/ultimatecatchrecipe clear</code> → clear list`);
+        ? `🍳 <b>حالت Catch روشن شد.</b>\n\nبه هر پیامی که شامل این عبارت باشد پاسخ می‌دهم:\n${trigPreview}\n\n<code>/ultimatecatchrecipe</code> → خاموش کردن\n<code>/ultimatecatchrecipe clear</code> → پاک کردن لیست`
+        : `🍳 <b>Catch mode enabled.</b>\n\nI'll respond to any message containing:\n${trigPreview}\n\n<code>/ultimatecatchrecipe</code> → disable\n<code>/ultimatecatchrecipe clear</code> → clear list`);
 }
 
 // ============= ENCRYPTION =============
