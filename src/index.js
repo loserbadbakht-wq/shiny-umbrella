@@ -29,6 +29,9 @@
 //        batch metadata before sending
 // + NEW: /doflush reports per-chat failure reasons in Telegram
 // + NEW: /doself, /dodoctor, verbose [DO] logs
+// + NEW: /ultimatecatchrecipe — auto-responder that sends the
+//        per-chat tag list with a Tag me button whenever a
+//        message containing the trigger phrase is seen
 // ============================================================
 
 import PROFANITY_ANIMATIONS from './gifs.json';
@@ -56,12 +59,19 @@ const DO_MAX_ITEM_ATTEMPTS = 6;
 const DO_STALE_ITEM_MS = 60 * 60 * 1000;
 const DO_BATCH_GRACE_MS = 45000;
 
+// ── /ultimatecatchrecipe ──
+// Trigger phrase WITHOUT brackets, using the same small-caps glyphs.
+const CATCH_TRIGGER = 'ᴀᴅᴅ⁠ ᴛʜɪs ᴄʜᴀʀᴀᴄᴛᴇʀ ᴛᴏ ʏᴏᴜʀ ʜᴀʀᴇᴍ ᴜsɪɴɢ';
+const CATCH_MODE_PREFIX = 'catchmode:';
+const CATCH_LIST_PREFIX = 'catchlist:';
+
 const WEBAPP_SHORT_NAME = 'schedule';
 
 let SUBREQUEST_COUNT = 0;
 let WORKER_ORIGIN = '';
 let CACHED_BOT_USERNAME = null;
 let CACHED_WEBAPP_LINK = null;
+let CACHED_BOT_ID = null;
 
 // ============= UTILITIES =============
 
@@ -212,8 +222,9 @@ async function getWebAppLink(env) {
         try {
             const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMe`);
             const json = await res.json();
-            if (json && json.ok && json.result && json.result.username) {
+            if (json && json.ok && json.result) {
                 CACHED_BOT_USERNAME = json.result.username;
+                CACHED_BOT_ID = json.result.id;
             }
         } catch (e) {
             console.warn('[WEBAPP] getMe failed:', e.message);
@@ -290,6 +301,173 @@ async function getLang(env, chatId) {
 async function setLang(env, chatId, lang) {
     await applyBotFatherCommandsToChat(env, chatId, lang);
     LANG_DETECT_CACHE.set(String(chatId), { lang, ts: Date.now() });
+}
+
+// ============= /ultimatecatchrecipe =============
+
+function normalizeTriggerText(s) {
+    return String(s || '').replace(/[\u2060\u200B\u200C\u200D\uFEFF]/g, '');
+}
+
+const CATCH_TRIGGER_NORMALIZED = normalizeTriggerText(CATCH_TRIGGER);
+
+function hasCatchTrigger(text) {
+    if (!text) return false;
+    return normalizeTriggerText(text).includes(CATCH_TRIGGER_NORMALIZED);
+}
+
+async function getBotChatMemberStatus(env, chatId) {
+    if (!CACHED_BOT_ID) {
+        try {
+            const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMe`);
+            const json = await res.json();
+            if (json.ok) {
+                CACHED_BOT_USERNAME = json.result.username;
+                CACHED_BOT_ID = json.result.id;
+            }
+        } catch {}
+    }
+    if (!CACHED_BOT_ID) return { ok: false, reason: 'no-bot-id' };
+
+    try {
+        const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getChatMember`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, user_id: CACHED_BOT_ID }),
+        });
+        const json = await res.json();
+        if (!json.ok) return { ok: false, reason: json.description };
+        const status = json.result.status;
+        return {
+            ok: true,
+            status,
+            isAdmin: status === 'creator' || status === 'administrator',
+            isMember: status !== 'left' && status !== 'kicked',
+        };
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+async function getCatchList(env, chatId) {
+    const key = `${CATCH_LIST_PREFIX}${chatId}`;
+    try {
+        const raw = await env.RSS_BOT_KV.get(key);
+        if (!raw) return [];
+        return decryptData(raw);
+    } catch { return []; }
+}
+
+async function saveCatchList(env, chatId, list) {
+    const key = `${CATCH_LIST_PREFIX}${chatId}`;
+    await env.RSS_BOT_KV.put(key, encryptData(list), { expirationTtl: TAG_TTL_SEC });
+}
+
+async function addToCatchList(env, chatId, user) {
+    const list = await getCatchList(env, chatId);
+    if (list.some((u) => u.userId === user.userId)) return { added: false, list, reason: 'duplicate' };
+    if (list.length >= MAX_TAGS_PER_ANIME) return { added: false, list, reason: 'full' };
+    list.push(user);
+    await saveCatchList(env, chatId, list);
+    return { added: true, list };
+}
+
+function formatCatchListText(users, lang) {
+    const isFa = lang === 'fa';
+    const label = isFa ? '🏷 لیست تگ:' : '🏷 Tag list:';
+    if (!users || users.length === 0) {
+        return `<b>${label}</b>\n${isFa ? '<i>هنوز کسی نیست — اولین نفر باش!</i>' : '<i>Nobody yet — be the first!</i>'}`;
+    }
+    const shown = users.slice(0, MAX_MENTIONS_SHOWN);
+    const lines = shown.map(renderUserMention);
+    let out = `<b>${label}</b>\n${lines.join('\n')}`;
+    if (users.length > MAX_MENTIONS_SHOWN) {
+        const extra = users.length - MAX_MENTIONS_SHOWN;
+        out += isFa ? `\n<i>و ${extra} نفر دیگر…</i>` : `\n<i>and ${extra} more…</i>`;
+    }
+    return out;
+}
+
+function buildCatchKeyboard(lang) {
+    const isFa = lang === 'fa';
+    return {
+        inline_keyboard: [[
+            { text: isFa ? '🏷 تگ کن' : '🏷 Tag me', callback_data: 'catch:tag' },
+        ]],
+    };
+}
+
+async function sendCatchMessage(env, chatId, sourceMsg) {
+    const lang = await getLang(env, chatId);
+    const list = await getCatchList(env, chatId);
+    const text = formatCatchListText(list, lang);
+    return await sendMessage(env, chatId, text, {
+        reply_to_message_id: sourceMsg.message_id,
+        reply_markup: buildCatchKeyboard(lang),
+    });
+}
+
+async function handleUltimateCatchRecipe(env, msg) {
+    const chatId = msg.chat.id;
+    const chatType = msg.chat.type;
+    const lang = await getLang(env, chatId);
+
+    if (chatType === 'private') {
+        await sendMessage(env, chatId, lang === 'fa'
+            ? '⚠️ این دستور فقط در گروه‌ها و کانال‌ها کار می‌کند.'
+            : '⚠️ This command only works in groups and channels.');
+        return;
+    }
+
+    const args = String(msg.text || '').trim().split(/\s+/).slice(1).map((s) => s.toLowerCase());
+    if (args.includes('clear') || args.includes('reset')) {
+        await saveCatchList(env, chatId, []);
+        await sendMessage(env, chatId, lang === 'fa'
+            ? '🧹 لیست تگ پاک شد.'
+            : '🧹 Tag list cleared.');
+        return;
+    }
+
+    const botStatus = await getBotChatMemberStatus(env, chatId);
+    if (!botStatus.ok) {
+        await sendMessage(env, chatId, lang === 'fa'
+            ? `❌ وضعیت ربات مشخص نیست: ${botStatus.reason || 'unknown'}`
+            : `❌ Cannot determine bot status: ${botStatus.reason || 'unknown'}`);
+        return;
+    }
+
+    if (!botStatus.isAdmin) {
+        await sendMessage(env, chatId, lang === 'fa'
+            ? '❌ برای فعال‌سازی، ربات باید ادمین این گروه/کانال باشد.\n' +
+              '📌 اگر گروه است، حتماً از @BotFather گزینه Privacy Mode را غیرفعال کنید تا پیام‌های عادی را ببیند.'
+            : '❌ To enable this, the bot must be an admin of this group/channel.\n' +
+              '📌 If it\'s a group, also disable Privacy Mode via @BotFather so the bot can see regular messages.');
+        return;
+    }
+
+    const key = `${CATCH_MODE_PREFIX}${chatId}`;
+    const current = await env.RSS_BOT_KV.get(key);
+
+    if (current === 'on') {
+        await env.RSS_BOT_KV.delete(key);
+        await sendMessage(env, chatId, lang === 'fa'
+            ? '🍳 حالت Catch خاموش شد.'
+            : '🍳 Catch mode disabled.');
+        return;
+    }
+
+    await env.RSS_BOT_KV.put(key, 'on');
+    const trigPreview = `<code>${escapeHtml(CATCH_TRIGGER)}</code>`;
+    let note = '';
+    if (chatType === 'group' || chatType === 'supergroup') {
+        note = lang === 'fa'
+            ? '\n\n⚠️ در گروه‌ها باید Privacy Mode از @BotFather غیرفعال باشد.'
+            : '\n\n⚠️ In groups, Privacy Mode must be disabled via @BotFather.';
+    }
+
+    await sendMessage(env, chatId, lang === 'fa'
+        ? `🍳 <b>حالت Catch روشن شد.</b>\n\nبه هر پیامی که شامل این عبارت باشد پاسخ می‌دهم:\n${trigPreview}${note}\n\n<code>/ultimatecatchrecipe</code> → خاموش کردن\n<code>/ultimatecatchrecipe clear</code> → پاک کردن لیست`
+        : `🍳 <b>Catch mode enabled.</b>\n\nI'll respond to any message containing:\n${trigPreview}${note}\n\n<code>/ultimatecatchrecipe</code> → disable\n<code>/ultimatecatchrecipe clear</code> → clear list`);
 }
 
 // ============= ENCRYPTION =============
@@ -1365,11 +1543,16 @@ async function editRichMessage(env, chatId, messageId, html, extra = {}) {
     try { return await res.json(); } catch { return { ok: res.ok }; }
 }
 
-async function answerCallback(env, callbackQueryId) {
+async function answerCallback(env, callbackQueryId, text = null, showAlert = false) {
+    const payload = { callback_query_id: callbackQueryId };
+    if (text) {
+        payload.text = text;
+        payload.show_alert = showAlert;
+    }
     return fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/answerCallbackQuery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ callback_query_id: callbackQueryId }),
+        body: JSON.stringify(payload),
     });
 }
 
@@ -1611,6 +1794,39 @@ async function handleCallbackQuery(env, callbackQuery) {
             await answerCallback(env, id);
             const lang = await getLang(env, chatId);
             await sendMessage(env, chatId, lang === 'fa' ? `📅 <b>خطای برنامه:</b> ${e.message}` : `📅 <b>Schedule error:</b> ${e.message}`);
+        }
+        return;
+    }
+
+    if (data === 'catch:tag') {
+        try {
+            const from = callbackQuery.from;
+            const user = {
+                userId: from.id,
+                username: from.username || null,
+                firstName: from.first_name || null,
+            };
+
+            const lang = await getLang(env, chatId);
+            const result = await addToCatchList(env, chatId, user);
+
+            if (result.added) {
+                const newText = formatCatchListText(result.list, lang);
+                const editRes = await editMessage(env, chatId, messageId, newText, {
+                    reply_markup: buildCatchKeyboard(lang),
+                });
+                if (!editRes || !editRes.ok) {
+                    console.warn(`[CATCH] edit failed: ${JSON.stringify(editRes).slice(0, 200)}`);
+                }
+                await answerCallback(env, id, lang === 'fa' ? '✅ تگ شدی' : '✅ You\'re tagged');
+            } else if (result.reason === 'full') {
+                await answerCallback(env, id, lang === 'fa' ? '⚠️ لیست پر است' : '⚠️ List is full', true);
+            } else {
+                await answerCallback(env, id, lang === 'fa' ? 'ℹ️ قبلاً تگ شدی' : 'ℹ️ Already tagged');
+            }
+        } catch (e) {
+            console.error(`[CATCH] callback error: ${e.message}`);
+            await answerCallback(env, id);
         }
         return;
     }
@@ -2162,8 +2378,6 @@ export class Broadcaster {
             return jsonResponse({ ok: true, enqueued: 0, reason: 'no-chats' });
         }
 
-        // Pre-load pending items grouped by animeKey so incoming episodes
-        // for the same anime are merged into a single queue entry.
         const pendingByAnime = new Map();
         const allEntries = await this.state.storage.list({ prefix: 'broadcast:' });
         for (const [k, s] of allEntries) {
@@ -2175,7 +2389,6 @@ export class Broadcaster {
         let enqueued = 0;
         let merged = 0;
         for (const a of airings) {
-            // KV migration check (unchanged)
             const kvKey = `aired:anilist:${a.idKey}`;
             const kvState = await this.env.RSS_BOT_KV.get(kvKey);
             if (kvState) {
@@ -2199,7 +2412,6 @@ export class Broadcaster {
 
             const newMax = a.batch && a.batch.max != null ? a.batch.max : a.episode;
 
-            // ── MERGE: pending item exists for this anime ──
             const pending = pendingByAnime.get(a.idKey);
             if (pending) {
                 const oldMax = pending.state.batch && pending.state.batch.max != null
@@ -2225,7 +2437,6 @@ export class Broadcaster {
                 continue;
             }
 
-            // ── FRESH ENQUEUE ──
             const key = `broadcast:${a.idKey}:${a.episode}`;
             const existingByKey = await this.state.storage.get(key);
             if (existingByKey) continue;
@@ -2242,10 +2453,6 @@ export class Broadcaster {
             console.log(`[DO] enqueued ${key} for ${chats.length}`);
         }
 
-        // Grace period for incomplete batches — gives AniList's
-        // incremental data time to reveal the remaining episodes of the
-        // same batch before we start sending. Complete batches and
-        // single airings fire instantly.
         const anyIncomplete = [...pendingByAnime.values()].some(
             ({ state }) => state.batch && state.totalEps && state.batch.count < state.totalEps
         );
@@ -2452,10 +2659,6 @@ export class Broadcaster {
             return { anyPending: false, maxAttempts: 0, failures: [] };
         }
 
-        // ── REFRESH BATCHES from latest schedule data ──
-        // If more episodes of the same anime appeared in the schedule
-        // since this item was enqueued, upgrade to a wider batch
-        // before sending so one combined message goes out.
         try {
             const week = await fetchScheduleWeek(this.env);
             const flatWeek = [];
@@ -2486,7 +2689,6 @@ export class Broadcaster {
             console.warn(`[DO] batch refresh failed: ${e.message}`);
         }
 
-        // Newest items first — prevents old stale items from starving fresh ones
         pending.sort((a, b) => (b.state.createdAt || 0) - (a.state.createdAt || 0));
 
         console.log(`[DO] processPending: ${pending.length} items`);
@@ -2501,7 +2703,6 @@ export class Broadcaster {
                 break;
             }
 
-            // ── RETIRE STALE / EXHAUSTED ITEMS ──
             const age = Date.now() - (state.createdAt || 0);
             const tries = state.attempts || 0;
             if (age > DO_STALE_ITEM_MS || tries >= DO_MAX_ITEM_ATTEMPTS) {
@@ -2602,7 +2803,6 @@ export class Broadcaster {
                 state.url, lang, '', state.batch || null
             );
             if (res && res.ok) return res;
-            // Malformed payload or permission — retrying is pointless
             if (res && (res.error_code === 400 || res.error_code === 403)) return res;
             if (res && isPermanentSendError(res.description)) return res;
             last = res;
@@ -2742,6 +2942,25 @@ export default {
                 const text = msg.text || '';
                 const chatType = msg.chat.type;
 
+                // ── /ultimatecatchrecipe auto-responder ──
+                // Runs for every non-private message before other handlers.
+                if (chatType !== 'private') {
+                    try {
+                        const isSelf = msg.from && msg.from.id === CACHED_BOT_ID;
+                        if (!isSelf) {
+                            const mode = await env.RSS_BOT_KV.get(`${CATCH_MODE_PREFIX}${chatId}`);
+                            if (mode === 'on') {
+                                const sourceText = msg.text || msg.caption || '';
+                                if (hasCatchTrigger(sourceText)) {
+                                    await sendCatchMessage(env, chatId, msg);
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.warn(`[CATCH] auto-responder error: ${e.message}`);
+                    }
+                }
+
                 if (msg.reply_to_message && text.trim() === '/debugreply') {
                     await handleDebugReply(env, msg);
                     return new Response('OK', { status: 200 });
@@ -2786,6 +3005,12 @@ export default {
                         else await sendMessage(env, chatId, 'Unknown /do command.\nTry /doself, /dodoctor, /dodiag, /dostatus, /doflush, /donudge, /dotrigger, /dotest, /dosingle, /dopurge.');
                         return new Response('OK', { status: 200 });
                     }
+
+                    if (text.startsWith('/ultimatecatchrecipe')) {
+                        await handleUltimateCatchRecipe(env, msg);
+                        return new Response('OK', { status: 200 });
+                    }
+
                     if (text.startsWith('/start')) await handleStart(env, chatId);
                     else if (text.startsWith('/unsub')) await handleUnsub(env, chatId);
                     else if (text.startsWith('/language')) await handleLanguage(env, chatId);
@@ -2794,6 +3019,12 @@ export default {
                     else if (text.startsWith('/debug')) await handleDebug(env, chatId);
                 } else {
                     await addChatToBroadcast(env, chatId);
+
+                    if (text.startsWith('/ultimatecatchrecipe')) {
+                        await handleUltimateCatchRecipe(env, msg);
+                        return new Response('OK', { status: 200 });
+                    }
+
                     if (text.startsWith('/unsub')) await handleUnsubInGroup(env, chatId);
                     else if (text.startsWith('/language')) await handleLanguage(env, chatId);
                     else if (text.startsWith('/schedule')) await handleSchedule(env, chatId, chatType);
