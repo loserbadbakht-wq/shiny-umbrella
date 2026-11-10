@@ -1,44 +1,7 @@
 // ============================================================
 // Telegram RSS Bot – KV-backed schedule + menu-based language
-// + per-chat per-anime tag lists (add + remove)
-// + profanity GIF replies (airing messages only, 6 random GIFs)
-// + trigger words loaded from words.json
-// + MAL Link rendered as a rich-message tg-button
-// + RTL for Persian rich messages via is_rtl
-// + rich-message URL extraction via unescaped full-payload search
-// + highlighted anime name via <mark>
-// + /schedule table with rich <input type="checkbox"> (date-accurate)
-// + standalone web app at /app (+ /api/schedule, /api/anime)
-// + anime detail modal (Alternative Titles + Information)
-// + direct-link Mini App (BotFather Web App section) for groups
-// + /debugreply diagnostic
-// + FIX: use `url` button (not `web_app`) with t.me direct link
-// + FIX: Durable Object owns broadcast queue + retry state
-// + FIX: migration from KV state handles legacy and object formats
-// + FIX: storage.list() returns Promise<Map> — await + for..of
-// + FIX: self-healing alarm via ensureAlarm()
-// + FIX: 3-layer message fallback (rich → plain<b> → raw text)
-// + FIX: isPermanentSendError catches parse errors
-// + FIX: newest-first queue order + retire stale (>1h or 6 tries)
-// + FIX: 400/403 treated as permanent
-// + FIX: handleEnqueue re-arms alarm to +100ms on new items
-// + FIX: MERGE pending items by animeKey + 45s grace period
-// + FIX: processPending re-reads schedule and upgrades batches
-// + NEW: /doflush reports per-chat failure reasons in Telegram
-// + NEW: /doself, /dodoctor, verbose [DO] logs
-// + NEW: /ultimatecatchrecipe — auto-responder that sends the
-//        per-chat tag list with a Tag me button whenever a
-//        message containing the trigger phrase is seen.
-//        Catch reply is a PLAIN message (no reply_to_message_id)
-//        so bot-to-bot flow isn't broken.
-// + NEW: Bot API 10.4 widgets — /schedule in private chats now
-//        renders as an interactive HTML widget with day switching
-//        via TelegramWidget.request() → widget_query updates.
-//        Widget HTML is immutable; only chat_data changes and
-//        the widget redraws itself on chatDataChanged.
-//        Automatic sizing (width=0, height=0) so it fits any screen.
-//        Falls back to rich message if widget delivery fails.
-// + NO: channel_post support (only update.message is handled)
+// + FIX: RTL direction for Persian widgets
+// + FIX: Reliable widget query handling and state update
 // ============================================================
 
 import PROFANITY_ANIMATIONS from './gifs.json';
@@ -51,7 +14,6 @@ const SCHEDULE_TZ = { fa: 'Asia/Tehran', en: 'UTC' };
 const JST = 'Asia/Tokyo';
 
 const WEEK_KV_KEY = 'sched:anilist:v5:week';
-const WEEK_STALE_TTL_MS = 24 * 60 * 60 * 1000;
 const TAG_TTL_SEC = 90 * 24 * 60 * 60;
 const MAX_TAGS_PER_ANIME = 100;
 const MAX_MENTIONS_SHOWN = 30;
@@ -66,8 +28,6 @@ const DO_MAX_ITEM_ATTEMPTS = 6;
 const DO_STALE_ITEM_MS = 60 * 60 * 1000;
 const DO_BATCH_GRACE_MS = 45000;
 
-// ── /ultimatecatchrecipe ──
-// Trigger phrase WITHOUT brackets, using the same small-caps glyphs.
 const CATCH_TRIGGER = 'ᴀᴅᴅ⁠ ᴛʜɪs ᴄʜᴀʀᴀᴄᴛᴇʀ ᴛᴏ ʏᴏᴜʀ ʜᴀʀᴇᴍ ᴜsɪɴɢ';
 const CATCH_MODE_PREFIX = 'catchmode:';
 const CATCH_LIST_PREFIX = 'catchlist:';
@@ -408,9 +368,6 @@ async function sendCatchMessage(env, chatId, sourceMsg) {
     const lang = await getLang(env, chatId);
     const list = await getCatchList(env, chatId);
     const text = formatCatchListText(list, lang);
-    // Plain standalone message — no reply_to_message_id. Replying to a
-    // bot's message can trigger its reply-handler and break bot-to-bot
-    // flow (loops, error storms). Sending as a plain message is neutral.
     return await sendMessage(env, chatId, text, {
         reply_markup: buildCatchKeyboard(lang),
     });
@@ -1494,7 +1451,6 @@ async function sendRichMessage(env, chatId, html, extra = {}) {
     try { return await res.json(); } catch { return { ok: res.ok }; }
 }
 
-// ── Bot API 10.4 widgets ──
 async function sendWidgetMessage(env, chatId, html, extra = {}) {
     const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendWidget`, {
         method: 'POST',
@@ -1624,7 +1580,7 @@ function buildScheduleWidgetHtml(initialDay, lang) {
     }).join('');
 
     return `<!DOCTYPE html>
-<html>
+<html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}">
 <head>
 <meta charset="utf-8">
 <style>
@@ -3212,8 +3168,6 @@ export default {
 
         try {
             // ── Widget query (Bot API 10.4) ──
-            // Fired when the user interacts with the /schedule widget
-            // (e.g., taps a day button). Update the widget state.
             if (update.widget_query) {
                 await handleWidgetQuery(env, update.widget_query);
                 return new Response('OK', { status: 200 });
@@ -3226,7 +3180,6 @@ export default {
                 const chatType = msg.chat.type;
 
                 // ── /ultimatecatchrecipe auto-responder ──
-                // Runs for every non-private message before other handlers.
                 if (chatType !== 'private') {
                     try {
                         const isSelf = msg.from && msg.from.id === CACHED_BOT_ID;
