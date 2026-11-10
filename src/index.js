@@ -1,7 +1,7 @@
 // ============================================================
 // Telegram RSS Bot – KV-backed schedule + menu-based language
-// + FIX: RTL direction for Persian widgets
-// + FIX: Reliable widget query handling and state update
+// + FIX: RTL direction for Persian text in widgets without breaking LTR titles
+// + FIX: Widget button interactions using `onclick` for QuickJS compatibility
 // ============================================================
 
 import PROFANITY_ANIMATIONS from './gifs.json';
@@ -1580,7 +1580,7 @@ function buildScheduleWidgetHtml(initialDay, lang) {
     }).join('');
 
     return `<!DOCTYPE html>
-<html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}">
+<html lang="${isFa ? 'fa' : 'en'}">
 <head>
 <meta charset="utf-8">
 <style>
@@ -1625,6 +1625,8 @@ function buildScheduleWidgetHtml(initialDay, lang) {
     letter-spacing: 0.04em; color: var(--tg-theme-hint-color, #888);
     font-weight: 700;
   }
+  /* Apply RTL direction only to Persian header cells */
+  html[lang="fa"] th { direction: rtl; text-align: right; }
   tr:last-child td { border-bottom: none; }
   .time {
     width: 78px; color: var(--tg-theme-hint-color, #888);
@@ -1716,13 +1718,13 @@ function buildScheduleWidgetHtml(initialDay, lang) {
   // Button taps send a request to the bot. The bot replies by
   // updating chat_data; the widget then re-renders.
   document.querySelectorAll('.day-btn').forEach(function(btn) {
-    btn.addEventListener('click', function() {
+    btn.onclick = function() {
       var day = btn.getAttribute('data-day');
       TelegramWidget.request('sched:' + day).catch(function(err) {
         // Show error state if the bot doesn't respond
         console.warn('widget request failed', err);
       });
-    });
+    };
   });
 })();
 </script>
