@@ -34,6 +34,9 @@
 // + NEW: Bot API 10.4 widgets — /schedule in private chats now
 //        renders as an interactive HTML widget with day switching
 //        via TelegramWidget.request() → widget_query updates.
+//        Widget HTML is immutable; only chat_data changes and
+//        the widget redraws itself on chatDataChanged.
+//        Automatic sizing (width=0, height=0) so it fits any screen.
 //        Falls back to rich message if widget delivery fails.
 // + NO: channel_post support (only update.message is handled)
 // ============================================================
@@ -1510,11 +1513,11 @@ async function answerWidgetQuery(env, widgetQueryId, data = {}) {
     try { return await res.json(); } catch { return { ok: res.ok }; }
 }
 
-async function editMessageWidgetData(env, chatId, messageId, html) {
+async function editMessageWidgetData(env, chatId, messageId, chatData) {
     const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/editMessageWidgetData`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, html }),
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, chat_data: chatData }),
     });
     try { return await res.json(); } catch { return { ok: res.ok }; }
 }
@@ -1609,38 +1612,16 @@ function batchSuffix(b, lang) {
 }
 
 // ── Widget HTML builder ──
-function buildScheduleWidgetHtml(dayKey, entries, lang) {
+function buildScheduleWidgetHtml(initialDay, lang) {
     const isFa = lang === 'fa';
-    const dayName = isFa ? DAY_FULL_FA[dayKey] : dayKey;
-    const tzLabel = isFa ? 'به وقت ایران' : 'UTC';
-    const nowUnix = Math.floor(Date.now() / 1000);
     const order = isFa ? DAYS_FA_ORDER : DAYS;
     const labels = isFa ? DAY_FULL_FA : DAY_LABELS_EN;
 
     // Day switcher buttons at the top
     const dayButtons = order.map((d) => {
-        const active = d === dayKey;
         const label = labels[d];
-        return `<button
-            class="day-btn${active ? ' active' : ''}"
-            onclick="TelegramWidget.request('sched:${d}')"
-        >${label}</button>`;
+        return `<button class="day-btn" data-day="${d}" type="button">${label}</button>`;
     }).join('');
-
-    // Schedule rows
-    const rowsHtml = (entries && entries.length)
-        ? entries.map(e => {
-            const t = convertToTz(e.airingAt, SCHEDULE_TZ[lang] || 'UTC');
-            const title = escapeHtml(e.title);
-            const suffix = escapeHtml(batchSuffix(e.batchEpisodes, lang));
-            const aired = e.airingAt && e.airingAt <= nowUnix;
-            const box = aired ? '☑️' : '☐';
-            return `<tr>
-                <td class="time">${t}</td>
-                <td class="title">${box} ${title}${suffix}</td>
-            </tr>`;
-        }).join('')
-        : `<tr><td colspan="2" class="empty">${isFa ? 'هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.' : 'No releases scheduled.'}</td></tr>`;
 
     return `<!DOCTYPE html>
 <html>
@@ -1648,27 +1629,28 @@ function buildScheduleWidgetHtml(dayKey, entries, lang) {
 <meta charset="utf-8">
 <style>
   * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 8px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  html, body {
+    margin: 0; padding: 0;
     background: var(--tg-theme-bg-color, #fff);
     color: var(--tg-theme-text-color, #000);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    /* No fixed height — let the client size the outer frame so it
+       fits the screen and can scroll naturally. */
   }
-  .card { border-radius: 12px; overflow: hidden; }
+  .card { padding: 8px; }
   h3 {
-    margin: 0 0 8px; font-size: 1.1rem; font-weight: 600;
-    color: var(--tg-theme-text-color, #000);
+    margin: 0 0 8px; font-size: 1.05rem; font-weight: 600;
   }
   .day-tabs {
     display: flex; gap: 4px; overflow-x: auto; padding-bottom: 8px;
-    margin-bottom: 8px;
+    margin-bottom: 8px; -webkit-overflow-scrolling: touch;
   }
   .day-btn {
     border: 1px solid var(--tg-theme-hint-color, #ddd);
     background: var(--tg-theme-secondary-bg-color, #f0f0f0);
     color: var(--tg-theme-text-color, #000);
     padding: 6px 10px; border-radius: 8px; cursor: pointer;
-    font-size: 0.8rem; font-weight: 500; white-space: nowrap;
+    font-size: 0.78rem; font-weight: 500; white-space: nowrap;
     font-family: inherit;
   }
   .day-btn.active {
@@ -1680,16 +1662,16 @@ function buildScheduleWidgetHtml(dayKey, entries, lang) {
   th, td {
     padding: 8px 10px; text-align: start;
     border-bottom: 1px solid var(--tg-theme-hint-color, #ddd);
-    font-size: 0.9rem;
+    font-size: 0.85rem;
   }
   th {
-    font-size: 0.72rem; text-transform: uppercase;
+    font-size: 0.7rem; text-transform: uppercase;
     letter-spacing: 0.04em; color: var(--tg-theme-hint-color, #888);
     font-weight: 700;
   }
   tr:last-child td { border-bottom: none; }
   .time {
-    width: 82px; color: var(--tg-theme-hint-color, #888);
+    width: 78px; color: var(--tg-theme-hint-color, #888);
     font-variant-numeric: tabular-nums; white-space: nowrap;
   }
   .title { font-weight: 500; }
@@ -1701,15 +1683,93 @@ function buildScheduleWidgetHtml(dayKey, entries, lang) {
 </head>
 <body>
 <div class="card">
-  <h3>📅 ${dayName} (${tzLabel})</h3>
+  <h3 id="widget-title">📅</h3>
   <div class="day-tabs">${dayButtons}</div>
   <table>
     <thead>
       <tr><th>${isFa ? 'ساعت' : 'Time'}</th><th>${isFa ? 'انیمه' : 'Show'}</th></tr>
     </thead>
-    <tbody>${rowsHtml}</tbody>
+    <tbody id="widget-body"></tbody>
   </table>
 </div>
+<script>
+(function() {
+  var isFa = ${isFa ? 'true' : 'false'};
+  var dayNames = ${JSON.stringify(isFa ? DAY_FULL_FA : DAY_LABELS_EN)};
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function render(day, entries) {
+    var label = isFa ? (dayNames[day] || day) : day;
+    var tzLabel = isFa ? 'به وقت ایران' : 'UTC';
+
+    document.getElementById('widget-title').textContent =
+      '📅 ' + label + ' (' + tzLabel + ')';
+
+    document.querySelectorAll('.day-btn').forEach(function(btn) {
+      if (btn.getAttribute('data-day') === day) btn.classList.add('active');
+      else btn.classList.remove('active');
+    });
+
+    var body = document.getElementById('widget-body');
+    if (!entries || !entries.length) {
+      body.innerHTML = '<tr><td colspan="2" class="empty">' +
+        (isFa ? 'هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.' : 'No releases scheduled.') +
+        '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    for (var i = 0; i < entries.length; i++) {
+      var e = entries[i];
+      var t = e.time || '--:--';
+      var title = esc(e.title);
+      var suffix = e.batch ? esc(e.batch) : '';
+      var box = e.aired ? '☑️' : '☐';
+      html += '<tr><td class="time">' + t + '</td>' +
+              '<td class="title">' + box + ' ' + title + suffix + '</td></tr>';
+    }
+    body.innerHTML = html;
+  }
+
+  // Read initial state from Telegram (chatData is set by the bot).
+  try {
+    var initial = TelegramWidget.chatData;
+    if (initial) {
+      var parsed = JSON.parse(initial);
+      if (parsed && parsed.day) {
+        render(parsed.day, parsed.entries || []);
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  // Re-render whenever the bot updates chat_data.
+  TelegramWidget.onEvent('chatDataChanged', function(data) {
+    try {
+      var parsed = typeof data === 'string' ? JSON.parse(data) : data;
+      if (parsed && parsed.day) {
+        render(parsed.day, parsed.entries || []);
+      }
+    } catch (e) { /* ignore */ }
+  });
+
+  // Button taps send a request to the bot. The bot replies by
+  // updating chat_data; the widget then re-renders.
+  document.querySelectorAll('.day-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var day = btn.getAttribute('data-day');
+      TelegramWidget.request('sched:' + day).catch(function(err) {
+        // Show error state if the bot doesn't respond
+        console.warn('widget request failed', err);
+      });
+    });
+  });
+})();
+</script>
 </body>
 </html>`;
 }
@@ -1720,18 +1780,15 @@ async function handleWidgetQuery(env, widgetQuery) {
         const queryId = widgetQuery.id;
         const chatId = widgetQuery.message && widgetQuery.message.chat && widgetQuery.message.chat.id;
         const messageId = widgetQuery.message && widgetQuery.message.message_id;
-        const data = widgetQuery.data || '';
+        const payload = widgetQuery.data || '';
 
         if (!chatId || !messageId) {
-            await answerWidgetQuery(env, queryId, {
-                error: 'missing chat or message context',
-            });
+            await answerWidgetQuery(env, queryId, { error: 'missing context' });
             return;
         }
 
-        // Data format: "sched:Monday", "sched:Tuesday", etc.
-        if (typeof data === 'string' && data.startsWith('sched:')) {
-            const dayKey = data.slice('sched:'.length);
+        if (typeof payload === 'string' && payload.startsWith('sched:')) {
+            const dayKey = payload.slice('sched:'.length);
             if (!DAYS.includes(dayKey)) {
                 await answerWidgetQuery(env, queryId, { error: 'invalid day' });
                 return;
@@ -1740,21 +1797,28 @@ async function handleWidgetQuery(env, widgetQuery) {
             const lang = await getLang(env, chatId);
             const tz = SCHEDULE_TZ[lang] || SCHEDULE_TZ.en;
             const entries = await fetchScheduleForDay(env, dayKey, tz);
-            const newHtml = buildScheduleWidgetHtml(dayKey, entries, lang);
 
-            const editRes = await editMessageWidgetData(env, chatId, messageId, newHtml);
+            // The HTML never changes. Only the state (chat_data) is
+            // updated, and the widget redraws itself via chatDataChanged.
+            const newData = JSON.stringify({
+                day: dayKey,
+                entries: entries.map((e) => ({
+                    title: e.title,
+                    time: convertToTz(e.airingAt, tz),
+                    aired: e.airingAt <= Math.floor(Date.now() / 1000),
+                    batch: batchSuffix(e.batchEpisodes, lang),
+                })),
+            });
+
+            const editRes = await editMessageWidgetData(env, chatId, messageId, newData);
             if (!editRes || !editRes.ok) {
                 console.warn(`[WIDGET] editMessageWidgetData failed: ${JSON.stringify(editRes).slice(0, 300)}`);
-                // fall back: acknowledge but note we couldn't update
-                await answerWidgetQuery(env, queryId, { error: 'could not update widget' });
-                return;
             }
-
+            // Acknowledge the query; ack and state-update are independent.
             await answerWidgetQuery(env, queryId, { ok: true });
             return;
         }
 
-        // Unknown query — acknowledge with an error
         await answerWidgetQuery(env, queryId, { error: 'unknown query' });
     } catch (e) {
         console.warn(`[WIDGET] handleWidgetQuery exception: ${e.message}`);
@@ -1887,12 +1951,26 @@ async function handleSchedule(env, chatId, chatType) {
 
         // Widgets are supported in private chats only in production.
         if (chatType === 'private') {
-            const html = buildScheduleWidgetHtml(today, entries, lang);
-            const caption = lang === 'fa' ? '📅 برنامه امروز' : "📅 Today's schedule";
+            const html = buildScheduleWidgetHtml(today, lang);
+            // Serialize the initial day + entries into chat_data so the
+            // widget can render immediately without waiting for a state
+            // update. Sent as a string (Bot API field is `chat_data`).
+            const initialData = JSON.stringify({
+                day: today,
+                entries: entries.map((e) => ({
+                    title: e.title,
+                    time: convertToTz(e.airingAt, tz),
+                    aired: e.airingAt <= Math.floor(Date.now() / 1000),
+                    batch: batchSuffix(e.batchEpisodes, lang),
+                })),
+            });
+
             const widgetRes = await sendWidgetMessage(env, chatId, html, {
-                width: 400,
-                height: 320,
-                caption,
+                width: 0,       // 0 = automatic
+                height: 0,      // 0 = automatic
+                allow_queries: true,
+                chat_data: initialData,   // initial state read by the widget
+                caption: lang === 'fa' ? '📅 برنامه امروز' : "📅 Today's schedule",
             });
             if (widgetRes && widgetRes.ok) return;
             console.warn('[SCHEDULE] widget failed, falling back to rich message:', JSON.stringify(widgetRes).slice(0, 300));
@@ -3135,7 +3213,7 @@ export default {
         try {
             // ── Widget query (Bot API 10.4) ──
             // Fired when the user interacts with the /schedule widget
-            // (e.g., taps a day button). Update the widget in place.
+            // (e.g., taps a day button). Update the widget state.
             if (update.widget_query) {
                 await handleWidgetQuery(env, update.widget_query);
                 return new Response('OK', { status: 200 });
