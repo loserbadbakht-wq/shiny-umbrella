@@ -3,7 +3,7 @@ name: Deploy to Cloudflare Workers
 on:
   push:
     branches:
-      - RSS
+      - RSS2
   workflow_dispatch:
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
       - name: Deploy to Cloudflare Workers
         run: |
           wrangler deploy \
-            --var BOT_TOKEN:${{ secrets.TWELVE_BOT_TOKEN }} \
+            --var BOT_TOKEN:${{ secrets.RSS2_BOT_TOKEN }} \
             --var DB_ENCRYPTION_KEY:${{ secrets.DB_ENCRYPTION_KEY }} \
             --var KEY:${{ secrets.KEY }} \
             --var ID:${{ secrets.ID }}
@@ -37,10 +37,10 @@ jobs:
       
       - name: Set Webhook
         run: |
-          WORKER_URL="https://shiny-rss.${{ secrets.CLOUDFLARE_USERNAME_TWO }}.workers.dev"
-          curl -X POST "https://api.telegram.org/bot${{ secrets.TWELVE_BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
+          WORKER_URL="https://shiny-rss2.${{ secrets.CLOUDFLARE_USERNAME_TWO }}.workers.dev"
+          curl -X POST "https://api.telegram.org/bot${{ secrets.RSS2_BOT_TOKEN }}/setWebhook?url=${WORKER_URL}"
       
       - name: Verify Deployment
         run: |
           echo "✅ Deployment successful!"
-          echo "🔗 Worker URL: https://shiny-rss.${{ secrets.CLOUDFLARE_USERNAME_TWO }}.workers.dev"
+          echo "🔗 Worker URL: https://shiny-rss2.${{ secrets.CLOUDFLARE_USERNAME_TWO }}.workers.dev"
