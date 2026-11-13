@@ -1,3049 +1,3216 @@
-// ============================================================
-// Telegram RSS Bot – KV-backed schedule + menu-based language
-// + per-chat per-anime tag lists (add + remove)
-// + profanity GIF replies (airing messages only, 6 random GIFs)
-// + trigger words loaded from words.json
-// + MAL Link rendered as a rich-message tg-button
-// + RTL for Persian rich messages via is_rtl
-// + rich-message URL extraction via unescaped full-payload search
-// + highlighted anime name via <mark>
-// + /schedule table with rich <input type="checkbox"> (date-accurate)
-// + standalone web app at /app (+ /api/schedule, /api/anime)
-// + anime detail modal (Alternative Titles + Information)
-// + direct-link Mini App (BotFather Web App section) for groups
-// + /debugreply diagnostic
-// + FIX: use `url` button (not `web_app`) with t.me direct link
-// + FIX: Durable Object owns broadcast queue + retry state
-// + FIX: migration from KV state handles legacy and object formats
-// + FIX: storage.list() returns Promise<Map> — await + for..of
-// + FIX: self-healing alarm via ensureAlarm()
-// + FIX: 3-layer message fallback (rich → plain<b> → raw text)
-// + FIX: isPermanentSendError catches parse errors
-// + FIX: newest-first queue order + retire stale (>1h or 6 tries)
-// + FIX: 400/403 treated as permanent
-// + FIX: handleEnqueue re-arms alarm to +100ms on new items
-// + FIX: MERGE pending items by animeKey + 45s grace period so
-//        batches that arrive incrementally across cron ticks
-//        become ONE combined message instead of N individual ones
-// + FIX: processPending re-reads schedule and upgrades stale
-//        batch metadata before sending
-// + NEW: /doflush reports per-chat failure reasons in Telegram
-// + NEW: /doself, /dodoctor, verbose [DO] logs
-// + NEW: /ultimatecatchrecipe — auto-responder that sends the
-//        per-chat tag list with a Tag me button whenever a
-//        message containing the trigger phrase is seen
-// ============================================================
+// ============= CONFIG (shared) =============
+const KV_CACHE_TTL = 30;
+const OWNER_ID_FALLBACK = 302287170;
 
-import PROFANITY_ANIMATIONS from './gifs.json';
-import PROFANITY_KEYWORDS from './words.json';
+const RLM = '\u200F';
 
-const TELEGRAM_API = 'https://api.telegram.org/bot';
-const JIKAN_API = 'https://api.jikan.moe/v4';
+// ============= ALLOWED CHATS =============
+const ALLOWED_CHAT_IDS = new Set([
+  -1004481485615,
+  -1004119297598,
+  302287170,
+]);
 
-const SCHEDULE_TZ = { fa: 'Asia/Tehran', en: 'UTC' };
-const JST = 'Asia/Tokyo';
+// ============= CONFIG (RSS) =============
+const RSS_TARGETS_KEY = 'rss:targets';
+const RSS_PIXEL_TARGETS_KEY = 'rss:pixel:targets';
+const ERRORS_KEY = 'errors:recent';
+const RSS_FETCH_TIMEOUT = 12000;
+const CRON_LAST_KEY = 'cron:last';
+const CRON_FIRED_FLAG_KEY = 'cron:fired_once';
 
-const WEEK_KV_KEY = 'sched:anilist:v5:week';
-const WEEK_STALE_TTL_MS = 24 * 60 * 60 * 1000;
-const TAG_TTL_SEC = 90 * 24 * 60 * 60;
-const MAX_TAGS_PER_ANIME = 100;
-const MAX_MENTIONS_SHOWN = 30;
+// ============= KV MIGRATION =============
+// Export format v2 stores the raw encrypted strings exactly as they sit in
+// KV — no plaintext user data ever leaves the storage. Import requires the
+// same DB_ENCRYPTION_KEY on the destination account.
+//
+// Exception: CRON_FIRED_FLAG_KEY is stored as plaintext ('1'), never
+// encrypted. The import path handles it before attempting decryption.
+const KV_EXPORT_KEYS = [
+  RSS_TARGETS_KEY,
+  RSS_PIXEL_TARGETS_KEY,
+  ERRORS_KEY,
+  'telemetry',
+  CRON_LAST_KEY,
+  CRON_FIRED_FLAG_KEY,
+];
 
-const BROADCAST_GAP_MS = 500;
-const BROADCAST_MAX_RETRIES = 4;
-const DO_TIME_BUDGET_MS = 25000;
-const DO_RETRY_BASE_MS = 5000;
-const DO_RETRY_MAX_MS = 60000;
-const DO_DONE_CLEANUP_MS = 24 * 60 * 60 * 1000;
-const DO_MAX_ITEM_ATTEMPTS = 6;
-const DO_STALE_ITEM_MS = 60 * 60 * 1000;
-const DO_BATCH_GRACE_MS = 45000;
-
-// ── /ultimatecatchrecipe ──
-// Trigger phrase WITHOUT brackets, using the same small-caps glyphs.
-const CATCH_TRIGGER = 'ᴀᴅᴅ⁠ ᴛʜɪs ᴄʜᴀʀᴀᴄᴛᴇʀ ᴛᴏ ʏᴏᴜʀ ʜᴀʀᴇᴍ ᴜsɪɴɢ';
-const CATCH_MODE_PREFIX = 'catchmode:';
-const CATCH_LIST_PREFIX = 'catchlist:';
-
-const WEBAPP_SHORT_NAME = 'schedule';
-
-let SUBREQUEST_COUNT = 0;
-let WORKER_ORIGIN = '';
-let CACHED_BOT_USERNAME = null;
-let CACHED_WEBAPP_LINK = null;
-let CACHED_BOT_ID = null;
-
-// ============= UTILITIES =============
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function isPermanentSendError(desc) {
-    return /blocked|chat not found|kicked|deactivated|bot was kicked|can't parse|parse entities|unsupported start tag|user is deactivated|message is too long|chat_id is empty|group chat was upgraded/i.test(String(desc || ''));
-}
-
-function jsonResponse(obj, status = 200) {
-    return new Response(JSON.stringify(obj), {
-        status,
-        headers: { 'content-type': 'application/json; charset=utf-8' },
-    });
-}
-
-async function doClient(env) {
-    const id = env.BROADCASTER.idFromName('global');
-    return env.BROADCASTER.get(id);
-}
-
-function isAdmin(env, msg) {
-    if (!msg || !msg.chat || msg.chat.type !== 'private') return false;
-    const adminId = env.ADMIN_ID;
-    if (!adminId) return true;
-    return String(msg.from && msg.from.id) === String(adminId);
-}
-
-// ============= SCHEDULE FROM KV =============
-
-async function fetchScheduleWeek(env) {
-    try {
-        const raw = await env.RSS_BOT_KV.get(WEEK_KV_KEY);
-        if (!raw) return {};
-        const parsed = JSON.parse(raw);
-        return parsed.week || {};
-    } catch (e) {
-        return {};
-    }
-}
-
-function localMinutes(unixSec, tz) {
-    const parts = new Intl.DateTimeFormat('en-GB', {
-        timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
-    }).formatToParts(new Date(unixSec * 1000));
-    let h = 0, m = 0;
-    for (const p of parts) {
-        if (p.type === 'hour') h = parseInt(p.value, 10) % 24;
-        if (p.type === 'minute') m = parseInt(p.value, 10);
-    }
-    return h * 60 + m;
-}
-
-function getYmdForDay(tz, dayName) {
-    const DAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
-    const targetIdx = DAYS.indexOf(String(dayName).toLowerCase());
-    if (targetIdx < 0) return null;
-
-    const now = new Date();
-    const todayName = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' })
-        .format(now).toLowerCase();
-    const todayIdx = DAYS.indexOf(todayName);
-    if (todayIdx < 0) return null;
-
-    let offset = targetIdx - todayIdx;
-    if (offset < 0) offset += 7;
-
-    const targetDate = new Date(now.getTime() + offset * 86400 * 1000);
-    return new Intl.DateTimeFormat('en-CA', {
-        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-    }).format(targetDate);
-}
-
-function animeGroupKey(e) {
-    if (!e) return null;
-    if (e.anilist_id) return `anilist:${e.anilist_id}`;
-    if (e.mal_id) return `mal:${e.mal_id}`;
-    return `title:${e.title}`;
-}
-
-function collapseBatches(entries) {
-    const byAnime = new Map();
-    for (const e of entries) {
-        const key = animeGroupKey(e);
-        if (!byAnime.has(key)) byAnime.set(key, []);
-        byAnime.get(key).push(e);
-    }
-    const grouped = [];
-    for (const eps of byAnime.values()) {
-        eps.sort((a, b) => (a.episode || 0) - (b.episode || 0));
-        const first = { ...eps[0] };
-        if (eps.length > 1) {
-            const epNums = eps.map(x => x.episode).filter(Number.isFinite);
-            first.batchEpisodes = {
-                count: eps.length,
-                min: epNums.length ? Math.min(...epNums) : null,
-                max: epNums.length ? Math.max(...epNums) : null,
-            };
-        }
-        grouped.push(first);
-    }
-    return grouped;
-}
-
-async function fetchScheduleForDay(env, dayKey, targetTz) {
-    const week = await fetchScheduleWeek(env);
-    if (!targetTz) return week[dayKey.toLowerCase()] || [];
-
-    const targetYmd = getYmdForDay(targetTz, dayKey);
-    if (!targetYmd) return [];
-
-    const flat = [];
-    for (const d of Object.keys(week)) flat.push(...week[d]);
-
-    const out = [];
-    for (const e of flat) {
-        if (!e.airingAt) continue;
-        const d = new Date(e.airingAt * 1000);
-        const localYmd = new Intl.DateTimeFormat('en-CA', {
-            timeZone: targetTz, year: 'numeric', month: '2-digit', day: '2-digit',
-        }).format(d);
-        if (localYmd === targetYmd) out.push(e);
-    }
-
-    out.sort((a, b) => {
-        const ma = localMinutes(a.airingAt, targetTz);
-        const mb = localMinutes(b.airingAt, targetTz);
-        if (ma !== mb) return ma - mb;
-        return a.airingAt - b.airingAt;
-    });
-
-    const grouped = collapseBatches(out);
-    grouped.sort((a, b) => {
-        const ma = localMinutes(a.airingAt, targetTz);
-        const mb = localMinutes(b.airingAt, targetTz);
-        if (ma !== mb) return ma - mb;
-        return a.airingAt - b.airingAt;
-    });
-    return grouped;
-}
-
-// ============= TELEGRAM WEB APP LINK =============
-
-async function getWebAppLink(env) {
-    if (CACHED_WEBAPP_LINK) return CACHED_WEBAPP_LINK;
-
-    if (!CACHED_BOT_USERNAME) {
-        try {
-            const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMe`);
-            const json = await res.json();
-            if (json && json.ok && json.result) {
-                CACHED_BOT_USERNAME = json.result.username;
-                CACHED_BOT_ID = json.result.id;
-            }
-        } catch (e) {
-            console.warn('[WEBAPP] getMe failed:', e.message);
-        }
-    }
-
-    if (CACHED_BOT_USERNAME) {
-        CACHED_WEBAPP_LINK = `https://t.me/${CACHED_BOT_USERNAME}/${WEBAPP_SHORT_NAME}`;
-    } else {
-        CACHED_WEBAPP_LINK = `${WORKER_ORIGIN}/app`;
-    }
-
-    return CACHED_WEBAPP_LINK;
-}
-
-// ============= BOTFATHER COMMAND READER =============
-
-async function fetchBotFatherCommands(env, lang) {
-    const payload = { scope: { type: 'default' } };
-    if (lang === 'fa') payload.language_code = 'fa';
-    try {
-        const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMyCommands`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const json = await res.json();
-        return Array.isArray(json.result) ? json.result : null;
-    } catch (e) { return null; }
-}
-
-async function applyBotFatherCommandsToChat(env, chatId, lang) {
-    const commands = await fetchBotFatherCommands(env, lang);
-    if (!commands || commands.length === 0) return;
-    try {
-        await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/setMyCommands`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ commands, scope: { type: 'chat', chat_id: chatId } }),
-        });
-    } catch (e) {}
-}
-
-// ============= LANGUAGE VIA BOTFATHER LOCALIZATION =============
-
-const LANG_DETECT_CACHE = new Map();
-const LANG_CACHE_TTL_MS = 5 * 60 * 1000;
-
-function isPersianText(text) {
-    return /[\u0600-\u06FF]/.test(String(text || ''));
-}
-
-async function getLang(env, chatId) {
-    const key = String(chatId);
-    const cached = LANG_DETECT_CACHE.get(key);
-    if (cached && Date.now() - cached.ts < LANG_CACHE_TTL_MS) return cached.lang;
-    try {
-        const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMyCommands`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ scope: { type: 'chat', chat_id: chatId } }),
-        });
-        const json = await res.json();
-        const commands = Array.isArray(json.result) ? json.result : [];
-        let lang = 'en';
-        for (const c of commands) {
-            if (isPersianText(c.description)) { lang = 'fa'; break; }
-        }
-        LANG_DETECT_CACHE.set(key, { lang, ts: Date.now() });
-        return lang;
-    } catch (e) { return 'en'; }
-}
-
-async function setLang(env, chatId, lang) {
-    await applyBotFatherCommandsToChat(env, chatId, lang);
-    LANG_DETECT_CACHE.set(String(chatId), { lang, ts: Date.now() });
-}
-
-// ============= /ultimatecatchrecipe =============
-
-function normalizeTriggerText(s) {
-    return String(s || '').replace(/[\u2060\u200B\u200C\u200D\uFEFF]/g, '');
-}
-
-const CATCH_TRIGGER_NORMALIZED = normalizeTriggerText(CATCH_TRIGGER);
-
-function hasCatchTrigger(text) {
-    if (!text) return false;
-    return normalizeTriggerText(text).includes(CATCH_TRIGGER_NORMALIZED);
-}
-
-async function getBotChatMemberStatus(env, chatId) {
-    if (!CACHED_BOT_ID) {
-        try {
-            const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMe`);
-            const json = await res.json();
-            if (json.ok) {
-                CACHED_BOT_USERNAME = json.result.username;
-                CACHED_BOT_ID = json.result.id;
-            }
-        } catch {}
-    }
-    if (!CACHED_BOT_ID) return { ok: false, reason: 'no-bot-id' };
-
-    try {
-        const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getChatMember`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, user_id: CACHED_BOT_ID }),
-        });
-        const json = await res.json();
-        if (!json.ok) return { ok: false, reason: json.description };
-        const status = json.result.status;
-        return {
-            ok: true,
-            status,
-            isAdmin: status === 'creator' || status === 'administrator',
-            isMember: status !== 'left' && status !== 'kicked',
-        };
-    } catch (e) {
-        return { ok: false, reason: e.message };
-    }
-}
-
-async function getCatchList(env, chatId) {
-    const key = `${CATCH_LIST_PREFIX}${chatId}`;
-    try {
-        const raw = await env.RSS_BOT_KV.get(key);
-        if (!raw) return [];
-        return decryptData(raw);
-    } catch { return []; }
-}
-
-async function saveCatchList(env, chatId, list) {
-    const key = `${CATCH_LIST_PREFIX}${chatId}`;
-    await env.RSS_BOT_KV.put(key, encryptData(list), { expirationTtl: TAG_TTL_SEC });
-}
-
-async function addToCatchList(env, chatId, user) {
-    const list = await getCatchList(env, chatId);
-    if (list.some((u) => u.userId === user.userId)) return { added: false, list, reason: 'duplicate' };
-    if (list.length >= MAX_TAGS_PER_ANIME) return { added: false, list, reason: 'full' };
-    list.push(user);
-    await saveCatchList(env, chatId, list);
-    return { added: true, list };
-}
-
-function formatCatchListText(users, lang) {
-    const isFa = lang === 'fa';
-    const label = isFa ? '🏷 لیست تگ:' : '🏷 Tag list:';
-    if (!users || users.length === 0) {
-        return `<b>${label}</b>\n${isFa ? '<i>هنوز کسی نیست — اولین نفر باش!</i>' : '<i>Nobody yet — be the first!</i>'}`;
-    }
-    const shown = users.slice(0, MAX_MENTIONS_SHOWN);
-    const lines = shown.map(renderUserMention);
-    let out = `<b>${label}</b>\n${lines.join('\n')}`;
-    if (users.length > MAX_MENTIONS_SHOWN) {
-        const extra = users.length - MAX_MENTIONS_SHOWN;
-        out += isFa ? `\n<i>و ${extra} نفر دیگر…</i>` : `\n<i>and ${extra} more…</i>`;
-    }
-    return out;
-}
-
-function buildCatchKeyboard(lang) {
-    const isFa = lang === 'fa';
-    return {
-        inline_keyboard: [[
-            { text: isFa ? '🏷 تگ کن' : '🏷 Tag me', callback_data: 'catch:tag' },
-        ]],
-    };
-}
-
-async function sendCatchMessage(env, chatId, sourceMsg) {
-    const lang = await getLang(env, chatId);
-    const list = await getCatchList(env, chatId);
-    const text = formatCatchListText(list, lang);
-    return await sendMessage(env, chatId, text, {
-        reply_to_message_id: sourceMsg.message_id,
-        reply_markup: buildCatchKeyboard(lang),
-    });
-}
-
-async function handleUltimateCatchRecipe(env, msg) {
-    const chatId = msg.chat.id;
-    const chatType = msg.chat.type;
-    const lang = await getLang(env, chatId);
-
-    if (chatType === 'private') {
-        await sendMessage(env, chatId, lang === 'fa'
-            ? '⚠️ این دستور فقط در گروه‌ها و کانال‌ها کار می‌کند.'
-            : '⚠️ This command only works in groups and channels.');
-        return;
-    }
-
-    const args = String(msg.text || '').trim().split(/\s+/).slice(1).map((s) => s.toLowerCase());
-    if (args.includes('clear') || args.includes('reset')) {
-        await saveCatchList(env, chatId, []);
-        await sendMessage(env, chatId, lang === 'fa'
-            ? '🧹 لیست تگ پاک شد.'
-            : '🧹 Tag list cleared.');
-        return;
-    }
-
-    const botStatus = await getBotChatMemberStatus(env, chatId);
-    if (!botStatus.ok) {
-        await sendMessage(env, chatId, lang === 'fa'
-            ? `❌ وضعیت ربات مشخص نیست: ${botStatus.reason || 'unknown'}`
-            : `❌ Cannot determine bot status: ${botStatus.reason || 'unknown'}`);
-        return;
-    }
-
-    if (!botStatus.isAdmin) {
-        await sendMessage(env, chatId, lang === 'fa'
-            ? '❌ برای فعال‌سازی، ربات باید ادمین این گروه/کانال باشد.\n' +
-              '📌 اگر گروه است، حتماً از @BotFather گزینه Privacy Mode را غیرفعال کنید تا پیام‌های عادی را ببیند.'
-            : '❌ To enable this, the bot must be an admin of this group/channel.\n' +
-              '📌 If it\'s a group, also disable Privacy Mode via @BotFather so the bot can see regular messages.');
-        return;
-    }
-
-    const key = `${CATCH_MODE_PREFIX}${chatId}`;
-    const current = await env.RSS_BOT_KV.get(key);
-
-    if (current === 'on') {
-        await env.RSS_BOT_KV.delete(key);
-        await sendMessage(env, chatId, lang === 'fa'
-            ? '🍳 حالت Catch خاموش شد.'
-            : '🍳 Catch mode disabled.');
-        return;
-    }
-
-    await env.RSS_BOT_KV.put(key, 'on');
-    const trigPreview = `<code>${escapeHtml(CATCH_TRIGGER)}</code>`;
-    let note = '';
-    if (chatType === 'group' || chatType === 'supergroup') {
-        note = lang === 'fa'
-            ? '\n\n⚠️ در گروه‌ها باید Privacy Mode از @BotFather غیرفعال باشد.'
-            : '\n\n⚠️ In groups, Privacy Mode must be disabled via @BotFather.';
-    }
-
-    await sendMessage(env, chatId, lang === 'fa'
-        ? `🍳 <b>حالت Catch روشن شد.</b>\n\nبه هر پیامی که شامل این عبارت باشد پاسخ می‌دهم:\n${trigPreview}${note}\n\n<code>/ultimatecatchrecipe</code> → خاموش کردن\n<code>/ultimatecatchrecipe clear</code> → پاک کردن لیست`
-        : `🍳 <b>Catch mode enabled.</b>\n\nI'll respond to any message containing:\n${trigPreview}${note}\n\n<code>/ultimatecatchrecipe</code> → disable\n<code>/ultimatecatchrecipe clear</code> → clear list`);
-}
+// Browser-like UA used for RSS fetches (helps bypass Cloudflare bot checks).
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // ============= ENCRYPTION =============
-let ENCRYPTION_KEY = 'default-key-please-change-me';
-
-function encryptData(data) {
-    const plaintext = new TextEncoder().encode(JSON.stringify(data));
-    const keyBytes = new TextEncoder().encode(ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32));
-    const out = new Uint8Array(plaintext.length);
-    for (let i = 0; i < plaintext.length; i++) out[i] = plaintext[i] ^ keyBytes[i % keyBytes.length];
-    return btoa(String.fromCharCode(...out));
-}
-
-function decryptData(str) {
-    const enc = Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
-    const keyBytes = new TextEncoder().encode(ENCRYPTION_KEY.padEnd(32, '0').slice(0, 32));
-    const out = new Uint8Array(enc.length);
-    for (let i = 0; i < enc.length; i++) out[i] = enc[i] ^ keyBytes[i % keyBytes.length];
-    return JSON.parse(new TextDecoder().decode(out));
-}
-
-// ============= BROADCAST CHAT LIST =============
-
-async function getBroadcastChats(env) {
-    const raw = await env.RSS_BOT_KV.get('broadcast_chats');
-    if (!raw) return [];
-    try { return decryptData(raw); } catch { return []; }
-}
-async function saveBroadcastChats(env, chats) {
-    await env.RSS_BOT_KV.put('broadcast_chats', encryptData(chats));
-}
-async function addChatToBroadcast(env, chatId) {
-    const chats = await getBroadcastChats(env);
-    if (!chats.includes(chatId)) { chats.push(chatId); await saveBroadcastChats(env, chats); }
-}
-async function removeChatFromBroadcast(env, chatId) {
-    const chats = await getBroadcastChats(env);
-    const filtered = chats.filter((id) => id !== chatId);
-    if (filtered.length !== chats.length) await saveBroadcastChats(env, filtered);
-}
-
-// ============= TAG LISTS (KV) =============
-
-function animeKeyFromEntry(e) {
-    if (!e) return null;
-    if (e.mal_id) return `mal:${e.mal_id}`;
-    if (e.anilist_id) return `anilist:${e.anilist_id}`;
-    return null;
-}
-
-async function getTagList(env, chatId, animeKey) {
-    const key = `tag:${chatId}:${animeKey}`;
-    try {
-        const raw = await env.RSS_BOT_KV.get(key);
-        if (!raw) return [];
-        return decryptData(raw);
-    } catch { return []; }
-}
-
-async function saveTagList(env, chatId, animeKey, list) {
-    const key = `tag:${chatId}:${animeKey}`;
-    await env.RSS_BOT_KV.put(key, encryptData(list), { expirationTtl: TAG_TTL_SEC });
-}
-
-async function addTag(env, chatId, animeKey, user) {
-    const list = await getTagList(env, chatId, animeKey);
-    if (list.some((u) => u.userId === user.userId)) return { added: false, list, reason: 'duplicate' };
-    if (list.length >= MAX_TAGS_PER_ANIME) return { added: false, list, reason: 'full' };
-    list.push(user);
-    await saveTagList(env, chatId, animeKey, list);
-    return { added: true, list };
-}
-
-async function removeTag(env, chatId, animeKey, userId) {
-    const list = await getTagList(env, chatId, animeKey);
-    const filtered = list.filter((u) => u.userId !== userId);
-    if (filtered.length === list.length) return { removed: false, list, reason: 'not-in-list' };
-    await saveTagList(env, chatId, animeKey, filtered);
-    return { removed: true, list: filtered };
-}
-
-function extractTitleFromAiringText(text) {
-    if (!text) return null;
-    const clean = String(text).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    if (!clean) return null;
-
-    let m = clean.match(/(.+?)\s+Season\s+(\d+)\s*[-–]\s*Episode\s+\d+\s+Aired!/i);
-    if (m) return { base: m[1].trim(), season: parseInt(m[2], 10) };
-
-    m = clean.match(/(.+?)\s*[-–]\s*Episode\s+\d+\s+Aired!/i);
-    if (m) return { base: m[1].trim(), season: null };
-
-    m = clean.match(/قسمت\s+\d+\s+فصل\s+(\d+)\s+انیمه\s+(.+?)\s+اومد!/);
-    if (m) return { base: m[2].trim(), season: parseInt(m[1], 10) };
-
-    m = clean.match(/قسمت\s+\d+\s+انیمه\s+(.+?)\s+اومد!/);
-    if (m) return { base: m[1].trim(), season: null };
-
-    return null;
-}
-
-function normalizeTitleForMatch(s) {
-    return String(s || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-}
-
-async function findAnimeKeyByTitle(env, base, season) {
-    const week = await fetchScheduleWeek(env);
-    const all = [];
-    for (const d of Object.keys(week)) all.push(...week[d]);
-    const target = normalizeTitleForMatch(base);
-    for (const e of all) {
-        const parsed = parseAnimeTitle(e.title);
-        if (normalizeTitleForMatch(parsed.base) !== target) continue;
-        if (season != null && parsed.season !== season) continue;
-        if (season == null && parsed.season != null) continue;
-        return animeKeyFromEntry(e);
-    }
-    return null;
-}
-
-async function extractAnimeKeyFromMessage(msg, env) {
-    if (!msg) return null;
-
-    try {
-        const blob = JSON.stringify(msg).replace(/\\\//g, '/');
-        let m = blob.match(/myanimelist\.net\/anime\/(\d+)/);
-        if (m) return `mal:${m[1]}`;
-        m = blob.match(/anilist\.co\/anime\/(\d+)/);
-        if (m) return `anilist:${m[1]}`;
-    } catch (e) {}
-
-    if (msg.reply_markup && Array.isArray(msg.reply_markup.inline_keyboard)) {
-        for (const row of msg.reply_markup.inline_keyboard) {
-            for (const btn of row) {
-                if (btn.url) {
-                    let m = btn.url.match(/myanimelist\.net\/anime\/(\d+)/);
-                    if (m) return `mal:${m[1]}`;
-                    m = btn.url.match(/anilist\.co\/anime\/(\d+)/);
-                    if (m) return `anilist:${m[1]}`;
-                }
-            }
-        }
-    }
-
-    if (Array.isArray(msg.entities)) {
-        for (const ent of msg.entities) {
-            if (ent.type === 'text_link' && ent.url) {
-                let m = ent.url.match(/myanimelist\.net\/anime\/(\d+)/);
-                if (m) return `mal:${m[1]}`;
-                m = ent.url.match(/anilist\.co\/anime\/(\d+)/);
-                if (m) return `anilist:${m[1]}`;
-            }
-        }
-    }
-
-    const text = msg.text || msg.caption || '';
-    let m = text.match(/myanimelist\.net\/anime\/(\d+)/);
-    if (m) return `mal:${m[1]}`;
-    m = text.match(/anilist\.co\/anime\/(\d+)/);
-    if (m) return `anilist:${m[1]}`;
-
-    if (env) {
-        const parsed = extractTitleFromAiringText(text);
-        if (parsed) {
-            const found = await findAnimeKeyByTitle(env, parsed.base, parsed.season);
-            if (found) return found;
-        }
-    }
-
-    return null;
-}
-
-function renderUserMention(u) {
-    if (u.username) return `@${escapeHtml(u.username)}`;
-    const name = escapeHtml(u.firstName || 'User');
-    return `<a href="tg://user?id=${u.userId}">${name}</a>`;
-}
-
-function formatTagList(users, lang) {
-    if (!users || users.length === 0) return '';
-    const label = lang === 'fa' ? 'لیست تگ این انیمه:' : 'Tag list for this anime:';
-    const shown = users.slice(0, MAX_MENTIONS_SHOWN);
-    const lines = shown.map(renderUserMention);
-    let out = `<b>${label}</b>\n${lines.join('\n')}`;
-    if (users.length > MAX_MENTIONS_SHOWN) {
-        const extra = users.length - MAX_MENTIONS_SHOWN;
-        out += lang === 'fa' ? `\n<i>و ${extra} نفر دیگر…</i>` : `\n<i>and ${extra} more…</i>`;
-    }
-    return out;
-}
-
-async function handleTagReply(env, msg) {
-    try {
-        const chatId = msg.chat.id;
-        const from = msg.from;
-        const replied = msg.reply_to_message;
-
-        if (!replied) return;
-        if (!replied.from || !replied.from.is_bot) return;
-
-        const animeKey = await extractAnimeKeyFromMessage(replied, env);
-        if (!animeKey) return;
-
-        const user = {
-            userId: from.id,
-            username: from.username || null,
-            firstName: from.first_name || null,
-        };
-
-        const lang = await getLang(env, chatId);
-        const result = await addTag(env, chatId, animeKey, user);
-
-        const mention = `<a href="tg://user?id=${from.id}">${escapeHtml(from.first_name || 'User')}</a>`;
-        let reply;
-        if (result.added) {
-            reply = lang === 'fa'
-                ? `✅ ${mention} به لیست تگ اضافه شد.\n\nاز این پس در پیام‌های این انیمه تگ می‌شوید (${result.list.length} نفر).`
-                : `✅ ${mention} added to the tag list.\n\nYou will be tagged in this anime's future airings (${result.list.length} user(s)).`;
-        } else if (result.reason === 'duplicate') {
-            reply = lang === 'fa' ? 'ℹ️ شما قبلاً در لیست تگ این انیمه هستید.' : 'ℹ️ You are already in this anime\'s tag list.';
-        } else {
-            reply = lang === 'fa' ? '⚠️ لیست تگ این انیمه پر است.' : '⚠️ This anime\'s tag list is full.';
-        }
-
-        await sendMessage(env, chatId, reply, { reply_to_message_id: msg.message_id });
-    } catch (e) {
-        console.error(`[TAG] EXCEPTION: ${e.message}`);
-    }
-}
-
-async function handleUntagReply(env, msg) {
-    const chatId = msg.chat.id;
-    const from = msg.from;
-    const replied = msg.reply_to_message;
-    if (!replied || !replied.from || !replied.from.is_bot) return;
-
-    const animeKey = await extractAnimeKeyFromMessage(replied, env);
-    if (!animeKey) return;
-
-    const lang = await getLang(env, chatId);
-    const result = await removeTag(env, chatId, animeKey, from.id);
-    const mention = `<a href="tg://user?id=${from.id}">${escapeHtml(from.first_name || 'User')}</a>`;
-
-    let reply;
-    if (result.removed) {
-        reply = lang === 'fa'
-            ? `✅ ${mention} از لیست تگ حذف شد.\n\nاز این پس در پیام‌های این انیمه تگ نمی‌شوید (${result.list.length} نفر باقی مانده).`
-            : `✅ ${mention} removed from the tag list.\n\nYou will no longer be tagged for this anime (${result.list.length} user(s) remaining).`;
-    } else {
-        reply = lang === 'fa' ? 'ℹ️ شما در لیست تگ این انیمه نیستید.' : 'ℹ️ You are not in this anime\'s tag list.';
-    }
-
-    await sendMessage(env, chatId, reply, { reply_to_message_id: msg.message_id });
-}
-
-// ============= PROFANITY GIF =============
-
-const PROFANITY_BOUNDARY = '[\\s!؟?.,،;:…\\-()\\[\\]"\']';
-
-function hasWholeWord(text, word) {
-    const re = new RegExp(`(?:^|${PROFANITY_BOUNDARY})${word}(?=${PROFANITY_BOUNDARY}|$)`, 'u');
-    return re.test(text);
-}
-
-function isProfanityReply(msg) {
-    const raw = String(msg.text || '').trim();
-    if (!raw) return false;
-    const stripped = raw.replace(/[!؟?.,…\s]+$/g, '').trim();
-    for (const w of PROFANITY_KEYWORDS) if (stripped === w) return true;
-    if (raw.length <= 60) {
-        for (const w of PROFANITY_KEYWORDS) if (hasWholeWord(raw, w)) return true;
-    }
-    return false;
-}
-
-async function looksLikeAiringMessage(env, msg) {
-    if (!msg) return false;
-    if (!msg.from || !msg.from.is_bot) return false;
-    const key = await extractAnimeKeyFromMessage(msg, env);
-    if (key) return true;
-    const text = msg.text || msg.caption || '';
-    if (/Aired!/.test(text)) return true;
-    if (/اومد!/.test(text)) return true;
-    return false;
-}
-
-async function handleProfanityReply(env, msg) {
-    const chatId = msg.chat.id;
-    const fileId = PROFANITY_ANIMATIONS[Math.floor(Math.random() * PROFANITY_ANIMATIONS.length)];
-    await sendAnimation(env, chatId, fileId, { reply_to_message_id: msg.message_id });
-}
-
-// ============= /debugreply DIAGNOSTIC =============
-
-async function handleDebugReply(env, msg) {
-    const replied = msg.reply_to_message;
-    if (!replied) {
-        await sendMessage(env, msg.chat.id, '🐛 No reply_to_message present.');
-        return;
-    }
-
-    const summary = {
-        message_id: replied.message_id,
-        from: replied.from ? { id: replied.from.id, is_bot: replied.from.is_bot } : null,
-        has_text: !!replied.text,
-        entities: Array.isArray(replied.entities) ? replied.entities.length : null,
-        reply_markup: replied.reply_markup ? 'yes' : null,
-        rich_message_blob: replied.rich_message
-            ? JSON.stringify(replied.rich_message).slice(0, 1500)
-            : null,
-        extra_keys: Object.keys(replied).filter((k) =>
-            ['text', 'caption', 'entities', 'caption_entities', 'reply_markup', 'from', 'message_id'].indexOf(k) === -1
-        ),
-    };
-
-    const jsonStr = JSON.stringify(summary, null, 2);
-    const chunks = [];
-    let remaining = jsonStr;
-    while (remaining.length > 3500) {
-        chunks.push(remaining.slice(0, 3500));
-        remaining = remaining.slice(3500);
-    }
-    chunks.push(remaining);
-
-    for (let i = 0; i < chunks.length; i++) {
-        const header = chunks.length > 1 ? `🐛 <b>Debug Reply (${i + 1}/${chunks.length})</b>\n` : `🐛 <b>Debug Reply</b>\n`;
-        await sendMessage(env, msg.chat.id, header + `<pre>${escapeHtml(chunks[i])}</pre>`);
-    }
-}
-
-// ============= TITLE PARSING =============
-
-function parseAnimeTitle(title) {
-    let m = title.match(/^(.*?)\s+Season\s+(\d+)$/i);
-    if (m) return { base: m[1].trim(), season: parseInt(m[2], 10) };
-    m = title.match(/^(.*?)\s+(\d+)(?:st|nd|rd|th)\s+Season$/i);
-    if (m) return { base: m[1].trim(), season: parseInt(m[2], 10) };
-    m = title.match(/^(.*?)\s+(II|III|IV|V|VI|VII|VIII|IX|X)$/i);
-    if (m) {
-        const rm = { ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
-        const s = rm[m[2].toLowerCase()];
-        if (s) return { base: m[1].trim(), season: s };
-    }
-    return { base: title, season: null };
-}
-
-// ============= FORMATTING =============
-
-function formatAiringMessage(title, epNum, totalEps, malLink, lang, prefix = '', batch = null) {
-    const { base, season } = parseAnimeTitle(title);
-    const isFa = lang === 'fa';
-    const nameHtml = `<mark><b>${base}</b></mark>`;
-
-    let body;
-    if (batch) {
-        const range = isFa ? `${batch.min} تا ${batch.max}` : `${batch.min} to ${batch.max}`;
-        if (season) {
-            body = isFa
-                ? `قسمت‌های ${range} فصل ${season} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} Season ${season} - Episodes ${range} Aired!`;
-        } else {
-            body = isFa
-                ? `قسمت‌های ${range} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} - Episodes ${range} Aired!`;
-        }
-        if (totalEps && batch.max >= totalEps) body += isFa ? ' (پایان)' : ' (end)';
-    } else {
-        if (season) {
-            body = isFa
-                ? `قسمت ${epNum} فصل ${season} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} Season ${season} - Episode ${epNum} Aired!`;
-        } else {
-            body = isFa
-                ? `قسمت ${epNum} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} - Episode ${epNum} Aired!`;
-        }
-        if (totalEps && epNum >= totalEps) body += isFa ? ' (پایان)' : ' (end)';
-    }
-
-    const counterLabel = isFa ? 'تعداد قسمت‌ها' : 'Episode Count';
-    const shown = batch ? batch.max : epNum;
-    const counter = totalEps ? `${counterLabel}: ${shown}/${totalEps}` : `${counterLabel}: ${shown}/?`;
-
-    let buttonHtml = '';
-    if (malLink) {
-        const url = String(malLink);
-        let label;
-        if (url.includes('myanimelist.net')) label = isFa ? 'لینک MAL' : 'MAL Link';
-        else if (url.includes('anilist.co')) label = isFa ? 'لینک AniList' : 'AniList Link';
-        else label = isFa ? 'لینک' : 'Link';
-        buttonHtml = `<p><tg-button url="${url}">${label}</tg-button></p>`;
-    }
-
-    const prefixHtml = prefix ? `<p><b>${prefix}</b></p>` : '';
-    return `${prefixHtml}<p>${body}</p><p>${counter}</p>${buttonHtml}`;
-}
-
-function formatAiringMessagePlain(title, epNum, totalEps, malLink, lang, prefix = '', batch = null) {
-    const { base, season } = parseAnimeTitle(title);
-    const pre = prefix ? `<b>${prefix}</b>\n` : '';
-    const nameHtml = `<b>${escapeHtml(base)}</b>`;
-    const isFa = lang === 'fa';
-
-    let body;
-    if (batch) {
-        const range = isFa ? `${batch.min} تا ${batch.max}` : `${batch.min} to ${batch.max}`;
-        if (season) {
-            body = isFa
-                ? `قسمت‌های ${range} فصل ${season} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} Season ${season} - Episodes ${range} Aired!`;
-        } else {
-            body = isFa
-                ? `قسمت‌های ${range} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} - Episodes ${range} Aired!`;
-        }
-        if (totalEps && batch.max >= totalEps) body += isFa ? ' (پایان)' : ' (end)';
-    } else {
-        if (season) {
-            body = isFa
-                ? `قسمت ${epNum} فصل ${season} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} Season ${season} - Episode ${epNum} Aired!`;
-        } else {
-            body = isFa
-                ? `قسمت ${epNum} انیمه ${nameHtml} اومد!`
-                : `${nameHtml} - Episode ${epNum} Aired!`;
-        }
-        if (totalEps && epNum >= totalEps) body += isFa ? ' (پایان)' : ' (end)';
-    }
-
-    const counterLabel = isFa ? 'تعداد قسمت‌ها' : 'Episode Count';
-    const shown = batch ? batch.max : epNum;
-    body += `\n\n${counterLabel}: ${totalEps ? `${shown}/${totalEps}` : `${shown}/?`}`;
-
-    if (malLink) {
-        const url = String(malLink);
-        let label;
-        if (url.includes('myanimelist.net')) label = isFa ? 'لینک MAL' : 'MAL Link';
-        else if (url.includes('anilist.co')) label = isFa ? 'لینک AniList' : 'AniList Link';
-        else label = isFa ? 'لینک' : 'Link';
-        body += `\n\n<a href="${url}">${label}</a>`;
-    }
-
-    return pre + body;
-}
-
-function formatAiringMessageSafe(title, epNum, totalEps, malLink, lang, prefix = '', batch = null) {
-    const { base, season } = parseAnimeTitle(title);
-    const isFa = lang === 'fa';
-    const pre = prefix ? `${prefix}\n` : '';
-
-    let body;
-    if (batch) {
-        const range = isFa ? `${batch.min} تا ${batch.max}` : `${batch.min} to ${batch.max}`;
-        if (season) {
-            body = isFa
-                ? `قسمت‌های ${range} فصل ${season} انیمه ${base} اومد!`
-                : `${base} Season ${season} - Episodes ${range} Aired!`;
-        } else {
-            body = isFa
-                ? `قسمت‌های ${range} انیمه ${base} اومد!`
-                : `${base} - Episodes ${range} Aired!`;
-        }
-        if (totalEps && batch.max >= totalEps) body += isFa ? ' (پایان)' : ' (end)';
-    } else {
-        if (season) {
-            body = isFa
-                ? `قسمت ${epNum} فصل ${season} انیمه ${base} اومد!`
-                : `${base} Season ${season} - Episode ${epNum} Aired!`;
-        } else {
-            body = isFa
-                ? `قسمت ${epNum} انیمه ${base} اومد!`
-                : `${base} - Episode ${epNum} Aired!`;
-        }
-        if (totalEps && epNum >= totalEps) body += isFa ? ' (پایان)' : ' (end)';
-    }
-
-    const counterLabel = isFa ? 'تعداد قسمت‌ها' : 'Episode Count';
-    const shown = batch ? batch.max : epNum;
-    body += `\n\n${counterLabel}: ${totalEps ? `${shown}/${totalEps}` : `${shown}/?`}`;
-
-    if (malLink) {
-        body += `\n\n${malLink}`;
-    }
-
-    return pre + body;
-}
-
-function convertToTz(unixSec, targetTz) {
-    try {
-        return new Intl.DateTimeFormat('en-GB', {
-            timeZone: targetTz, hour: '2-digit', minute: '2-digit', hour12: false,
-        }).format(new Date(unixSec * 1000));
-    } catch { return '--:--'; }
-}
-
-// ============= ANIME DETAIL =============
-
-const ANIME_DETAIL_CACHE = new Map();
-const ANIME_DETAIL_TTL_MS = 60 * 60 * 1000;
-
-function stripTags(s) {
-    return String(s || '')
-        .replace(/<br\s*\/?>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#0?39;/g, "'")
-        .replace(/&nbsp;/g, ' ')
-        .replace(/\s+,\s*/g, ', ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-function extractMalLabel(html, label) {
-    const re = new RegExp(
-        '<span class="dark_text">\\s*' + label + ':\\s*</span>([\\s\\S]*?)' +
-        '(?=<span class="dark_text">|<\\/div>)',
-        'i'
+function encryptData(data, key) {
+  const jsonStr = JSON.stringify(data);
+  const encoder = new TextEncoder();
+  const plaintext = encoder.encode(jsonStr);
+  const keyBytes = encoder.encode(key.padEnd(32, '0').slice(0, 32));
+  const encrypted = new Uint8Array(plaintext.length);
+  for (let i = 0; i < plaintext.length; i++) {
+    encrypted[i] = plaintext[i] ^ keyBytes[i % keyBytes.length];
+  }
+  let binary = '';
+  const CHUNK = 8192;
+  for (let i = 0; i < encrypted.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(
+      null,
+      encrypted.subarray(i, i + CHUNK)
     );
-    const m = html.match(re);
-    if (!m) return null;
-    const cleaned = stripTags(m[1]);
-    return cleaned || null;
+  }
+  return btoa(binary);
 }
 
-function parseMalHtml(html, malId) {
-    const synonymsRaw = extractMalLabel(html, 'Synonyms');
-    const synonyms = synonymsRaw
-        ? synonymsRaw.split(/\s*,\s*/).map((s) => s.trim()).filter(Boolean)
-        : [];
-
-    const alt = {
-        japanese: extractMalLabel(html, 'Japanese'),
-        english: extractMalLabel(html, 'English'),
-        synonyms,
-    };
-
-    const info = {
-        type: extractMalLabel(html, 'Type'),
-        episodes: extractMalLabel(html, 'Episodes'),
-        status: extractMalLabel(html, 'Status'),
-        aired: extractMalLabel(html, 'Aired'),
-        producers: extractMalLabel(html, 'Producers'),
-        licensors: extractMalLabel(html, 'Licensors'),
-        studios: extractMalLabel(html, 'Studios'),
-        source: extractMalLabel(html, 'Source'),
-        genres: extractMalLabel(html, 'Genres'),
-        duration: extractMalLabel(html, 'Duration'),
-        rating: extractMalLabel(html, 'Rating'),
-    };
-
-    const hasAny = alt.japanese || alt.english || info.type || info.episodes;
-    if (!hasAny) return null;
-
-    return {
-        id: malId,
-        url: `https://myanimelist.net/anime/${malId}`,
-        alternativeTitles: alt,
-        information: info,
-    };
+function decryptData(encryptedStr, key) {
+  const encrypted = Uint8Array.from(atob(encryptedStr), (c) =>
+    c.charCodeAt(0)
+  );
+  const keyBytes = new TextEncoder().encode(
+    key.padEnd(32, '0').slice(0, 32)
+  );
+  const decrypted = new Uint8Array(encrypted.length);
+  for (let i = 0; i < encrypted.length; i++) {
+    decrypted[i] = encrypted[i] ^ keyBytes[i % keyBytes.length];
+  }
+  return JSON.parse(new TextDecoder().decode(decrypted));
 }
 
-function joinEntityNames(arr) {
-    if (!Array.isArray(arr) || arr.length === 0) return 'None found';
-    const names = arr
-        .map((x) => (typeof x === 'string' ? x : x && x.name))
-        .filter(Boolean);
-    return names.length ? names.join(', ') : 'None found';
+function htmlEsc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }[c])
+  );
 }
 
-function normalizeJikanAnime(a) {
-    return {
-        id: a.mal_id,
-        url: a.url || `https://myanimelist.net/anime/${a.mal_id}`,
-        alternativeTitles: {
-            japanese: a.title_japanese || null,
-            english: a.title_english || null,
-            synonyms: Array.isArray(a.title_synonyms) ? a.title_synonyms : [],
-        },
-        information: {
-            type: a.type || null,
-            episodes: a.episodes != null ? String(a.episodes) : null,
-            status: a.status || null,
-            aired: (a.aired && a.aired.string) || null,
-            producers: joinEntityNames(a.producers),
-            licensors: joinEntityNames(a.licensors),
-            studios: joinEntityNames(a.studios),
-            source: a.source || null,
-            genres: joinEntityNames(a.genres),
-            duration: a.duration || null,
-            rating: a.rating || null,
-        },
-    };
+function linesToRichHtml(lines) {
+  return (lines || [])
+    .map((l) => (l === '' ? '<p>&nbsp;</p>' : `<p>${htmlEsc(l)}</p>`))
+    .join('\n');
 }
 
-async function fetchAnimeFromJikan(malId, attempt = 1) {
-    try {
-        const res = await fetch(`${JIKAN_API}/anime/${malId}`, {
-            headers: {
-                Accept: 'application/json',
-                'User-Agent': 'SubsPleaseTelegramBot/1.0 (+https://workers.dev)',
-            },
-        });
-        if (res.status === 429 && attempt < 3) {
-            await new Promise((r) => setTimeout(r, 1500 * attempt));
-            return fetchAnimeFromJikan(malId, attempt + 1);
-        }
-        if (!res.ok) return null;
-        const json = await res.json();
-        if (!json || !json.data) return null;
-        return normalizeJikanAnime(json.data);
-    } catch (e) {
-        console.warn('[ANIME] Jikan error:', e.message);
-        return null;
-    }
+// ============= CONDITIONAL KV WRITE =============
+async function writeIfChanged(env, key, data, options = {}) {
+  const newRaw = encryptData(data, env.DB_ENCRYPTION_KEY);
+  let oldRaw = null;
+  try {
+    oldRaw = await env.BOT_KV.get(key);
+  } catch { /* ignore */ }
+  if (oldRaw === newRaw) return false;
+  await env.BOT_KV.put(key, newRaw, options);
+  return true;
 }
 
-async function fetchAnimeFromMalPage(malId) {
-    try {
-        const res = await fetch(`https://myanimelist.net/anime/${malId}`, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            },
-        });
-        if (!res.ok) return null;
-        const html = await res.text();
-        return parseMalHtml(html, malId);
-    } catch (e) {
-        console.warn('[ANIME] MAL scrape error:', e.message);
-        return null;
-    }
+// ============= OWNER =============
+function ownerId(env) {
+  const v = env.OWNER_ID;
+  if (v == null || v === '') return OWNER_ID_FALLBACK;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : OWNER_ID_FALLBACK;
 }
 
-async function fetchAnimeDetails(env, malId) {
-    const key = String(malId);
-    const hit = ANIME_DETAIL_CACHE.get(key);
-    if (hit && Date.now() - hit.ts < ANIME_DETAIL_TTL_MS) {
-        return hit.data;
-    }
-
-    const fromJikan = await fetchAnimeFromJikan(malId);
-    if (fromJikan) {
-        ANIME_DETAIL_CACHE.set(key, { ts: Date.now(), data: fromJikan });
-        return fromJikan;
-    }
-
-    const fromHtml = await fetchAnimeFromMalPage(malId);
-    if (fromHtml) {
-        ANIME_DETAIL_CACHE.set(key, { ts: Date.now(), data: fromHtml });
-        return fromHtml;
-    }
-
-    return null;
+// ============= ALLOWLIST CHECK =============
+function isAllowedChat(chatId) {
+  if (chatId == null) return false;
+  const n = typeof chatId === 'number' ? chatId : parseInt(chatId, 10);
+  if (!Number.isFinite(n)) return false;
+  return ALLOWED_CHAT_IDS.has(n);
 }
 
-async function handleApiAnime(env, request) {
-    const url = new URL(request.url);
-    const idRaw = url.searchParams.get('id');
-    const malId = parseInt(idRaw, 10);
-
-    if (!malId || malId < 1 || malId > 99999999) {
-        return new Response(JSON.stringify({ error: 'invalid id' }), {
-            status: 400,
-            headers: { 'content-type': 'application/json; charset=utf-8' },
-        });
-    }
-
-    const details = await fetchAnimeDetails(env, malId);
-    if (!details) {
-        return new Response(JSON.stringify({ error: 'not found' }), {
-            status: 404,
-            headers: { 'content-type': 'application/json; charset=utf-8' },
-        });
-    }
-
-    return new Response(JSON.stringify(details), {
-        headers: {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'public, max-age=3600',
-            'access-control-allow-origin': '*',
-        },
-    });
-}
-
-// ============= WEB APP =============
-
-function getScheduleAppHtml() {
-    return `<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#0f1220">
-<title>Anime Schedule</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;700&display=swap" rel="stylesheet">
-<style>
-:root{--bg:#0f1220;--card:#171b2e;--fg:#e8ebf5;--muted:#9aa3bd;--accent:#6c8cff;--line:#252a42;--ok:#3ddc97}
-@media (prefers-color-scheme: light){:root{--bg:#f4f6fb;--card:#fff;--fg:#14172a;--muted:#5b6380;--accent:#3b5bdb;--line:#e3e7f2;--ok:#0f9d63}}
-*{box-sizing:border-box}
-html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:Vazirmatn,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-html[lang="en"] body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:880px;margin:0 auto;padding:20px 16px 44px}
-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px;flex-wrap:wrap}
-h1{font-size:1.35rem;margin:0;font-weight:700}
-.lang{display:flex;gap:4px;background:var(--card);padding:4px;border-radius:10px;border:1px solid var(--line)}
-.lang button{border:0;background:transparent;color:var(--muted);padding:6px 12px;border-radius:8px;cursor:pointer;font:inherit;font-weight:600}
-.lang button.on{background:var(--accent);color:#fff}
-.tabs{display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;margin-bottom:14px}
-.tabs button{white-space:nowrap;border:1px solid var(--line);background:var(--card);color:var(--fg);padding:8px 14px;border-radius:999px;cursor:pointer;font:inherit;font-weight:600;font-size:.92rem}
-.tabs button.on{background:var(--accent);border-color:var(--accent);color:#fff}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
-table{width:100%;border-collapse:collapse}
-th,td{padding:12px 14px;text-align:start;border-bottom:1px solid var(--line);font-size:.95rem}
-th{font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:700}
-tr:last-child td{border-bottom:0}
-td.time{width:92px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
-td.title{font-weight:600}
-td.title a{color:inherit;text-decoration:none}
-td.title a:hover{text-decoration:underline}
-input[type=checkbox]{accent-color:var(--ok);transform:translateY(1px);margin-inline-end:6px}
-.title-link{border:0;background:transparent;color:inherit;font:inherit;font-weight:600;padding:0;cursor:pointer;text-align:start}
-.title-link:hover{text-decoration:underline}
-.empty,.loading{padding:30px;text-align:center;color:var(--muted)}
-footer{margin-top:14px;text-align:center;color:var(--muted);font-size:.78rem}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:50;backdrop-filter:blur(2px)}
-.modal[hidden]{display:none}
-.modal-card{background:var(--card);border:1px solid var(--line);border-radius:16px;max-width:640px;width:100%;max-height:85vh;overflow:auto;padding:22px 22px 20px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.35)}
-.modal-close{position:absolute;top:8px;inset-inline-end:10px;border:0;background:transparent;color:var(--muted);font-size:1.6rem;line-height:1;cursor:pointer;padding:4px 8px;border-radius:8px}
-.modal-close:hover{background:var(--line);color:var(--fg)}
-.modal h3{margin:0 22px 4px 0;font-size:1.12rem;font-weight:700;line-height:1.35}
-.detail-section{margin-top:18px}
-.detail-section h4{margin:0 0 8px;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:700}
-.detail-row{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:.93rem;line-height:1.4}
-.detail-row:last-child{border-bottom:0}
-.detail-row .k{min-width:96px;color:var(--muted);font-weight:600;flex-shrink:0}
-.detail-row .v{flex:1;word-break:break-word}
-.mal-open{display:inline-block;margin-top:16px;color:var(--accent);font-weight:600;text-decoration:none}
-.mal-open:hover{text-decoration:underline}
-@media(max-width:520px){h1{font-size:1.15rem}th,td{padding:10px 10px}td.time{width:74px}.detail-row .k{min-width:80px}}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1 id="hTitle">📅 برنامه انیمه‌ها</h1>
-    <div class="lang">
-      <button id="btnFa" type="button">فارسی</button>
-      <button id="btnEn" type="button">English</button>
-    </div>
-  </header>
-  <nav class="tabs" id="tabs"></nav>
-  <main id="content"><div class="loading">…</div></main>
-  <footer><span id="updated"></span></footer>
-</div>
-
-<div class="modal" id="modal" hidden>
-  <div class="modal-card" role="dialog" aria-modal="true">
-    <button class="modal-close" id="modalClose" type="button" aria-label="Close">×</button>
-    <div id="modalBody"></div>
-  </div>
-</div>
-
-<script>
-(function(){
-  var $=function(id){return document.getElementById(id);};
-  var DAYS_EN=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
-  var DAYS_FA_ORDER=['Saturday','Sunday','Monday','Tuesday','Wednesday','Thursday','Friday'];
-  var LABELS_EN={Monday:'Mon',Tuesday:'Tue',Wednesday:'Wed',Thursday:'Thu',Friday:'Fri',Saturday:'Sat',Sunday:'Sun'};
-  var LABELS_FA={Monday:'دوشنبه',Tuesday:'سه‌شنبه',Wednesday:'چهارشنبه',Thursday:'پنجشنبه',Friday:'جمعه',Saturday:'شنبه',Sunday:'یکشنبه'};
-  var DETAIL_LABELS={
-    fa:{alt:'عناوین جایگزین',info:'اطلاعات',japanese:'ژاپنی',english:'انگلیسی',synonyms:'مترادف‌ها',type:'نوع',episodes:'تعداد قسمت',status:'وضعیت',aired:'پخش',producers:'تهیه‌کننده',licensors:'دارنده مجوز',studios:'استودیو',source:'منبع',genres:'ژانرها',duration:'مدت',rating:'رده‌بندی',openMal:'باز کردن در MAL ↗',loading:'در حال بارگذاری…',error:'خطا در دریافت اطلاعات',empty:'—',na:'در دسترس نیست'},
-    en:{alt:'Alternative Titles',info:'Information',japanese:'Japanese',english:'English',synonyms:'Synonyms',type:'Type',episodes:'Episodes',status:'Status',aired:'Aired',producers:'Producers',licensors:'Licensors',studios:'Studios',source:'Source',genres:'Genres',duration:'Duration',rating:'Rating',openMal:'Open on MAL ↗',loading:'Loading…',error:'Failed to load details',empty:'—',na:'Not available'}
+// ============= ERROR REPORTING =============
+async function reportError(env, where, err, extra = {}) {
+  const entry = {
+    t: new Date().toISOString(),
+    where: where || 'unknown',
+    msg: (err && (err.message || String(err))) || 'unknown error',
+    stack: (err && err.stack) ? String(err.stack).slice(0, 800) : '',
+    ...extra,
   };
-  var state={lang:'fa',day:null};
-  try{var s=localStorage.getItem('schedLang');if(s==='fa'||s==='en')state.lang=s;}catch(e){}
-  function tz(){return state.lang==='fa'?'Asia/Tehran':'UTC';}
-  function order(){return state.lang==='fa'?DAYS_FA_ORDER:DAYS_EN;}
-  function label(d){return state.lang==='fa'?LABELS_FA[d]:LABELS_EN[d];}
-  function currentDay(){
-    var n=new Intl.DateTimeFormat('en-US',{timeZone:tz(),weekday:'long'}).format(new Date());
-    return DAYS_EN.indexOf(n)>=0?n:'Saturday';
-  }
-  function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-  function dl(){return DETAIL_LABELS[state.lang];}
 
-  function renderTabs(){
-    var nav=$('tabs');nav.innerHTML='';
-    order().forEach(function(d){
-      var b=document.createElement('button');
-      b.type='button';b.textContent=label(d);
-      if(d===state.day)b.className='on';
-      b.onclick=function(){state.day=d;renderTabs();load();};
-      nav.appendChild(b);
+  try {
+    const raw = await env.BOT_KV.get(ERRORS_KEY, { cacheTtl: KV_CACHE_TTL });
+    let list = [];
+    if (raw) {
+      try {
+        list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(list)) list = [];
+      } catch { list = []; }
+    }
+    list.unshift(entry);
+    list = list.slice(0, 20);
+    await env.BOT_KV.put(
+      ERRORS_KEY,
+      encryptData(list, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('reportError KV write failed:', e.message);
+  }
+
+  try {
+    const text =
+      `🚨 *Error*\n` +
+      `📍 where: \`${entry.where}\`\n` +
+      `⏰ ${entry.t}\n` +
+      `\n*Message*\n\`${entry.msg.replace(/`/g, '')}\`` +
+      (entry.stack
+        ? `\n\n*Stack (truncated)*\n\`\`\`\n${entry.stack.slice(0, 500)}\n\`\`\``
+        : '');
+    await sendMessage(env.BOT_TOKEN, ownerId(env), text, undefined, {
+      parse_mode: 'Markdown',
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (e) {
+    console.error('reportError DM failed:', e.message);
+  }
+
+  console.error(`[${entry.where}]`, entry.msg);
+  if (entry.stack) console.error(entry.stack);
+}
+
+// ============= TELEMETRY =============
+async function logEvents(env, events) {
+  if (!events || !events.length) return;
+  try {
+    const raw = await env.BOT_KV.get('telemetry', { cacheTtl: KV_CACHE_TTL });
+    let log = [];
+    if (raw) {
+      try {
+        log = decryptData(raw, env.DB_ENCRYPTION_KEY);
+        if (!Array.isArray(log)) log = [];
+      } catch { log = []; }
+    }
+    const now = new Date().toISOString();
+    const fresh = events.slice().reverse().map((e) => ({ t: now, ...e }));
+    log = fresh.concat(log).slice(0, 30);
+    await env.BOT_KV.put(
+      'telemetry',
+      encryptData(log, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('logEvents failed:', e.message);
+  }
+}
+
+async function logEvent(env, event) {
+  await logEvents(env, [event]);
+}
+
+// ═══════════════════════════════════════════════════════════
+//                        RSS BOT
+// ═══════════════════════════════════════════════════════════
+
+function xmlUnescape(s) {
+  return String(s)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&');
+}
+
+function stripCdata(s) {
+  const m = String(s).match(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/);
+  return (m ? m[1] : s).trim();
+}
+
+function extractTag(xml, tag) {
+  const re = new RegExp(
+    `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+    'i'
+  );
+  const m = xml.match(re);
+  if (!m) return '';
+  return xmlUnescape(stripCdata(m[1])).trim();
+}
+
+function extractAttr(xml, tag, attr) {
+  const re = new RegExp(
+    `<${tag}\\b[^>]*\\s${attr}\\s*=\\s*"([^"]*)"`,
+    'i'
+  );
+  const m = xml.match(re);
+  if (!m) return '';
+  return xmlUnescape(m[1]).trim();
+}
+
+function parseRssItem(xml) {
+  let link = extractTag(xml, 'link');
+  if (!link) {
+    const m = xml.match(/<link[^>]*\shref\s*=\s*"([^"]+)"/i);
+    if (m) link = xmlUnescape(m[1]).trim();
+  }
+
+  let description = '';
+  let descriptionIsHtml = false;
+
+  const htmlDesc =
+    extractTag(xml, 'content:encoded') ||
+    extractTag(xml, 'description') ||
+    extractTag(xml, 'summary') ||
+    extractTag(xml, 'content');
+  if (htmlDesc) {
+    description = htmlDesc;
+    descriptionIsHtml = true;
+  } else {
+    const mediaDesc = extractTag(xml, 'media:description');
+    if (mediaDesc) {
+      description = mediaDesc;
+      descriptionIsHtml = false;
+    }
+  }
+
+  let thumbnail = extractAttr(xml, 'media:thumbnail', 'url');
+  if (!thumbnail) {
+    thumbnail =
+      extractTag(xml, 'thumbnail') ||
+      extractAttr(xml, 'enclosure', 'url') ||
+      extractAttr(xml, 'media:content', 'url') ||
+      '';
+  }
+
+  const pubDate =
+    extractTag(xml, 'pubDate') ||
+    extractTag(xml, 'dc:date') ||
+    extractTag(xml, 'published') ||
+    extractTag(xml, 'updated') ||
+    '';
+
+  const guid =
+    extractTag(xml, 'guid') ||
+    extractTag(xml, 'id') ||
+    extractTag(xml, 'media:title') ||
+    link ||
+    extractTag(xml, 'title') ||
+    '';
+
+  const title = extractTag(xml, 'title');
+
+  return {
+    title,
+    link,
+    description,
+    descriptionIsHtml,
+    pubDate,
+    guid,
+    thumbnail,
+  };
+}
+
+function parseRssXml(xml) {
+  if (!xml || typeof xml !== 'string') return null;
+  const isRss = /<rss\b/i.test(xml);
+  const isAtom = /<feed\b/i.test(xml);
+  if (!isRss && !isAtom) return null;
+
+  let title = '';
+  if (isRss) {
+    const m = xml.match(
+      /<channel\b[^>]*>[\s\S]*?<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/i
+    );
+    if (m) title = xmlUnescape(stripCdata(m[1])).trim();
+  } else {
+    const m = xml.match(
+      /<feed\b[^>]*>[\s\S]*?<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/i
+    );
+    if (m) title = xmlUnescape(stripCdata(m[1])).trim();
+  }
+
+  const items = [];
+  const itemRe = /<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi;
+  let m;
+  while ((m = itemRe.exec(xml)) !== null) {
+    const item = parseRssItem(m[0]);
+    if (item.guid || item.link || item.title) items.push(item);
+  }
+  const entryRe = /<entry(?:\s[^>]*)?>[\s\S]*?<\/entry>/gi;
+  while ((m = entryRe.exec(xml)) !== null) {
+    const item = parseRssItem(m[0]);
+    if (item.guid || item.link || item.title) items.push(item);
+  }
+
+  return { title, items };
+}
+
+async function fetchRssOnce(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RSS_FETCH_TIMEOUT);
+  try {
+    const cleanUrl = String(url).trim().replace(/[\u200B-\u200D\uFEFF]/g, '');
+    const isYouTube = /(?:^|\.)youtube\.com|(?:^|\.)youtu\.be/i.test(cleanUrl);
+
+    let origin = '';
+    try {
+      origin = new URL(cleanUrl).origin;
+    } catch { /* ignore */ }
+
+    const headers = {
+      'User-Agent': BROWSER_UA,
+      'Accept':
+        'application/rss+xml, application/atom+xml, ' +
+        'application/xml, text/xml, text/html, */*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Upgrade-Insecure-Requests': '1',
+    };
+    if (origin) {
+      headers['Referer'] = origin + '/';
+      headers['Origin'] = origin;
+    }
+
+    if (isYouTube) {
+      headers['Referer'] = 'https://www.youtube.com/';
+      headers['Origin'] = 'https://www.youtube.com';
+    }
+
+    console.log(`📡 RSS fetch: ${cleanUrl} (YouTube=${isYouTube})`);
+
+    const res = await fetch(cleanUrl, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        reason: `HTTP ${res.status}${res.statusText ? ' ' + res.statusText : ''}`,
+        status: res.status,
+      };
+    }
+
+    const xml = await res.text();
+    const parsed = parseRssXml(xml);
+    if (!parsed) {
+      return {
+        ok: false,
+        reason: `bad shape: ${xml.slice(0, 80)}`,
+        status: res.status,
+      };
+    }
+    return { ok: true, data: parsed };
+  } catch (e) {
+    clearTimeout(timer);
+    return { ok: false, reason: e.message };
+  }
+}
+
+async function readRssTargets(env) {
+  const raw = await env.BOT_KV.get(RSS_TARGETS_KEY, {
+    cacheTtl: KV_CACHE_TTL,
+  });
+  if (!raw) return [];
+  try {
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    console.error('readRssTargets decrypt failed:', e.message);
+    return [];
+  }
+}
+
+async function writeRssTargets(env, targets) {
+  await writeIfChanged(env, RSS_TARGETS_KEY, targets);
+}
+
+async function readPixelTargets(env) {
+  const raw = await env.BOT_KV.get(RSS_PIXEL_TARGETS_KEY, {
+    cacheTtl: KV_CACHE_TTL,
+  });
+  if (!raw) return [];
+  try {
+    const arr = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    console.error('readPixelTargets decrypt failed:', e.message);
+    return [];
+  }
+}
+
+async function writePixelTargets(env, targets) {
+  await writeIfChanged(env, RSS_PIXEL_TARGETS_KEY, targets);
+}
+
+async function saveCronStatus(env, info) {
+  try {
+    await env.BOT_KV.put(
+      CRON_LAST_KEY,
+      encryptData(info, env.DB_ENCRYPTION_KEY)
+    );
+  } catch (e) {
+    console.error('saveCronStatus failed:', e.message);
+  }
+}
+
+async function readCronStatus(env) {
+  try {
+    const raw = await env.BOT_KV.get(CRON_LAST_KEY);
+    if (!raw) return null;
+    return decryptData(raw, env.DB_ENCRYPTION_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function simpleHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h * 33) ^ s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(16);
+}
+
+function formatPubDate(s) {
+  if (!s) return '';
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return new Intl.DateTimeFormat('fa-IR', {
+      timeZone: 'Asia/Tehran',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(d);
+  } catch {
+    return s;
+  }
+}
+
+function normalizeForCompare(s) {
+  return String(s || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/\S*:\/\/\S*/g, ' ')
+    .replace(/\S*\.\S*\/\S*/g, ' ')
+    .replace(/\p{So}/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+const GENERIC_TITLES = new Set([
+  'image',
+  'photo',
+  'picture',
+  'untitled',
+  'no title',
+  'no-title',
+  '(no title)',
+  'no_title',
+  'na',
+  'n/a',
+  '-',
+  '—',
+]);
+
+function isGenericTitle(title) {
+  if (!title) return true;
+  const t = String(title).trim().toLowerCase();
+  if (!t) return true;
+  return GENERIC_TITLES.has(t);
+}
+
+function isTitleInDescription(title, description) {
+  if (!title || !description) return false;
+  const t = normalizeForCompare(title);
+  if (!t) return false;
+  const d = normalizeForCompare(description);
+  if (!d) return false;
+  return d.includes(t);
+}
+
+function extractRtPrefix(title, description) {
+  const m = String(title || '').match(/^(RT by @[A-Za-z0-9_]+:)/);
+  if (!m) return null;
+  const nDesc = normalizeForCompare(description || '');
+  if (!nDesc || nDesc.length < 20) return null;
+  return m[1];
+}
+
+function groupImagesIntoSlideshow(html) {
+  const s = String(html || '');
+  if (!s) return s;
+
+  const imgRe = /<img\b[^>]*\/?>/gi;
+  const matches = [];
+  let m;
+  while ((m = imgRe.exec(s)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length, tag: m[0] });
+  }
+  if (matches.length < 2) return s;
+
+  const groups = [];
+  let current = [matches[0]];
+  for (let i = 1; i < matches.length; i++) {
+    const between = s.slice(
+      current[current.length - 1].end,
+      matches[i].start
+    );
+    if (/^\s*$/.test(between)) {
+      current.push(matches[i]);
+    } else {
+      groups.push(current);
+      current = [matches[i]];
+    }
+  }
+  groups.push(current);
+
+  let result = '';
+  let cursor = 0;
+  for (const group of groups) {
+    result += s.slice(cursor, group[0].start);
+    if (group.length >= 2) {
+      result +=
+        '<tg-slideshow>\n' +
+        group.map((g) => g.tag).join('\n') +
+        '\n<figcaption>ورق بزنید</figcaption>\n' +
+        '</tg-slideshow>';
+    } else {
+      result += group[0].tag;
+    }
+    cursor = group[group.length - 1].end;
+  }
+  result += s.slice(cursor);
+  return result;
+}
+
+function buildRssItemRichMessage(item, feedTitle, hideTitle) {
+  const parts = [];
+  const titleDuplicated = isTitleInDescription(item.title, item.description);
+  const titleIsGeneric = isGenericTitle(item.title);
+  const rtPrefix = extractRtPrefix(item.title, item.description);
+
+  if (rtPrefix && !hideTitle) {
+    parts.push(`<h1>${htmlEsc(rtPrefix)}</h1>`);
+  } else if (item.title && !hideTitle && !titleDuplicated && !titleIsGeneric) {
+    parts.push(`<h1>${htmlEsc(item.title)}</h1>`);
+  }
+  if (item.thumbnail) {
+    parts.push(`<img src="${htmlEsc(item.thumbnail)}" />`);
+  }
+  if (item.pubDate) {
+    parts.push(`<p>🗓 ${htmlEsc(formatPubDate(item.pubDate))}</p>`);
+  }
+  if (item.link) {
+    const label = feedTitle ? htmlEsc(feedTitle) : 'مشاهده مطلب';
+    parts.push(`<p>🔗 <a href="${htmlEsc(item.link)}">${label}</a></p>`);
+  }
+  if (item.description) {
+    if (item.descriptionIsHtml) {
+      let html = item.description;
+      if (html.length > 3000) html = html.slice(0, 3000) + '…';
+      html = groupImagesIntoSlideshow(html);
+      parts.push(html);
+    } else {
+      let text = htmlEsc(item.description)
+        .replace(/\r\n/g, '\n')
+        .replace(/\n+/g, ' ')
+        .trim();
+      if (text.length > 1200) text = text.slice(0, 1200) + '…';
+      parts.push(`<p>${text}</p>`);
+    }
+  }
+  return { html: parts.join('\n'), is_rtl: true };
+}
+
+function buildPixelMessage(type, item) {
+  const name = item && item.title ? item.title : '';
+  return (
+    `🟦<b>تریلر جدید ${htmlEsc(type)} ${htmlEsc(name)} منتشر شد</b>\n` +
+    `\n` +
+    `🔹PixelMedia`
+  );
+}
+
+// Sends the two-message pixel pair for one item:
+//   1) the pixel announcement (plain HTML sendMessage)
+//   2) a follow-up message with the item's thumbnail + link + feed name + date
+//      — rendered as a rich message with <img> when a thumbnail exists,
+//        exactly like regular RSS items. If there's no thumbnail, falls back
+//        to a plain text sendMessage (unchanged behaviour).
+async function sendPixelPair(token, chatId, threadId, type, item, feedName) {
+  await sendMessage(
+    token,
+    chatId,
+    buildPixelMessage(type, item),
+    threadId,
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    }
+  );
+
+  const link = String(item && item.link ? item.link : '').trim();
+  const thumb = String(item && item.thumbnail ? item.thumbnail : '').trim();
+  if (!link && !thumb) return;
+
+  const dateStr = item && item.pubDate ? formatPubDate(item.pubDate) : '';
+
+  if (thumb) {
+    const parts = [];
+    parts.push(`<img src="${htmlEsc(thumb)}" />`);
+    if (link) {
+      parts.push(`<p>🔗 <a href="${htmlEsc(link)}">${htmlEsc(link)}</a></p>`);
+    }
+    if (feedName) {
+      parts.push(`<p>📡 ${htmlEsc(feedName)}</p>`);
+    }
+    if (dateStr) {
+      parts.push(`<p>🗓 ${htmlEsc(dateStr)}</p>`);
+    }
+
+    await sendRichMessage(
+      token,
+      chatId,
+      { html: parts.join('\n'), is_rtl: false },
+      threadId
+    );
+    return;
+  }
+
+  // No thumbnail — keep the previous plain-text look.
+  const lines = [];
+  if (link) lines.push(`🔗 ${link}`);
+  if (feedName) lines.push(`📡 ${feedName}`);
+  if (dateStr) lines.push(`🗓 ${dateStr}`);
+
+  await sendMessage(
+    token,
+    chatId,
+    lines.join('\n'),
+    threadId,
+    { link_preview_options: { is_disabled: true } }
+  );
+}
+
+function xmlEscapeAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function buildOpml(feeds) {
+  let out = '<?xml version="1.0" encoding="UTF-8"?>\n';
+  out += '<opml version="2.0">\n';
+  out += '  <head>\n';
+  out += '    <title>RSS Subscriptions</title>\n';
+  out += '  </head>\n';
+  out += '  <body>\n';
+  for (const f of feeds) {
+    const t = xmlEscapeAttr(f.title || f.url);
+    const u = xmlEscapeAttr(f.url);
+    out += `    <outline type="rss" text="${t}" title="${t}" xmlUrl="${u}"/>\n`;
+  }
+  out += '  </body>\n';
+  out += '</opml>\n';
+  return out;
+}
+
+function parseOpml(xml) {
+  const feeds = [];
+  const re = /<outline\b[^>]*>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const tag = m[0];
+    const urlMatch = tag.match(/\sxmlUrl\s*=\s*"([^"]+)"/i);
+    if (!urlMatch) continue;
+    const textMatch = tag.match(/\stext\s*=\s*"([^"]+)"/i);
+    const titleMatch = tag.match(/\stitle\s*=\s*"([^"]+)"/i);
+    feeds.push({
+      url: xmlUnescape(urlMatch[1]).trim(),
+      title: xmlUnescape(
+        (textMatch && textMatch[1]) ||
+        (titleMatch && titleMatch[1]) ||
+        ''
+      ).trim(),
     });
   }
+  return feeds;
+}
 
-  function load(){
-    var content=$('content');
-    content.innerHTML='<div class="loading">…</div>';
-    var url='/api/schedule?day='+encodeURIComponent(state.day)+'&tz='+encodeURIComponent(tz());
-    fetch(url,{cache:'no-store'}).then(function(r){return r.json();}).then(function(data){
-      render(data);
-      var lang=state.lang==='fa'?'fa-IR':'en-GB';
-      $('updated').textContent=(state.lang==='fa'?'آخرین بروزرسانی: ':'Updated: ')+new Date().toLocaleTimeString(lang);
-    }).catch(function(){
-      content.innerHTML='<div class="card"><div class="empty">'+(state.lang==='fa'?'خطا در دریافت برنامه':'Failed to load schedule')+'</div></div>';
-    });
+function normalizeDomainArg(s) {
+  let d = String(s || '').trim().toLowerCase();
+  if (!d) return '';
+  d = d.replace(/^https?:\/\//, '');
+  d = d.replace(/^\.+/, '');
+  d = d.replace(/[/?#].*$/, '');
+  d = d.replace(/:\d+$/, '');
+  return d;
+}
+
+function urlMatchesDomain(url, domain) {
+  if (!domain) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === domain || host.endsWith('.' + domain);
+  } catch {
+    return false;
+  }
+}
+
+function parseRssCallback(data) {
+  if (!data || typeof data !== 'string' || !data.startsWith('rss:')) return null;
+  const parts = data.split(':');
+  if (parts[1] !== 'toggle') return null;
+  const ref = parts.slice(2).join(':');
+  if (!ref) return null;
+  return { action: 'toggle', ref };
+}
+
+function rssSettingsMessage(mine, ref) {
+  if (ref === 'all') {
+    const total = mine.length;
+    const hidden = mine.filter((t) => !!t.hideTitle).length;
+    let stateStr;
+    if (hidden === 0) stateStr = 'همه روشن (ON)';
+    else if (hidden === total) stateStr = 'همه خاموش (OFF)';
+    else stateStr = `مخلوط — ${hidden} از ${total} خاموش`;
+
+    const willHide = hidden < total;
+    const buttonText = willHide
+      ? '🔕 Turn Feed Title off'
+      : '🔔 Turn Feed Title on';
+
+    return {
+      text:
+        `${RLM}📡 تنظیمات RSS — همه فیدها\n` +
+        `${RLM}تعداد: ${total}\n` +
+        `${RLM}نمایش تیتر آیتم‌ها: ${stateStr}\n\n` +
+        `${RLM}با زدن دکمه، برای همه فیدهای این چت تغییر می‌کنه.`,
+      button: { text: buttonText, callback_data: 'rss:toggle:all' },
+    };
   }
 
-  function render(data){
-    var content=$('content');
-    var entries=(data&&data.entries)?data.entries:[];
-    if(!entries.length){
-      content.innerHTML='<div class="card"><div class="empty">'+(state.lang==='fa'?'هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.':'No releases scheduled.')+'</div></div>';
+  const t = mine.find((x) => simpleHash(x.url) === ref);
+  if (!t) return null;
+  const hide = !!t.hideTitle;
+  const stateStr = hide ? 'خاموش (OFF)' : 'روشن (ON)';
+  const buttonText = hide
+    ? '🔔 Turn Feed Title on'
+    : '🔕 Turn Feed Title off';
+
+  return {
+    text:
+      `${RLM}📡 تنظیمات RSS\n` +
+      `${RLM}«${t.title || 'RSS'}»\n` +
+      `${RLM}${t.url}\n\n` +
+      `${RLM}نمایش تیتر آیتم‌ها: ${stateStr}`,
+    button: { text: buttonText, callback_data: `rss:toggle:${ref}` },
+  };
+}
+
+function rssSettingsKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: settings.button.text,
+          callback_data: settings.button.callback_data,
+        },
+      ],
+    ],
+  };
+}
+
+async function handleRssSettingsCallback(cq, parsed, env) {
+  const chatId = cq.message.chat.id;
+  const threadId = cq.message.message_thread_id ?? null;
+  const messageId = cq.message.message_id;
+
+  const targets = await readRssTargets(env);
+  const mine = targets.filter(
+    (t) => t.chatId === chatId && (t.threadId ?? null) === threadId
+  );
+
+  if (!mine.length) {
+    try {
+      await editMessageText(
+        env.BOT_TOKEN,
+        chatId,
+        messageId,
+        '📭 دیگه هیچ RSS ای در اینجا نیست.',
+        { reply_markup: { inline_keyboard: [] } }
+      );
+    } catch { /* ignore */ }
+    return;
+  }
+
+  let changed = 0;
+  if (parsed.ref === 'all') {
+    const allHidden = mine.every((t) => !!t.hideTitle);
+    const newHide = !allHidden;
+    for (const t of targets) {
+      if (t.chatId === chatId && (t.threadId ?? null) === threadId) {
+        t.hideTitle = newHide;
+        changed++;
+      }
+    }
+  } else {
+    const t = targets.find(
+      (x) =>
+        x.chatId === chatId &&
+        (x.threadId ?? null) === threadId &&
+        simpleHash(x.url) === parsed.ref
+    );
+    if (!t) {
+      try {
+        await editMessageText(
+          env.BOT_TOKEN,
+          chatId,
+          messageId,
+          '⚠️ این فید دیگه وجود نداره.',
+          { reply_markup: { inline_keyboard: [] } }
+        );
+      } catch { /* ignore */ }
       return;
     }
-    var html='<div class="card"><table><thead><tr><th>'+(state.lang==='fa'?'ساعت':'Time')+'</th><th>'+(state.lang==='fa'?'انیمه':'Show')+'</th></tr></thead><tbody>';
-    entries.forEach(function(e){
-      var suffix='';
-      if(e.batchEpisodes&&e.batchEpisodes.count>1){
-        var b=e.batchEpisodes;
-        var range=state.lang==='fa'?(b.min+' تا '+b.max):(b.min+' to '+b.max);
-        suffix=state.lang==='fa'?(' (قسمت '+range+'، پخش یک‌جا)'):(' (eps '+range+', batch)');
-      }
-      html+='<tr><td class="time">'+esc(e.time)+'</td><td class="title">';
-      html+='<input type="checkbox" disabled '+(e.aired?'checked':'')+'>';
-      if(e.malId){
-        html+='<button type="button" class="title-link" data-mal-id="'+esc(e.malId)+'" data-title="'+esc(e.title)+'">'+esc(e.title)+'</button>';
-      }else if(e.url){
-        html+='<a href="'+esc(e.url)+'" target="_blank" rel="noopener">'+esc(e.title)+'</a>';
-      }else{
-        html+=esc(e.title);
-      }
-      html+=esc(suffix);
-      html+='</td></tr>';
-    });
-    html+='</tbody></table></div>';
-    content.innerHTML=html;
+    t.hideTitle = !t.hideTitle;
+    changed = 1;
   }
 
-  function openModal(){
-    $('modal').hidden=false;
-    document.body.style.overflow='hidden';
-  }
-  function closeModal(){
-    $('modal').hidden=true;
-    $('modalBody').innerHTML='';
-    document.body.style.overflow='';
-  }
-
-  function openAnime(malId, fallbackTitle){
-    var body=$('modalBody');
-    var l=dl();
-    body.innerHTML='<h3>'+esc(fallbackTitle||'')+'</h3><div class="loading">'+esc(l.loading)+'</div>';
-    openModal();
-
-    fetch('/api/anime?id='+encodeURIComponent(malId),{cache:'no-store'})
-      .then(function(r){
-        if(!r.ok) throw new Error('HTTP '+r.status);
-        return r.json();
-      })
-      .then(function(d){
-        if(!d||!d.alternativeTitles) throw new Error('no data');
-        renderDetail(d, fallbackTitle);
-      })
-      .catch(function(){
-        body.innerHTML='<h3>'+esc(fallbackTitle||'')+'</h3><div class="empty">'+esc(l.error)+'</div>';
-      });
-  }
-
-  function row(k,v){
-    var l=dl();
-    var val=(v==null||v==='')?l.na:v;
-    return '<div class="detail-row"><span class="k">'+esc(k)+'</span><span class="v">'+esc(val)+'</span></div>';
-  }
-
-  function renderDetail(d, fallbackTitle){
-    var l=dl();
-    var alt=d.alternativeTitles||{};
-    var info=d.information||{};
-    var syn=(alt.synonyms&&alt.synonyms.length)?alt.synonyms.join(', '):null;
-    var title=fallbackTitle||alt.english||alt.japanese||'Anime';
-
-    var h='<h3>'+esc(title)+'</h3>';
-
-    h+='<div class="detail-section"><h4>'+esc(l.alt)+'</h4>';
-    h+=row(l.japanese, alt.japanese);
-    h+=row(l.english, alt.english);
-    h+=row(l.synonyms, syn);
-    h+='</div>';
-
-    h+='<div class="detail-section"><h4>'+esc(l.info)+'</h4>';
-    h+=row(l.type, info.type);
-    h+=row(l.episodes, info.episodes);
-    h+=row(l.status, info.status);
-    h+=row(l.aired, info.aired);
-    h+=row(l.producers, info.producers);
-    h+=row(l.licensors, info.licensors);
-    h+=row(l.studios, info.studios);
-    h+=row(l.source, info.source);
-    h+=row(l.genres, info.genres);
-    h+=row(l.duration, info.duration);
-    h+=row(l.rating, info.rating);
-    h+='</div>';
-
-    if(d.url){
-      h+='<div><a class="mal-open" href="'+esc(d.url)+'" target="_blank" rel="noopener">'+esc(l.openMal)+'</a></div>';
-    }
-
-    $('modalBody').innerHTML=h;
-  }
-
-  $('content').addEventListener('click',function(ev){
-    var btn=ev.target.closest('.title-link');
-    if(!btn) return;
-    openAnime(btn.getAttribute('data-mal-id'), btn.getAttribute('data-title'));
-  });
-
-  $('modalClose').onclick=closeModal;
-  $('modal').addEventListener('click',function(e){ if(e.target===$('modal')) closeModal(); });
-  document.addEventListener('keydown',function(e){ if(e.key==='Escape' && !$('modal').hidden) closeModal(); });
-
-  function setLang(l){
-    state.lang=l;
-    try{localStorage.setItem('schedLang',l);}catch(e){}
-    document.documentElement.lang=l;
-    document.documentElement.dir=(l==='fa')?'rtl':'ltr';
-    $('hTitle').textContent=(l==='fa')?'📅 برنامه انیمه‌ها':'📅 Anime Schedule';
-    $('btnFa').className=(l==='fa')?'on':'';
-    $('btnEn').className=(l==='en')?'on':'';
-    state.day=currentDay();
-    renderTabs();
-    load();
-  }
-
-  $('btnFa').onclick=function(){setLang('fa');};
-  $('btnEn').onclick=function(){setLang('en');};
-  setLang(state.lang);
-  setInterval(function(){load();},60000);
-  document.addEventListener('visibilitychange',function(){if(!document.hidden)load();});
-})();
-</script>
-</body>
-</html>`;
-}
-
-async function handleScheduleApp(env) {
-    return new Response(getScheduleAppHtml(), {
-        headers: {
-            'content-type': 'text/html; charset=UTF-8',
-            'cache-control': 'no-store',
-        },
-    });
-}
-
-async function handleApiSchedule(env, request) {
-    const url = new URL(request.url);
-    const day = url.searchParams.get('day') || 'Monday';
-    const tz = url.searchParams.get('tz') || 'UTC';
-
-    const allowedTz = ['UTC', 'Asia/Tehran'];
-    const safeTz = allowedTz.indexOf(tz) >= 0 ? tz : 'UTC';
-
-    const entries = await fetchScheduleForDay(env, day, safeTz);
-    const nowUnix = Math.floor(Date.now() / 1000);
-
-    const data = entries.map((e) => ({
-        title: e.title,
-        airingAt: e.airingAt,
-        time: convertToTz(e.airingAt, safeTz),
-        aired: e.airingAt <= nowUnix,
-        malId: e.mal_id || null,
-        anilistId: e.anilist_id || null,
-        url: e.url || null,
-        batchEpisodes: e.batchEpisodes || null,
-    }));
-
-    return new Response(JSON.stringify({ day, tz: safeTz, entries: data }), {
-        headers: {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'no-store',
-        },
-    });
-}
-
-// ============= TELEGRAM API =============
-
-async function sendMessage(env, chatId, text, extra = {}) {
-    const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra }),
-    });
-    try { return await res.json(); } catch { return { ok: res.ok }; }
-}
-
-async function sendMessageRaw(env, chatId, text) {
-    const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
-    });
-    try { return await res.json(); } catch { return { ok: res.ok }; }
-}
-
-async function sendRichMessage(env, chatId, html, extra = {}) {
-    const { is_rtl, ...rest } = extra;
-    const richMessage = { html };
-    if (is_rtl) richMessage.is_rtl = true;
-    const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendRichMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, rich_message: richMessage, ...rest }),
-    });
-    try { return await res.json(); } catch { return { ok: res.ok }; }
-}
-
-async function sendAiringMessage(env, chatId, title, epNum, totalEps, malLink, lang, prefix = '', batch = null) {
-    const richHtml = formatAiringMessage(title, epNum, totalEps, malLink, lang, prefix, batch);
-    const richRes = await sendRichMessage(env, chatId, richHtml, { is_rtl: lang === 'fa' });
-    if (richRes && richRes.ok) return richRes;
-    const richErr = (richRes && richRes.description) || JSON.stringify(richRes || {}).slice(0, 150);
-
-    const plain = formatAiringMessagePlain(title, epNum, totalEps, malLink, lang, prefix, batch);
-    const plainRes = await sendMessage(env, chatId, plain);
-    if (plainRes && plainRes.ok) return plainRes;
-    const plainErr = (plainRes && plainRes.description) || JSON.stringify(plainRes || {}).slice(0, 150);
-
-    const safeText = formatAiringMessageSafe(title, epNum, totalEps, malLink, lang, prefix, batch);
-    const safeRes = await sendMessageRaw(env, chatId, safeText);
-    if (!safeRes || !safeRes.ok) {
-        const safeErr = (safeRes && safeRes.description) || JSON.stringify(safeRes || {}).slice(0, 150);
-        console.warn(`[AIRING] all 3 failed for chat=${chatId} — rich="${richErr}" plain="${plainErr}" safe="${safeErr}"`);
-        return safeRes || plainRes || richRes;
-    }
-    console.warn(`[AIRING] delivered via safe fallback for chat=${chatId} — rich="${richErr}" plain="${plainErr}"`);
-    return safeRes;
-}
-
-async function sendAnimation(env, chatId, fileId, extra = {}) {
-    const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/sendAnimation`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, animation: fileId, ...extra }),
-    });
-    try { return await res.json(); } catch { return { ok: res.ok }; }
-}
-
-async function editMessage(env, chatId, messageId, text, extra = {}) {
-    const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/editMessageText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra }),
-    });
-    try { return await res.json(); } catch { return { ok: res.ok }; }
-}
-
-async function editRichMessage(env, chatId, messageId, html, extra = {}) {
-    const { is_rtl, ...rest } = extra;
-    const richMessage = { html };
-    if (is_rtl) richMessage.is_rtl = true;
-    const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/editMessageText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, rich_message: richMessage, ...rest }),
-    });
-    try { return await res.json(); } catch { return { ok: res.ok }; }
-}
-
-async function answerCallback(env, callbackQueryId, text = null, showAlert = false) {
-    const payload = { callback_query_id: callbackQueryId };
-    if (text) {
-        payload.text = text;
-        payload.show_alert = showAlert;
-    }
-    return fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/answerCallbackQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-    });
-}
-
-// ============= /schedule =============
-
-const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
-const DAY_LABELS_EN = { Monday:'Mon',Tuesday:'Tue',Wednesday:'Wed',Thursday:'Thu',Friday:'Fri',Saturday:'Sat',Sunday:'Sun' };
-const DAY_FULL_FA = { Monday:'دوشنبه',Tuesday:'سه‌شنبه',Wednesday:'چهارشنبه',Thursday:'پنجشنبه',Friday:'جمعه',Saturday:'شنبه',Sunday:'یکشنبه' };
-const DAYS_FA_ORDER = ['Saturday','Sunday','Monday','Tuesday','Wednesday','Thursday','Friday'];
-
-function getCurrentDay(tz) {
-    const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' });
-    const dayName = fmt.format(new Date());
-    return DAYS.includes(dayName) ? dayName : 'Saturday';
-}
-
-function escapeHtml(str) {
-    return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function batchSuffix(b, lang) {
-    if (!b || b.count <= 1) return '';
-    const isFa = lang === 'fa';
-    const range = isFa ? `${b.min} تا ${b.max}` : `${b.min} to ${b.max}`;
-    return isFa ? ` (قسمت ${range}، پخش یک‌جا)` : ` (eps ${range}, batch)`;
-}
-
-function formatDaySchedule(dayKey, entries, lang) {
-    const isFa = lang === 'fa';
-    const dayName = isFa ? DAY_FULL_FA[dayKey] : dayKey;
-    const targetTz = SCHEDULE_TZ[lang] || SCHEDULE_TZ.en;
-    const tzLabel = isFa ? 'به وقت ایران' : 'UTC';
-    const nowUnix = Math.floor(Date.now() / 1000);
-
-    let html = `<h3>📅 ${dayName} (${tzLabel})</h3>`;
-
-    if (!entries || entries.length === 0) {
-        html += isFa
-            ? '<p><i>هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.</i></p>'
-            : '<p><i>No releases scheduled.</i></p>';
-        return html;
-    }
-
-    html += '<table bordered striped columns="1,6">';
-    html += isFa
-        ? '<tr><th>ساعت</th><th>انیمه</th></tr>'
-        : '<tr><th>Time</th><th>Show</th></tr>';
-
-    for (const e of entries) {
-        const t = convertToTz(e.airingAt, targetTz);
-        const titleSafe = escapeHtml(e.title);
-        const aired = e.airingAt && e.airingAt <= nowUnix;
-        const box = aired
-            ? '<input type="checkbox" checked>'
-            : '<input type="checkbox">';
-        const suffix = escapeHtml(batchSuffix(e.batchEpisodes, lang));
-        html += `<tr><td nowrap>${t}</td><td>${box} ${titleSafe}${suffix}</td></tr>`;
-    }
-
-    html += '</table>';
-    return html;
-}
-
-function formatDaySchedulePlain(dayKey, entries, lang) {
-    const isFa = lang === 'fa';
-    const dayName = isFa ? DAY_FULL_FA[dayKey] : dayKey;
-    const targetTz = SCHEDULE_TZ[lang] || SCHEDULE_TZ.en;
-    const tzLabel = isFa ? 'به وقت ایران' : 'UTC';
-    const nowUnix = Math.floor(Date.now() / 1000);
-
-    let msg = `📅 <b>${dayName}</b> (${tzLabel})\n\n`;
-
-    if (!entries || entries.length === 0) {
-        msg += isFa
-            ? '<i>هیچ انتشار برنامه‌ریزی‌شده‌ای وجود ندارد.</i>'
-            : '<i>No releases scheduled.</i>';
-        return msg;
-    }
-
-    for (const e of entries) {
-        const t = convertToTz(e.airingAt, targetTz);
-        const aired = e.airingAt && e.airingAt <= nowUnix;
-        const box = aired ? '☑️' : '☐';
-        const suffix = escapeHtml(batchSuffix(e.batchEpisodes, lang));
-        msg += `<code>${t}</code>  ${box} ${escapeHtml(e.title)}${suffix}\n`;
-    }
-    return msg;
-}
-
-function buildDayKeyboard(activeDay, lang, chatType = 'private') {
-    const isFa = lang === 'fa';
-    const order = isFa ? DAYS_FA_ORDER : DAYS;
-    const labels = isFa ? DAY_FULL_FA : DAY_LABELS_EN;
-    const buttons = order.map((d) => ({
-        text: d === activeDay ? `⭐ ${labels[d]}` : labels[d],
-        callback_data: `sched:${d}`,
-    }));
-    const rows = [buttons.slice(0, 4), buttons.slice(4)].filter(r => r.length > 0);
-
-    const webAppUrl = CACHED_WEBAPP_LINK || `${WORKER_ORIGIN}/app`;
-
-    rows.push([{
-        text: isFa ? '📱 وب اپ' : '📱 Web App',
-        url: webAppUrl,
-    }]);
-
-    return { inline_keyboard: rows };
-}
-
-async function sendScheduleMessage(env, chatId, dayKey, entries, lang, keyboard) {
-    const richRes = await sendRichMessage(env, chatId, formatDaySchedule(dayKey, entries, lang), {
-        reply_markup: keyboard, is_rtl: lang === 'fa',
-    });
-    if (richRes && richRes.ok) return richRes;
-
-    console.warn('[SCHEDULE] rich failed:', JSON.stringify(richRes).slice(0, 300));
-
-    const plainRes = await sendMessage(env, chatId, formatDaySchedulePlain(dayKey, entries, lang), {
-        reply_markup: keyboard,
-    });
-    if (!plainRes || !plainRes.ok) {
-        console.error('[SCHEDULE] plain fallback failed:', JSON.stringify(plainRes).slice(0, 300));
-    }
-    return plainRes;
-}
-
-async function editScheduleMessage(env, chatId, messageId, dayKey, entries, lang, keyboard) {
-    const richRes = await editRichMessage(env, chatId, messageId, formatDaySchedule(dayKey, entries, lang), {
-        reply_markup: keyboard, is_rtl: lang === 'fa',
-    });
-    if (richRes && richRes.ok) return richRes;
-
-    console.warn('[SCHEDULE] editRich failed:', JSON.stringify(richRes).slice(0, 300));
-
-    const plainRes = await editMessage(env, chatId, messageId, formatDaySchedulePlain(dayKey, entries, lang), {
-        reply_markup: keyboard,
-    });
-    if (!plainRes || !plainRes.ok) {
-        console.error('[SCHEDULE] editPlain fallback failed:', JSON.stringify(plainRes).slice(0, 300));
-    }
-    return plainRes;
-}
-
-async function handleSchedule(env, chatId, chatType) {
-    try {
-        const lang = await getLang(env, chatId);
-        const tz = SCHEDULE_TZ[lang] || SCHEDULE_TZ.en;
-        const today = getCurrentDay(tz);
-        const entries = await fetchScheduleForDay(env, today, tz);
-        await sendScheduleMessage(env, chatId, today, entries, lang, buildDayKeyboard(today, lang, chatType));
-    } catch (e) {
-        const lang = await getLang(env, chatId);
-        await sendMessage(env, chatId, lang === 'fa' ? `📅 <b>خطای برنامه:</b> ${e.message}` : `📅 <b>Schedule error:</b> ${e.message}`);
-    }
-}
-
-// ============= /app =============
-
-async function handleAppCommand(env, chatId, chatType) {
-    if (!CACHED_WEBAPP_LINK) {
-        await sendMessage(env, chatId, '❌ Web app link unavailable.');
-        return;
-    }
-    const lang = await getLang(env, chatId);
-    const text = lang === 'fa'
-        ? '📱 برنامه هفتگی انیمه‌ها را در وب اپ ببینید:'
-        : '📱 View the weekly anime schedule in the web app:';
-
-    const button = {
-        text: lang === 'fa' ? 'باز کردن وب اپ' : 'Open Web App',
-        url: CACHED_WEBAPP_LINK,
-    };
-
-    await sendMessage(env, chatId, text, {
-        reply_markup: { inline_keyboard: [[button]] },
-    });
-}
-
-// ============= OTHER COMMANDS =============
-
-async function handleStart(env, chatId) {
-    const lang = await getLang(env, chatId);
-    await setLang(env, chatId, lang);
-    const text = lang === 'fa'
-        ? 'سلام! من ربات اطلاع‌رسانی انیمه هستم.\n✅ شما مشترک شدید.\nبرای تغییر زبان از /language استفاده کنید.\nبرای لغو اشتراک از /unsub استفاده کنید.'
-        : 'Hi! I am an anime release notification bot.\n✅ You are now subscribed.\nUse /language to change the language.\nUse /unsub to unsubscribe.';
-    await sendMessage(env, chatId, text);
-    await addChatToBroadcast(env, chatId);
-}
-
-async function handleUnsub(env, chatId) {
-    const lang = await getLang(env, chatId);
-    await removeChatFromBroadcast(env, chatId);
-    const text = lang === 'fa'
-        ? '❌ اشتراک شما لغو شد.\nبرای فعال‌سازی مجدد از /start استفاده کنید.'
-        : '❌ You have been unsubscribed.\nUse /start to subscribe again.';
-    await sendMessage(env, chatId, text);
-}
-
-async function handleUnsubInGroup(env, chatId) {
-    const lang = await getLang(env, chatId);
-    const text = lang === 'fa'
-        ? 'ℹ️ این ربات به‌صورت گروهی مشترک می‌شود و نمی‌توانید فقط خودتان را از لیست ارسال لغو کنید.\n\nاگر نمی‌خواهید این گروه پیام دریافت کند، لطفاً ربات را از گروه حذف کنید (Kick/Remove).'
-        : 'ℹ️ This bot subscribes the whole group at once, so you can\'t unsubscribe just yourself from the broadcast list.\n\nIf you don\'t want this group to receive messages, please remove the bot from the group (Kick/Remove).';
-    await sendMessage(env, chatId, text);
-}
-
-async function handleLanguage(env, chatId) {
-    await sendMessage(env, chatId, '🌐 Choose your language:', {
-        reply_markup: { inline_keyboard: [[{ text: 'فارسی🇮🇷', callback_data: 'lang:fa' }, { text: '🇬🇧English', callback_data: 'lang:en' }]] },
-    });
-}
-
-async function handleCallbackQuery(env, callbackQuery) {
-    const { id, data, message } = callbackQuery;
-    const chatId = message.chat.id;
-    const messageId = message.message_id;
-    const chatType = message.chat.type || 'private';
-
-    if (data && data.startsWith('lang:')) {
-        const lang = data.split(':')[1];
-        await setLang(env, chatId, lang);
-        const confirmText = lang === 'fa' ? '✅ زبان به فارسی تغییر کرد.' : '✅ Language changed to English.';
-        await editMessage(env, chatId, messageId, confirmText);
-        await answerCallback(env, id);
-        return;
-    }
-
-    if (data && data.startsWith('sched:')) {
-        const dayKey = data.slice('sched:'.length);
-        if (!DAYS.includes(dayKey)) { await answerCallback(env, id); return; }
-        try {
-            const lang = await getLang(env, chatId);
-            const tz = SCHEDULE_TZ[lang] || SCHEDULE_TZ.en;
-            const entries = await fetchScheduleForDay(env, dayKey, tz);
-            await editScheduleMessage(env, chatId, messageId, dayKey, entries, lang, buildDayKeyboard(dayKey, lang, chatType));
-            await answerCallback(env, id);
-        } catch (e) {
-            await answerCallback(env, id);
-            const lang = await getLang(env, chatId);
-            await sendMessage(env, chatId, lang === 'fa' ? `📅 <b>خطای برنامه:</b> ${e.message}` : `📅 <b>Schedule error:</b> ${e.message}`);
-        }
-        return;
-    }
-
-    if (data === 'catch:tag') {
-        try {
-            const from = callbackQuery.from;
-            const user = {
-                userId: from.id,
-                username: from.username || null,
-                firstName: from.first_name || null,
-            };
-
-            const lang = await getLang(env, chatId);
-            const result = await addToCatchList(env, chatId, user);
-
-            if (result.added) {
-                const newText = formatCatchListText(result.list, lang);
-                const editRes = await editMessage(env, chatId, messageId, newText, {
-                    reply_markup: buildCatchKeyboard(lang),
-                });
-                if (!editRes || !editRes.ok) {
-                    console.warn(`[CATCH] edit failed: ${JSON.stringify(editRes).slice(0, 200)}`);
-                }
-                await answerCallback(env, id, lang === 'fa' ? '✅ تگ شدی' : '✅ You\'re tagged');
-            } else if (result.reason === 'full') {
-                await answerCallback(env, id, lang === 'fa' ? '⚠️ لیست پر است' : '⚠️ List is full', true);
-            } else {
-                await answerCallback(env, id, lang === 'fa' ? 'ℹ️ قبلاً تگ شدی' : 'ℹ️ Already tagged');
-            }
-        } catch (e) {
-            console.error(`[CATCH] callback error: ${e.message}`);
-            await answerCallback(env, id);
-        }
-        return;
-    }
-
-    if (data === 'dopurge:confirm') {
-        try {
-            const stub = await doClient(env);
-            const res = await stub.fetch('https://broadcaster/purge', { method: 'POST' });
-            const result = await res.json().catch(() => ({}));
-            await editMessage(env, chatId, messageId, `✅ Purged <b>${result.deleted ?? '?'}</b> item(s) and cleared alarm.`);
-        } catch (e) {
-            await editMessage(env, chatId, messageId, `❌ Purge failed: ${escapeHtml(e.message)}`);
-        }
-        await answerCallback(env, id);
-        return;
-    }
-    if (data === 'dopurge:cancel') {
-        await editMessage(env, chatId, messageId, '❌ Purge cancelled.');
-        await answerCallback(env, id);
-        return;
-    }
-}
-
-// ============= /debug =============
-
-async function handleDebug(env, chatId) {
-    try {
-        const lang = await getLang(env, chatId);
-        const nowUnix = Math.floor(Date.now() / 1000);
-        const week = await fetchScheduleWeek(env);
-
-        const allPast = [];
-        for (const d of Object.keys(week)) {
-            for (const e of week[d]) {
-                if (e.airingAt && e.airingAt <= nowUnix) allPast.push(e);
-            }
-        }
-        allPast.sort((a, b) => b.airingAt - a.airingAt);
-        const latestRaw = allPast.slice(0, 10);
-        const latest = collapseBatches(latestRaw);
-
-        if (latest.length === 0) {
-            await sendMessage(env, chatId, '🐛 <b>Debug:</b> No aired entries yet.');
-            return;
-        }
-
-        await sendMessage(env, chatId, `🐛 <b>Debug:</b> sending the ${latest.length} latest aired entries...`);
-        await sleep(BROADCAST_GAP_MS);
-
-        for (let i = 0; i < latest.length; i++) {
-            const e = latest[i];
-            const epKey = e.batchEpisodes && e.batchEpisodes.max != null ? e.batchEpisodes.max : e.episode;
-            await sendAiringMessage(env, chatId, e.title, epKey, e.episodes, e.url, lang, `#${i + 1}`, e.batchEpisodes || null);
-            SUBREQUEST_COUNT++;
-            await sleep(BROADCAST_GAP_MS);
-        }
-
-        await sendMessage(env, chatId, `🐛 <b>Debug complete.</b>\nSubrequests: ${SUBREQUEST_COUNT}`);
-    } catch (e) {
-        await sendMessage(env, chatId, `🐛 <b>Debug error:</b> ${e.message}`);
-    }
-}
-
-// ============= /do* ADMIN DEBUG COMMANDS =============
-
-async function handleDoStatus(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/status');
-        if (!res.ok) { await sendMessage(env, chatId, `❌ DO /status returned ${res.status}`); return; }
-        const data = await res.json();
-        const items = data.items || [];
-        const pending = items.filter(i => i.status === 'pending');
-        const done = items.filter(i => i.status === 'done');
-        const alarm = data.alarm;
-
-        let txt = `🔧 <b>DO Status</b>\n\n`;
-        txt += `Total: <b>${items.length}</b>\n`;
-        txt += `Pending: <b>${pending.length}</b>\n`;
-        txt += `Done: <b>${done.length}</b>\n`;
-        if (alarm) {
-            const inSec = Math.max(0, Math.round((alarm - Date.now()) / 1000));
-            txt += `Alarm: <code>${new Date(alarm).toISOString()}</code> (in ${inSec}s)\n`;
-        } else {
-            txt += `Alarm: <i>none set</i> ⚠️\n`;
-        }
-
-        if (pending.length) {
-            txt += `\n<b>Pending items:</b>\n`;
-            for (const p of pending.slice(0, 15)) {
-                const age = p.ageSec != null ? `${p.ageSec}s` : '?';
-                const batchInfo = p.batch ? `, batch ${p.batch.min}-${p.batch.max}` : '';
-                txt += `• ${escapeHtml(p.title)} ep<b>${p.episode}</b> — ${p.done}/${p.total} (try ${p.attempts}, age ${age}s${batchInfo})\n`;
-            }
-            if (pending.length > 15) txt += `<i>… +${pending.length - 15} more</i>\n`;
-        }
-        await sendMessage(env, chatId, txt);
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ DO status failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoDump(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/status?full=1');
-        if (!res.ok) { await sendMessage(env, chatId, `❌ DO /status?full=1 returned ${res.status}`); return; }
-        const data = await res.json();
-        const json = JSON.stringify(data, null, 2);
-
-        const chunks = [];
-        let rest = json;
-        while (rest.length > 3500) { chunks.push(rest.slice(0, 3500)); rest = rest.slice(3500); }
-        chunks.push(rest);
-
-        for (let i = 0; i < chunks.length; i++) {
-            const head = chunks.length > 1 ? `🗂 <b>DO Dump (${i + 1}/${chunks.length})</b>\n` : `🗂 <b>DO Dump</b>\n`;
-            await sendMessage(env, chatId, head + `<pre>${escapeHtml(chunks[i])}</pre>`);
-        }
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ DO dump failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoTrigger(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/trigger');
-        const data = await res.json().catch(() => ({}));
-        if (res.ok && data.ok) {
-            await sendMessage(env, chatId, '✅ Alarm set to +100ms. Now check <code>wrangler tail</code> — you should see <code>[DO] ALARM FIRED</code> within 1s.');
-        } else {
-            await sendMessage(env, chatId, `❌ Trigger failed: ${res.status} ${escapeHtml(JSON.stringify(data)).slice(0, 300)}`);
-        }
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Trigger failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoFlush(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/flush-now', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-        });
-        if (!res.ok) {
-            await sendMessage(env, chatId, `❌ /flush-now returned HTTP ${res.status}`);
-            return;
-        }
-        const data = await res.json().catch(() => ({}));
-        let txt = `🔄 <b>Flush complete</b>\n\n`;
-        txt += `Before: <b>${data.before ?? '?'}</b> pending\n`;
-        txt += `After: <b>${data.after ?? '?'}</b> pending\n`;
-        txt += `Any pending: <b>${data.anyPending ?? '?'}</b>\n`;
-        txt += `Max attempts: <b>${data.maxAttempts ?? '?'}</b>\n`;
-
-        if (data.failures && data.failures.length) {
-            txt += `\n<b>⚠️ Failures (${data.failures.length}):</b>\n`;
-            for (const f of data.failures.slice(0, 5)) {
-                const err = (f.error || '').slice(0, 200);
-                txt += `• chat <code>${escapeHtml(String(f.chatId))}</code>: <code>${escapeHtml(err)}</code>\n`;
-            }
-            if (data.failures.length > 5) txt += `<i>… +${data.failures.length - 5} more (see wrangler tail)</i>\n`;
-        }
-        if (data.errors && data.errors.length) {
-            txt += `\n<b>❌ Exceptions:</b>\n`;
-            for (const err of data.errors.slice(0, 5)) {
-                txt += `• <code>${escapeHtml(err).slice(0, 200)}</code>\n`;
-            }
-        }
-        await sendMessage(env, chatId, txt);
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Flush failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoNudge(env, chatId) {
-    try {
-        const week = await fetchScheduleWeek(env);
-        const nowUnix = Math.floor(Date.now() / 1000);
-        const windowStart = nowUnix - 25 * 60;
-        const windowEnd = nowUnix + 60;
-
-        const candidates = [];
-        for (const d of Object.keys(week)) {
-            for (const e of week[d]) {
-                if (e.airingAt && e.airingAt >= windowStart && e.airingAt <= windowEnd) candidates.push(e);
-            }
-        }
-        if (candidates.length === 0) {
-            await sendMessage(env, chatId, `🐛 No airings in window\n${new Date(windowStart * 1000).toISOString()} → ${new Date(windowEnd * 1000).toISOString()}`);
-            return;
-        }
-
-        const toSend = collapseBatches(candidates);
-        const airings = toSend.map((e) => {
-            const epNum = e.batchEpisodes && e.batchEpisodes.max != null ? e.batchEpisodes.max : e.episode;
-            return {
-                idKey: String(e.anilist_id || e.mal_id || e.title),
-                episode: epNum,
-                title: e.title,
-                url: e.url || null,
-                totalEps: e.episodes || null,
-                batch: e.batchEpisodes || null,
-                animeKey: animeKeyFromEntry(e),
-            };
-        });
-
-        await enqueueToBroadcaster(env, airings);
-
-        let txt = `✅ Nudged ${airings.length} airing(s):\n`;
-        for (const a of airings.slice(0, 10)) {
-            txt += `• ${escapeHtml(a.title)} ep${a.episode}\n`;
-        }
-        if (airings.length > 10) txt += `<i>… +${airings.length - 10} more</i>\n`;
-        await sendMessage(env, chatId, txt);
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Nudge failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoCleanup(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/cleanup');
-        const data = await res.json().catch(() => ({}));
-        await sendMessage(env, chatId, `✅ Cleanup: deleted <b>${data.deleted ?? '?'}</b> item(s).`);
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Cleanup failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoPurgeRequest(env, chatId) {
-    await sendMessage(env, chatId,
-        '⚠️ <b>Purge DO state?</b>\n\nThis deletes <b>all</b> <code>broadcast:*</code> keys and clears the alarm. Pending deliveries will be lost.',
-        { reply_markup: { inline_keyboard: [[
-            { text: '✅ Yes, purge', callback_data: 'dopurge:confirm' },
-            { text: '❌ Cancel', callback_data: 'dopurge:cancel' },
-        ]] } }
+  await writeRssTargets(env, targets);
+
+  const newMine = targets.filter(
+    (t) => t.chatId === chatId && (t.threadId ?? null) === threadId
+  );
+  const settings = rssSettingsMessage(newMine, parsed.ref);
+  if (!settings) return;
+
+  try {
+    await editMessageText(
+      env.BOT_TOKEN,
+      chatId,
+      messageId,
+      settings.text,
+      { reply_markup: rssSettingsKeyboard(settings) }
     );
+  } catch (e) {
+    if (!/not modified/i.test(String(e.message || ''))) {
+      console.error('rss settings edit failed:', e.message);
+    }
+  }
+
+  await logEvent(env, {
+    ev: 'rss_settings_toggle',
+    ref: parsed.ref,
+    changed,
+  });
 }
 
-async function handleDoTest(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/test', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chatId,
-                title: 'Debug Test Anime',
-                episode: 1,
-                totalEps: 12,
-                url: 'https://anilist.co/anime/1',
-            }),
+async function handleRssCallback(update, env) {
+  const cq = update.callback_query;
+  if (!cq) return;
+  try {
+    await answerCallbackQuery(env.BOT_TOKEN, cq.id);
+  } catch { /* ignore */ }
+
+  const parsed = parseRssCallback(cq.data);
+  if (!parsed) return;
+
+  try {
+    await handleRssSettingsCallback(cq, parsed, env);
+  } catch (e) {
+    await reportError(env, 'handleRssSettingsCallback', e, { data: cq.data });
+  }
+}
+
+function rssItemId(item) {
+  if (item.guid) return item.guid;
+  if (item.link) return 'link:' + item.link;
+  if (item.title) return 'title:' + item.title + '|' + (item.pubDate || '');
+  return null;
+}
+
+function mergeTrackedGuids(existing, newGuids, seed, allGuids) {
+  const seen = new Set();
+  const merged = [];
+  const source = seed ? [...allGuids, ...existing] : [...newGuids, ...existing];
+  for (const g of source) {
+    if (!g || seen.has(g)) continue;
+    seen.add(g);
+    merged.push(g);
+    if (merged.length >= 500) break;
+  }
+  return merged;
+}
+
+// ═══════════════════════════════════════════════════════════
+//                    REGULAR RSS CRON
+// ═══════════════════════════════════════════════════════════
+
+async function handleRssCron(env, events) {
+  if (!events) events = [];
+  const summary = {
+    at: new Date().toISOString(),
+    total: 0,
+    sent: 0,
+    failed: 0,
+    details: [],
+  };
+  try {
+    const targets = await readRssTargets(env);
+    summary.total = targets.length;
+    if (!targets.length) return summary;
+
+    const urlCache = new Map();
+    let changed = false;
+
+    for (const t of targets) {
+      const d = {
+        url: t.url,
+        chatId: t.chatId,
+        threadId: t.threadId ?? null,
+        fetchOk: false,
+        reason: '',
+        itemsFound: 0,
+        newFound: 0,
+        sent: 0,
+        tracked: 0,
+        seeded: false,
+        newestGuid: '',
+      };
+
+      let r = urlCache.get(t.url);
+      if (!r) {
+        r = await fetchRssOnce(t.url);
+        urlCache.set(t.url, r);
+      }
+      if (!r.ok) {
+        d.reason = r.reason || 'unknown';
+        summary.failed++;
+        summary.details.push(d);
+        continue;
+      }
+      d.fetchOk = true;
+
+      const items = r.data.items;
+      d.itemsFound = items.length;
+      d.newestGuid = items[0] ? (rssItemId(items[0]) || '').slice(0, 40) : '';
+      if (!items.length) {
+        summary.details.push(d);
+        continue;
+      }
+
+      const hasSentGuids = Array.isArray(t.sentGuids);
+      const sentGuids = hasSentGuids ? t.sentGuids.slice() : [];
+      const sentSet = new Set(sentGuids);
+      d.tracked = sentGuids.length;
+
+      const newItems = [];
+      for (const item of items) {
+        const ident = rssItemId(item);
+        if (ident && sentSet.has(ident)) continue;
+        newItems.push(item);
+      }
+      d.newFound = newItems.length;
+
+      const MAX_NEW_PER_PASS = 10;
+      const RESEED_THRESHOLD = 30;
+      const isSeedRun =
+        !t.seededAt ||
+        !hasSentGuids ||
+        newItems.length > RESEED_THRESHOLD;
+      d.seeded = isSeedRun;
+
+      const toSend = isSeedRun ? [] : newItems.slice(0, MAX_NEW_PER_PASS);
+      toSend.reverse();
+
+      const justSent = [];
+      for (const item of toSend) {
+        try {
+          await sendRichMessage(
+            env.BOT_TOKEN,
+            t.chatId,
+            buildRssItemRichMessage(
+              item,
+              t.title || r.data.title,
+              !!t.hideTitle
+            ),
+            t.threadId ?? undefined
+          );
+          d.sent++;
+          summary.sent++;
+          const ident = rssItemId(item);
+          if (ident) justSent.push(ident);
+        } catch (e) {
+          console.error('RSS sendRichMessage failed:', e.message);
+          summary.failed++;
+          events.push({
+            ev: 'rss_send_error',
+            msg: e.message,
+            url: t.url.slice(0, 80),
+          });
+          break;
+        }
+      }
+
+      const allGuids = items.map((i) => rssItemId(i)).filter(Boolean);
+      const toRecord = isSeedRun ? allGuids : justSent;
+
+      if (toRecord.length > 0 || isSeedRun) {
+        t.sentGuids = mergeTrackedGuids(sentGuids, toRecord, isSeedRun, allGuids);
+        t.seededAt = Date.now();
+        if ('lastGuid' in t) delete t.lastGuid;
+        if (r.data.title) t.title = r.data.title;
+        changed = true;
+      }
+
+      if (d.sent > 0) {
+        events.push({
+          ev: 'rss_sent',
+          url: t.url.slice(0, 80),
+          count: d.sent,
         });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok && data.ok) {
-            await sendMessage(env, chatId, `✅ Test enqueued (key: <code>${escapeHtml(data.key)}</code>).\nIf the alarm fires you'll see this message arrive in ~1s.\nIf nothing arrives, run <code>/doflush</code> and <code>/doself</code>.`);
+      }
+
+      summary.details.push(d);
+    }
+
+    if (changed) {
+      await writeRssTargets(env, targets);
+    }
+  } catch (e) {
+    summary.error = e.message;
+    await reportError(env, 'scheduled.rss', e);
+  }
+  return summary;
+}
+
+// ═══════════════════════════════════════════════════════════
+//                    PIXEL RSS CRON
+// ═══════════════════════════════════════════════════════════
+
+async function handlePixelRssCron(env, events) {
+  if (!events) events = [];
+  const summary = {
+    at: new Date().toISOString(),
+    total: 0,
+    sent: 0,
+    failed: 0,
+    details: [],
+  };
+  try {
+    const targets = await readPixelTargets(env);
+    summary.total = targets.length;
+    if (!targets.length) return summary;
+
+    const urlCache = new Map();
+    let changed = false;
+
+    for (const t of targets) {
+      const d = {
+        url: t.url,
+        chatId: t.chatId,
+        threadId: t.threadId ?? null,
+        type: t.type || '',
+        fetchOk: false,
+        reason: '',
+        itemsFound: 0,
+        newFound: 0,
+        sent: 0,
+        tracked: 0,
+        seeded: false,
+        newestGuid: '',
+      };
+
+      let r = urlCache.get(t.url);
+      if (!r) {
+        r = await fetchRssOnce(t.url);
+        urlCache.set(t.url, r);
+      }
+      if (!r.ok) {
+        d.reason = r.reason || 'unknown';
+        summary.failed++;
+        summary.details.push(d);
+        continue;
+      }
+      d.fetchOk = true;
+
+      const items = r.data.items;
+      d.itemsFound = items.length;
+      d.newestGuid = items[0] ? (rssItemId(items[0]) || '').slice(0, 40) : '';
+      if (!items.length) {
+        summary.details.push(d);
+        continue;
+      }
+
+      const hasSentGuids = Array.isArray(t.sentGuids);
+      const sentGuids = hasSentGuids ? t.sentGuids.slice() : [];
+      const sentSet = new Set(sentGuids);
+      d.tracked = sentGuids.length;
+
+      const newItems = [];
+      for (const item of items) {
+        const ident = rssItemId(item);
+        if (ident && sentSet.has(ident)) continue;
+        newItems.push(item);
+      }
+      d.newFound = newItems.length;
+
+      const MAX_NEW_PER_PASS = 10;
+      const RESEED_THRESHOLD = 30;
+      const isSeedRun =
+        !t.seededAt ||
+        !hasSentGuids ||
+        newItems.length > RESEED_THRESHOLD;
+      d.seeded = isSeedRun;
+
+      const toSend = isSeedRun ? [] : newItems.slice(0, MAX_NEW_PER_PASS);
+      toSend.reverse();
+
+      const justSent = [];
+      for (const item of toSend) {
+        try {
+          await sendPixelPair(
+            env.BOT_TOKEN,
+            t.chatId,
+            t.threadId ?? undefined,
+            t.type || '',
+            item,
+            t.title || r.data.title || ''
+          );
+
+          d.sent++;
+          summary.sent++;
+          const ident = rssItemId(item);
+          if (ident) justSent.push(ident);
+        } catch (e) {
+          console.error('Pixel RSS sendPixelPair failed:', e.message);
+          summary.failed++;
+          events.push({
+            ev: 'rss_pixel_send_error',
+            msg: e.message,
+            url: t.url.slice(0, 80),
+          });
+          break;
+        }
+      }
+
+      const allGuids = items.map((i) => rssItemId(i)).filter(Boolean);
+      const toRecord = isSeedRun ? allGuids : justSent;
+
+      if (toRecord.length > 0 || isSeedRun) {
+        t.sentGuids = mergeTrackedGuids(sentGuids, toRecord, isSeedRun, allGuids);
+        t.seededAt = Date.now();
+        if ('lastGuid' in t) delete t.lastGuid;
+        if (r.data.title) t.title = r.data.title;
+        changed = true;
+      }
+
+      if (d.sent > 0) {
+        events.push({
+          ev: 'rss_pixel_sent',
+          url: t.url.slice(0, 80),
+          count: d.sent,
+        });
+      }
+
+      summary.details.push(d);
+    }
+
+    if (changed) {
+      await writePixelTargets(env, targets);
+    }
+  } catch (e) {
+    summary.error = e.message;
+    await reportError(env, 'scheduled.rss_pixel', e);
+  }
+  return summary;
+}
+
+// ═══════════════════════════════════════════════════════════
+//                    KV EXPORT / IMPORT
+// ═══════════════════════════════════════════════════════════
+
+function targetKeyOf(t) {
+  return `${t.chatId}|${t.threadId ?? ''}|${t.url}`;
+}
+
+function dedupeTargets(imported, existing) {
+  const seen = new Set();
+  const result = [];
+  for (const t of imported) {
+    if (!t || typeof t !== 'object' || !t.url) continue;
+    const k = targetKeyOf(t);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    result.push(t);
+  }
+  for (const t of existing) {
+    if (!t || typeof t !== 'object' || !t.url) continue;
+    const k = targetKeyOf(t);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    result.push(t);
+  }
+  return result;
+}
+
+async function handleKvExport(env, msg, threadId) {
+  if (msg.from?.id !== ownerId(env)) return;
+
+  // Version 2: each value is the raw string exactly as stored in KV.
+  // Encrypted values are NOT decrypted here; the CRON_FIRED_FLAG_KEY
+  // value is plaintext '1' and is stored verbatim. Import handles both.
+  const data = {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    keys: {},
+  };
+
+  for (const key of KV_EXPORT_KEYS) {
+    try {
+      const raw = await env.BOT_KV.get(key);
+      if (raw == null) continue;
+      data.keys[key] = raw;
+    } catch (e) {
+      console.error(`Export failed for ${key}:`, e);
+    }
+  }
+
+  const json = JSON.stringify(data, null, 2);
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const filename = `rss-kv-export-${dateStr}.json`;
+
+  try {
+    await sendDocument(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      filename,
+      json,
+      'application/json',
+      threadId ?? undefined,
+      {
+        caption:
+          '📦 KV export (encrypted). ' +
+          'Import on the new account with the same DB_ENCRYPTION_KEY.',
+      }
+    );
+  } catch (e) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      `❌ Failed to send export: ${e.message}`,
+      threadId ?? undefined
+    );
+    await reportError(env, 'kv_export', e);
+    return;
+  }
+
+  await logEvent(env, { ev: 'kv_export', keys: Object.keys(data.keys).length });
+}
+
+async function handleKvImport(env, msg, threadId) {
+  if (msg.from?.id !== ownerId(env)) return;
+
+  const arg = msg.text.replace(/^\/rsskvimport(@\w+)?\s*/i, '').trim().toLowerCase();
+  const merge = arg === 'merge';
+
+  const reply = msg.reply_to_message;
+  if (!reply || !reply.document) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      'ℹ️ Usage:\n' +
+        'Reply to an exported `.json` file and send:\n' +
+        '• `/rsskvimport` — replace all current KV\n' +
+        '• `/rsskvimport merge` — merge with current KV\n\n' +
+        'The destination account must use the same `DB_ENCRYPTION_KEY`.',
+      threadId ?? undefined,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  let text;
+  try {
+    text = await getFileText(env.BOT_TOKEN, reply.document.file_id);
+  } catch (e) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      `❌ Failed to download file: ${e.message}`,
+      threadId ?? undefined
+    );
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      `❌ Invalid JSON: ${e.message}`,
+      threadId ?? undefined
+    );
+    return;
+  }
+
+  if (!parsed || parsed.version !== 2 || !parsed.keys || typeof parsed.keys !== 'object') {
+    await sendMessage(
+      env.BOT_TOKEN,
+      msg.chat.id,
+      '⚠️ Unrecognized export file (expected version 2 with a "keys" object ' +
+        'whose values are strings).',
+      threadId ?? undefined
+    );
+    return;
+  }
+
+  const whitelist = new Set(KV_EXPORT_KEYS);
+  const results = [];
+  let written = 0;
+  let skipped = 0;
+
+  for (const [key, raw] of Object.entries(parsed.keys)) {
+    if (!whitelist.has(key)) {
+      results.push(`⏭ ${key} (unknown, skipped)`);
+      skipped++;
+      continue;
+    }
+    if (typeof raw !== 'string') {
+      results.push(`❌ ${key} (not a string)`);
+      skipped++;
+      continue;
+    }
+
+    // cron:fired_once is stored as plaintext ('1'), never encrypted.
+    // Copy it as-is without attempting decryption.
+    if (key === CRON_FIRED_FLAG_KEY) {
+      try {
+        const existing = await env.BOT_KV.get(key);
+        if (merge && existing) {
+          results.push(`⏭ ${key} (already set, kept)`);
+          skipped++;
         } else {
-            await sendMessage(env, chatId, `❌ Enqueue failed: ${res.status} ${escapeHtml(JSON.stringify(data)).slice(0, 300)}`);
+          await env.BOT_KV.put(key, raw);
+          results.push(`✅ ${key}`);
+          written++;
         }
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Test failed: ${escapeHtml(e.message)}`);
+      } catch (e) {
+        results.push(`❌ ${key}: ${e.message}`);
+        skipped++;
+      }
+      continue;
     }
-}
 
-async function handleDoSingle(env, chatId) {
+    // Verify this Worker's key can decrypt the blob. If it can't, the
+    // destination is using a different DB_ENCRYPTION_KEY.
+    let value;
     try {
-        const lang = await getLang(env, chatId);
-        const res = await sendAiringMessage(
-            env, chatId, 'Debug Direct Test', 1, 12,
-            'https://anilist.co/anime/1', lang
+      value = decryptData(raw, env.DB_ENCRYPTION_KEY);
+    } catch {
+      results.push(`❌ ${key} (cannot decrypt — DB_ENCRYPTION_KEY differs)`);
+      skipped++;
+      continue;
+    }
+
+    try {
+      if (!merge) {
+        // Replace: write the encrypted blob as-is, no re-encryption needed.
+        await env.BOT_KV.put(key, raw);
+        const count = Array.isArray(value) ? ` (${value.length} entries)` : '';
+        results.push(`✅ ${key}${count}`);
+        written++;
+        continue;
+      }
+
+      if (key === RSS_TARGETS_KEY || key === RSS_PIXEL_TARGETS_KEY) {
+        if (!Array.isArray(value)) {
+          results.push(`❌ ${key} (expected array)`);
+          skipped++;
+          continue;
+        }
+        const existing = key === RSS_TARGETS_KEY
+          ? await readRssTargets(env)
+          : await readPixelTargets(env);
+        const before = existing.length;
+        const imported = value.filter((t) => t && isAllowedChat(t.chatId));
+        const dropped = value.length - imported.length;
+        const merged = dedupeTargets(imported, existing);
+        await env.BOT_KV.put(
+          key,
+          encryptData(merged, env.DB_ENCRYPTION_KEY)
         );
-        const ok = res && res.ok;
-        await sendMessage(env, chatId,
-            ok
-                ? `✅ Direct send OK (lang=${lang}). Telegram works from worker.`
-                : `❌ Direct send failed: <code>${escapeHtml(JSON.stringify(res).slice(0, 500))}</code>`
+        results.push(
+          `✅ ${key} (merged: ${before} + ${imported.length} → ${merged.length}` +
+            (dropped > 0 ? `, ${dropped} dropped not-allowed` : '') +
+            `)`
         );
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Direct send exception: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoSelf(env, chatId) {
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/selfcheck', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chatId }),
-        });
-        if (!res.ok) {
-            await sendMessage(env, chatId, `❌ /selfcheck HTTP ${res.status}`);
-            return;
+        written++;
+      } else if (key === ERRORS_KEY || key === 'telemetry') {
+        if (!Array.isArray(value)) {
+          results.push(`❌ ${key} (expected array)`);
+          skipped++;
+          continue;
         }
-        const data = await res.json();
-        const c = data.checks || {};
-
-        let txt = '🩺 <b>DO Self-Check</b>\n\n';
-        txt += `BOT_TOKEN: ${c.hasBOT_TOKEN ? `✅ len=${c.botTokenLen} prefix=<code>${escapeHtml(c.botTokenPrefix || '')}</code>` : '❌ <b>MISSING</b>'}\n`;
-        txt += `KV: ${c.hasKV ? '✅' : '❌'}\n`;
-        txt += `Broadcaster: ${c.hasBroadcaster ? '✅' : '❌'}\n`;
-        txt += `EncKey: ${c.hasEncKey ? '✅' : '❌'}\n`;
-        txt += `\n<b>getMe from DO:</b>\n<code>${escapeHtml(JSON.stringify(c.getMe))}</code>\n`;
-        txt += `\n<b>plain sendMessage from DO:</b>\n<code>${escapeHtml(JSON.stringify(c.plainSend))}</code>\n`;
-        txt += `\n<b>sendRichMessage from DO:</b>\n<code>${escapeHtml(JSON.stringify(c.richSend))}</code>\n`;
-
-        if (!c.hasBOT_TOKEN) {
-            txt += '\n⚠️ <b>BOT_TOKEN missing in DO env.</b>\nAdd it to <code>wrangler.toml</code> under <code>[vars]</code>, or set it with <code>wrangler secret put BOT_TOKEN</code>.';
-        } else if (c.plainSend && c.plainSend.ok) {
-            txt += '\n✅ plain sendMessage from DO succeeded.';
-        } else if (c.plainSend && c.plainSend.error) {
-            txt += `\n❌ plain sendMessage failed: <code>${escapeHtml(c.plainSend.error)}</code>`;
+        let existing = [];
+        const oldRaw = await env.BOT_KV.get(key);
+        if (oldRaw) {
+          try {
+            existing = decryptData(oldRaw, env.DB_ENCRYPTION_KEY) || [];
+            if (!Array.isArray(existing)) existing = [];
+          } catch { existing = []; }
         }
-
-        await sendMessage(env, chatId, txt);
-    } catch (e) {
-        await sendMessage(env, chatId, `❌ Self-check failed: ${escapeHtml(e.message)}`);
-    }
-}
-
-async function handleDoDoctor(env, chatId) {
-    const lines = [];
-    const log = (s) => lines.push(s);
-
-    log('<b>🩺 Doctor</b>\n');
-
-    try {
-        const lang = await getLang(env, chatId);
-        const res = await sendAiringMessage(
-            env, chatId, 'Doctor Test 1/2 (direct)', 1, 12,
-            'https://anilist.co/anime/1', lang
+        const cap = key === 'telemetry' ? 30 : 20;
+        const merged = [...value, ...existing].slice(0, cap);
+        await env.BOT_KV.put(
+          key,
+          encryptData(merged, env.DB_ENCRYPTION_KEY)
         );
-        log(`1. Direct send (worker→Telegram): ${res && res.ok ? '✅' : `❌ ${JSON.stringify(res).slice(0, 200)}`}`);
-    } catch (e) {
-        log(`1. Direct send: ❌ ${e.message}`);
-    }
-
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/status');
-        const data = await res.json();
-        const pending = (data.items || []).filter(i => i.status === 'pending').length;
-        const done = (data.items || []).filter(i => i.status === 'done').length;
-        log(`2. DO status: pending=${pending}, done=${done}, alarm=${data.alarm ? new Date(data.alarm).toISOString() : 'none'}`);
-    } catch (e) {
-        log(`2. DO status: ❌ ${e.message}`);
-    }
-
-    try {
-        const stub = await doClient(env);
-        log(`3. Calling /flush-now (synchronous)...`);
-        const res = await stub.fetch('https://broadcaster/flush-now', { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
-        log(`   before=${data.before} after=${data.after} anyPending=${data.anyPending}`);
-        if (data.failures && data.failures.length) {
-            for (const f of data.failures.slice(0, 3)) {
-                log(`   ⚠️ chat <code>${escapeHtml(String(f.chatId))}</code>: ${escapeHtml((f.error || '').slice(0, 150))}`);
-            }
-        }
-        if (data.errors && data.errors.length) {
-            for (const err of data.errors.slice(0, 3)) {
-                log(`   ❌ ${escapeHtml(err).slice(0, 150)}`);
-            }
-        }
-    } catch (e) {
-        log(`3. Flush: ❌ ${e.message}`);
-    }
-
-    try {
-        const stub = await doClient(env);
-        const res = await stub.fetch('https://broadcaster/selfcheck', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chatId }),
-        });
-        const data = await res.json();
-        const c = data.checks || {};
-        log(`4. DO BOT_TOKEN: ${c.hasBOT_TOKEN ? `✅ len=${c.botTokenLen}` : '❌ MISSING'}`);
-        log(`   DO plain sendMessage: ${c.plainSend && c.plainSend.ok ? '✅' : `❌ ${escapeHtml(JSON.stringify(c.plainSend)).slice(0, 200)}`}`);
-    } catch (e) {
-        log(`4. Self-check: ❌ ${e.message}`);
-    }
-
-    try {
-        const stub = await doClient(env);
-        await stub.fetch('https://broadcaster/trigger');
-        log(`5. Alarm scheduled for +100ms — check <code>wrangler tail</code> for <code>[DO] ALARM FIRED</code>`);
-    } catch (e) {
-        log(`5. Alarm test: ❌ ${e.message}`);
-    }
-
-    log('\n<b>Interpretation:</b>');
-    log('• Step 1 ❌ with parse error → HTML format rejected');
-    log('• Step 3 leaves pending>0 → per-chat failures listed above');
-    log('• Step 4 BOT_TOKEN MISSING → fix wrangler.toml vars');
-    log('• Step 5 no ALARM FIRED in tail → Cloudflare alarm issue');
-
-    await sendMessage(env, chatId, lines.join('\n'));
-}
-
-async function handleDoDiag(env, chatId) {
-    const lines = [];
-    const log = (s) => lines.push(s);
-
-    log('<b>🔍 Diagnostics</b>\n');
-    log(`1. BOT_TOKEN: ${env.BOT_TOKEN ? '✅ set' : '❌ MISSING'}`);
-    log(`2. BROADCASTER binding: ${env.BROADCASTER ? '✅' : '❌ MISSING'}`);
-    log(`3. ADMIN_ID: ${env.ADMIN_ID ? `✅ ${env.ADMIN_ID}` : '⚪ not set'}`);
-
-    try {
-        const res = await fetch(`${TELEGRAM_API}${env.BOT_TOKEN}/getMe`);
-        const json = await res.json();
-        log(`4. getMe: ${json.ok ? `✅ @${json.result.username}` : `❌ ${json.description || json.error_code}`}`);
-    } catch (e) { log(`4. getMe: ❌ ${e.message}`); }
-
-    try {
-        const chats = await getBroadcastChats(env);
-        log(`5. Broadcast chats: <b>${chats.length}</b> (this: ${chats.includes(chatId) ? '✅' : '❌'})`);
-    } catch (e) { log(`5. Chats: ❌ ${e.message}`); }
-
-    try {
-        const week = await fetchScheduleWeek(env);
-        const weekSize = Object.values(week).reduce((s, l) => s + l.length, 0);
-        log(`6. Week entries: <b>${weekSize}</b>`);
-    } catch (e) { log(`6. Week: ❌ ${e.message}`); }
-
-    try {
-        const stub = await doClient(env);
-        const res = await Promise.race([
-            stub.fetch('https://broadcaster/status'),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 5s')), 5000)),
-        ]);
-        if (res.ok) {
-            const data = await res.json();
-            const items = data.items || [];
-            const pending = items.filter(i => i.status === 'pending').length;
-            const done = items.filter(i => i.status === 'done').length;
-            log(`7. DO: ✅ pending=${pending} done=${done} alarm=${data.alarm ? new Date(data.alarm).toISOString() : 'none'}`);
+        results.push(`✅ ${key} (merged: ${merged.length} entries)`);
+        written++;
+      } else if (key === CRON_LAST_KEY) {
+        const existing = await env.BOT_KV.get(key);
+        if (existing) {
+          results.push(`⏭ ${key} (already set, kept)`);
+          skipped++;
         } else {
-            log(`7. DO: ⚠️ /status HTTP ${res.status}`);
+          await env.BOT_KV.put(key, raw);
+          results.push(`✅ ${key}`);
+          written++;
         }
-    } catch (e) { log(`7. DO: ❌ ${e.message}`); }
+      } else {
+        results.push(`⏭ ${key} (no merge rule, skipped)`);
+        skipped++;
+      }
+    } catch (e) {
+      results.push(`❌ ${key}: ${e.message}`);
+      skipped++;
+    }
+  }
 
-    try {
-        const lang = await getLang(env, chatId);
-        log(`8. Your language: <b>${lang}</b>`);
-    } catch (e) { log(`8. Language: ❌ ${e.message}`); }
+  let summary =
+    `${RLM}📥 KV import done${merge ? ' (merge)' : ''}\n` +
+    `${RLM}Written: ${written} · Skipped: ${skipped}\n\n` +
+    results.map((r) => `${RLM}${r}`).join('\n');
+  if (summary.length > 4000) summary = summary.slice(0, 3950) + '\n…';
 
-    log('\nRun <code>/doself</code>, <code>/doflush</code>, <code>/dodoctor</code> for deeper checks.');
-    await sendMessage(env, chatId, lines.join('\n'));
+  await sendMessage(
+    env.BOT_TOKEN,
+    msg.chat.id,
+    summary,
+    threadId ?? undefined,
+    { link_preview_options: { is_disabled: true } }
+  );
+
+  await logEvent(env, {
+    ev: 'kv_import',
+    merge,
+    written,
+    skipped,
+    exportedAt: parsed.exportedAt || null,
+  });
 }
 
-// ============= DURABLE OBJECT: BROADCASTER =============
+// ═══════════════════════════════════════════════════════════
+//                     COMMAND HANDLER
+// ═══════════════════════════════════════════════════════════
 
-export class Broadcaster {
-    constructor(state, env) {
-        this.state = state;
-        this.env = env;
-        ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
-        globalThis.ENCRYPTION_KEY = ENCRYPTION_KEY;
+function parseCommand(text) {
+  if (!text || typeof text !== 'string' || !text.startsWith('/')) return null;
+  const first = text.trim().split(/\s+/)[0];
+  return first.split('@')[0].toLowerCase();
+}
+
+async function handleUpdate(update, env) {
+  const msg = update.message || update.channel_post;
+  if (!msg || !msg.text) return;
+  const cmd = parseCommand(msg.text);
+  if (!cmd) return;
+  if (!env.BOT_TOKEN) return;
+
+  const threadId = topicOf(msg) ?? null;
+  const where = !threadId
+    ? msg.chat.type === 'private'
+      ? 'چت خصوصی'
+      : msg.chat.type === 'channel'
+        ? 'کانال'
+        : 'چت'
+    : 'تاپیک';
+
+  switch (cmd) {
+    case '/start': {
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        '<b>RSS Bot — دستورات:</b>\n' +
+          '<b>— RSS —</b>\n' +
+          '/rss &lt;url&gt; — اشتراک فید جدید\n' +
+          '/rssunsub &lt;url&gt; — حذف اشتراک\n' +
+          '/rssunsubdomain &lt;domain&gt; — حذف همه اشتراک‌های یک دامنه\n' +
+          '/rsslist — لیست اشتراک‌های این چت\n' +
+          '/rsssettings &lt;url&gt; | all — تنظیمات نمایش تیتر\n' +
+          '/rsstest &lt;url&gt; — تست دستی یک فید\n' +
+          '/rssexport — خروجی OPML\n' +
+          '/rssimport — ورودی OPML (روی فایل ریپلای کن)\n' +
+          '\n<b>— RSS Pixel —</b>\n' +
+          '/rsspixel &lt;url&gt; &lt;type&gt; — اشتراک PixelMedia\n' +
+          '/rsspixelunsub &lt;url&gt; — حذف اشتراک PixelMedia\n' +
+          '/rsspixellist — لیست اشتراک‌های PixelMedia\n' +
+          '/rsspixeltest &lt;url&gt; &lt;type&gt; — تست دستی یک فید PixelMedia\n' +
+          '\n<b>— Migration —</b>\n' +
+          '/rsskvexport — خروجی KV (فقط owner)\n' +
+          '/rsskvimport — ورودی KV (روی فایل ریپلای کن، فقط owner)\n' +
+          '\n<b>— عمومی —</b>\n' +
+          '/id — نمایش Chat ID و Topic ID\n' +
+          '/ping — تست',
+        threadId ?? undefined,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      await logEvent(env, { ev: 'start_help' });
+      return;
     }
 
-    async fetch(request) {
-        const url = new URL(request.url);
-        try {
-            console.log(`[DO] fetch hit: ${url.pathname}`);
-            if (url.pathname === '/enqueue' && request.method === 'POST') {
-                const body = await request.json();
-                return await this.handleEnqueue(body.airings || []);
-            }
-            if (url.pathname === '/status') {
-                return await this.handleStatus(url.searchParams.get('full') === '1');
-            }
-            if (url.pathname === '/trigger') {
-                await this.state.storage.setAlarm(Date.now() + 100);
-                console.log(`[DO] /trigger set alarm for +100ms`);
-                return jsonResponse({ ok: true, triggered: true });
-            }
-            if (url.pathname === '/flush-now' && request.method === 'POST') {
-                return await this.handleFlushNow();
-            }
-            if (url.pathname === '/cleanup') {
-                const deleted = await this.cleanupOld();
-                return jsonResponse({ ok: true, deleted });
-            }
-            if (url.pathname === '/purge' && request.method === 'POST') {
-                return await this.handlePurge();
-            }
-            if (url.pathname === '/test' && request.method === 'POST') {
-                const body = await request.json();
-                return await this.handleTest(body);
-            }
-            if (url.pathname === '/selfcheck' && request.method === 'POST') {
-                const body = await request.json();
-                return await this.handleSelfCheck(body);
-            }
-            return new Response('not found', { status: 404 });
-        } catch (e) {
-            console.error('[DO] fetch error:', e);
-            return jsonResponse({ error: e.message }, 500);
-        }
+    case '/ping': {
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `🏓 pong — ${new Date().toISOString()}`,
+        threadId ?? undefined
+      );
+      return;
     }
 
-    async alarm() {
-        console.log(`[DO] ALARM FIRED at ${new Date().toISOString()}`);
-        let anyPending = false;
-        let maxAttempts = 0;
+    case '/crondebug': {
+      if (msg.from?.id !== ownerId(env)) return;
 
-        try {
-            const del = await this.cleanupOld();
-            if (del > 0) console.log(`[DO] cleanupOld deleted ${del}`);
-            const result = await this.processPending();
-            anyPending = result.anyPending;
-            maxAttempts = result.maxAttempts;
-            console.log(`[DO] processPending returned anyPending=${anyPending} maxAttempts=${maxAttempts}`);
-        } catch (e) {
-            console.error('[DO] alarm error:', e);
-            anyPending = true;
-            maxAttempts = 0;
-        }
+      const arg = msg.text
+        .replace(/^\/crondebug(@\w+)?\s*/i, '')
+        .trim()
+        .toLowerCase();
 
-        try {
-            if (anyPending) {
-                const backoff = Math.min(DO_RETRY_MAX_MS, DO_RETRY_BASE_MS * Math.max(1, maxAttempts));
-                await this.state.storage.setAlarm(Date.now() + backoff);
-                console.log(`[DO] alarm rescheduled for +${backoff}ms`);
-            } else {
-                await this.state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
-                console.log(`[DO] alarm set to cleanup-only +1h`);
-            }
-        } catch (e) {
-            console.error('[DO] setAlarm FAILED:', e);
-        }
-    }
-
-    async handleEnqueue(airings) {
-        if (!Array.isArray(airings) || airings.length === 0) {
-            await this.ensureAlarm();
-            return jsonResponse({ ok: true, enqueued: 0, reason: 'empty' });
-        }
-
-        const chats = await getBroadcastChats(this.env);
-        if (chats.length === 0) {
-            await this.ensureAlarm();
-            return jsonResponse({ ok: true, enqueued: 0, reason: 'no-chats' });
-        }
-
-        const pendingByAnime = new Map();
-        const allEntries = await this.state.storage.list({ prefix: 'broadcast:' });
-        for (const [k, s] of allEntries) {
-            if (s.status === 'pending' && s.idKey) {
-                pendingByAnime.set(s.idKey, { key: k, state: s });
-            }
-        }
-
-        let enqueued = 0;
-        let merged = 0;
-        for (const a of airings) {
-            const kvKey = `aired:anilist:${a.idKey}`;
-            const kvState = await this.env.RSS_BOT_KV.get(kvKey);
-            if (kvState) {
-                let skip = false;
-                if (kvState === String(a.episode)) skip = true;
-                if (!skip) {
-                    try {
-                        const parsed = JSON.parse(kvState);
-                        if (parsed && typeof parsed === 'object' && parsed.episode === a.episode) {
-                            const target = Array.isArray(parsed.targetChats) ? parsed.targetChats : [];
-                            const done = Array.isArray(parsed.done) ? parsed.done : [];
-                            if (target.length === 0 || done.length >= target.length) skip = true;
-                        }
-                    } catch {}
-                }
-                if (skip) {
-                    console.log(`[DO] skip ${a.idKey}:${a.episode} (in KV)`);
-                    continue;
-                }
-            }
-
-            const newMax = a.batch && a.batch.max != null ? a.batch.max : a.episode;
-
-            const pending = pendingByAnime.get(a.idKey);
-            if (pending) {
-                const oldMax = pending.state.batch && pending.state.batch.max != null
-                    ? pending.state.batch.max
-                    : pending.state.episode;
-                if (newMax > oldMax) {
-                    const mergedState = {
-                        ...pending.state,
-                        episode: newMax,
-                        batch: a.batch || {
-                            count: newMax - Math.min(oldMax + 1, newMax) + 1,
-                            min: pending.state.batch ? pending.state.batch.min : Math.min(oldMax, a.episode),
-                            max: newMax,
-                        },
-                    };
-                    await this.state.storage.put(pending.key, mergedState);
-                    pendingByAnime.set(a.idKey, { key: pending.key, state: mergedState });
-                    merged++;
-                    console.log(`[DO] merged ${a.idKey} batch → max=${newMax} (was ${oldMax})`);
-                } else {
-                    console.log(`[DO] skip ${a.idKey} (already pending, max=${oldMax} >= ${newMax})`);
-                }
-                continue;
-            }
-
-            const key = `broadcast:${a.idKey}:${a.episode}`;
-            const existingByKey = await this.state.storage.get(key);
-            if (existingByKey) continue;
-
-            const newState = {
-                idKey: a.idKey, episode: a.episode, title: a.title, url: a.url,
-                totalEps: a.totalEps, batch: a.batch, animeKey: a.animeKey,
-                targetChats: chats, done: [],
-                attempts: 0, status: 'pending', createdAt: Date.now(),
-            };
-            await this.state.storage.put(key, newState);
-            pendingByAnime.set(a.idKey, { key, state: newState });
-            enqueued++;
-            console.log(`[DO] enqueued ${key} for ${chats.length}`);
-        }
-
-        const anyIncomplete = [...pendingByAnime.values()].some(
-            ({ state }) => state.batch && state.totalEps && state.batch.count < state.totalEps
+      if (arg === 'run' || arg === 'now' || arg === 'test') {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⏳ Running RSS cron now…',
+          threadId ?? undefined
         );
 
-        if (enqueued > 0 || merged > 0) {
-            const delay = anyIncomplete ? DO_BATCH_GRACE_MS : 100;
-            await this.state.storage.setAlarm(Date.now() + delay);
-            console.log(`[DO] alarm set +${delay}ms (enqueued=${enqueued} merged=${merged} incomplete=${anyIncomplete})`);
-        } else {
-            await this.ensureAlarm();
-        }
+        const events = [];
+        const summary = await handleRssCron(env, events);
+        const pixelSummary = await handlePixelRssCron(env, events);
+        await logEvents(env, events);
 
-        return jsonResponse({ ok: true, enqueued, merged, chats: chats.length });
-    }
-
-    async ensureAlarm() {
-        try {
-            const alarm = await this.state.storage.getAlarm();
-            if (alarm) return;
-
-            const entries = await this.state.storage.list({ prefix: 'broadcast:' });
-            for (const [, state] of entries) {
-                if (state.status === 'pending') {
-                    console.log('[DO] ensureAlarm: pending + no alarm → scheduling');
-                    await this.state.storage.setAlarm(Date.now() + 100);
-                    return;
-                }
-            }
-        } catch (e) {
-            console.warn(`[DO] ensureAlarm error: ${e.message}`);
-        }
-    }
-
-    async handleFlushNow() {
-        const errors = [];
-        let before = 0;
-        try {
-            const e = await this.state.storage.list({ prefix: 'broadcast:' });
-            for (const [, s] of e) if (s.status === 'pending') before++;
-        } catch (err) {
-            errors.push(`list before: ${err.message}`);
-        }
-
-        let result = { anyPending: false, maxAttempts: 0, failures: [] };
-        try {
-            result = await this.processPending();
-        } catch (err) {
-            errors.push(`processPending: ${err.message}`);
-        }
-
-        let after = 0;
-        try {
-            const e = await this.state.storage.list({ prefix: 'broadcast:' });
-            for (const [, s] of e) if (s.status === 'pending') after++;
-        } catch (err) {
-            errors.push(`list after: ${err.message}`);
-        }
-
-        if (after > 0) {
-            try { await this.state.storage.setAlarm(Date.now() + 5000); } catch {}
-        }
-
-        return jsonResponse({
-            ok: true,
-            before, after,
-            anyPending: result.anyPending,
-            maxAttempts: result.maxAttempts,
-            failures: (result.failures || []).slice(0, 20),
-            errors,
+        await saveCronStatus(env, {
+          at: new Date().toISOString(),
+          cron: 'manual',
+          status: 'done',
+          rss: summary,
+          pixel: pixelSummary,
         });
-    }
 
-    async handleSelfCheck(body) {
-        const chatId = body && body.chatId;
-        if (!chatId) return jsonResponse({ error: 'chatId required' }, 400);
-
-        const checks = {
-            hasBOT_TOKEN: !!this.env.BOT_TOKEN,
-            botTokenLen: this.env.BOT_TOKEN ? String(this.env.BOT_TOKEN).length : 0,
-            botTokenPrefix: this.env.BOT_TOKEN ? String(this.env.BOT_TOKEN).slice(0, 6) + '…' : null,
-            hasKV: !!this.env.RSS_BOT_KV,
-            hasBroadcaster: !!this.env.BROADCASTER,
-            hasEncKey: !!this.env.DB_ENCRYPTION_KEY,
-        };
-
-        try {
-            const res = await fetch(`${TELEGRAM_API}${this.env.BOT_TOKEN}/getMe`);
-            const json = await res.json();
-            checks.getMe = { status: res.status, ok: json.ok, username: json.result && json.result.username, error: json.description };
-        } catch (e) { checks.getMe = { exception: e.message }; }
-
-        try {
-            const res = await fetch(`${TELEGRAM_API}${this.env.BOT_TOKEN}/sendMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, text: 'selfcheck: plain sendMessage from DO' }),
-            });
-            const json = await res.json();
-            checks.plainSend = { status: res.status, ok: json.ok, error: json.description };
-        } catch (e) { checks.plainSend = { exception: e.message }; }
-
-        try {
-            const res = await fetch(`${TELEGRAM_API}${this.env.BOT_TOKEN}/sendRichMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, rich_message: { html: '<p>selfcheck rich</p>' } }),
-            });
-            const json = await res.json();
-            checks.richSend = { status: res.status, ok: json.ok, error: json.description };
-        } catch (e) { checks.richSend = { exception: e.message }; }
-
-        return jsonResponse({ ok: true, checks });
-    }
-
-    async handleStatus(full = false) {
-        const items = [];
-        const entries = await this.state.storage.list({ prefix: 'broadcast:' });
-        const now = Date.now();
-        for (const [key, state] of entries) {
-            if (full) {
-                items.push({ key, ...state });
-            } else {
-                items.push({
-                    key,
-                    status: state.status,
-                    episode: state.episode,
-                    title: state.title,
-                    batch: state.batch || null,
-                    done: Array.isArray(state.done) ? state.done.length : 0,
-                    total: Array.isArray(state.targetChats) ? state.targetChats.length : 0,
-                    attempts: state.attempts || 0,
-                    createdAt: state.createdAt || null,
-                    completedAt: state.completedAt || null,
-                    deadReason: state.deadReason || null,
-                    ageSec: state.createdAt ? Math.round((now - state.createdAt) / 1000) : null,
-                });
-            }
-        }
-        const alarm = await this.state.storage.getAlarm();
-        return jsonResponse({ items, alarm });
-    }
-
-    async handlePurge() {
-        let deleted = 0;
-        const entries = await this.state.storage.list({ prefix: 'broadcast:' });
-        const keys = Array.from(entries.keys());
-        for (const k of keys) {
-            await this.state.storage.delete(k);
-            deleted++;
-        }
-        await this.state.storage.deleteAlarm();
-        console.log(`[DO] purge: ${deleted} items, alarm cleared`);
-        return jsonResponse({ ok: true, deleted });
-    }
-
-    async handleTest(body) {
-        const chatId = body && body.chatId;
-        if (!chatId) return jsonResponse({ error: 'chatId required' }, 400);
-
-        const key = `broadcast:test:${chatId}:${Date.now()}`;
-        await this.state.storage.put(key, {
-            idKey: `test:${chatId}`,
-            episode: body.episode || 1,
-            title: body.title || 'Debug Test Anime',
-            url: body.url || 'https://anilist.co/anime/1',
-            totalEps: body.totalEps || 12,
-            batch: null,
-            animeKey: null,
-            targetChats: [chatId],
-            done: [],
-            attempts: 0,
-            status: 'pending',
-            createdAt: Date.now(),
-        });
-        await this.state.storage.setAlarm(Date.now() + 100);
-        console.log(`[DO] test enqueue ${key}, alarm +100ms`);
-        return jsonResponse({ ok: true, key });
-    }
-
-    async cleanupOld() {
-        const threshold = Date.now() - DO_DONE_CLEANUP_MS;
-        let deleted = 0;
-        const entries = await this.state.storage.list({ prefix: 'broadcast:' });
-        for (const [key, state] of entries) {
-            if (state.status === 'done' && state.completedAt && state.completedAt < threshold) {
-                await this.state.storage.delete(key);
-                deleted++;
-            }
-        }
-        return deleted;
-    }
-
-    async processPending() {
-        const deadline = Date.now() + DO_TIME_BUDGET_MS;
-        const pending = [];
-
-        const entries = await this.state.storage.list({ prefix: 'broadcast:' });
-        for (const [key, state] of entries) {
-            if (state.status !== 'pending') continue;
-            pending.push({ key, state });
-        }
-
-        if (pending.length === 0) {
-            return { anyPending: false, maxAttempts: 0, failures: [] };
-        }
-
-        try {
-            const week = await fetchScheduleWeek(this.env);
-            const flatWeek = [];
-            for (const d of Object.keys(week)) flatWeek.push(...week[d]);
-
-            for (const { key, state } of pending) {
-                if (!state.idKey || state.status !== 'pending') continue;
-                const sameAnime = flatWeek.filter((e) => animeGroupKey(e) === state.idKey);
-                if (sameAnime.length <= 1) continue;
-
-                const epNums = sameAnime.map((e) => e.episode).filter(Number.isFinite);
-                if (epNums.length <= 1) continue;
-
-                const maxEp = Math.max(...epNums);
-                const minEp = Math.min(...epNums);
-                const existingMax = state.batch && state.batch.max != null
-                    ? state.batch.max
-                    : state.episode;
-
-                if (maxEp > existingMax) {
-                    console.log(`[DO] refresh ${key} batch ${existingMax} → ${minEp}-${maxEp}`);
-                    state.batch = { count: epNums.length, min: minEp, max: maxEp };
-                    state.episode = maxEp;
-                    await this.state.storage.put(key, state);
-                }
-            }
-        } catch (e) {
-            console.warn(`[DO] batch refresh failed: ${e.message}`);
-        }
-
-        pending.sort((a, b) => (b.state.createdAt || 0) - (a.state.createdAt || 0));
-
-        console.log(`[DO] processPending: ${pending.length} items`);
-
-        let anyPending = false;
-        let maxAttempts = 0;
-        const failures = [];
-
-        for (const { key, state } of pending) {
-            if (Date.now() > deadline) {
-                anyPending = true;
-                break;
-            }
-
-            const age = Date.now() - (state.createdAt || 0);
-            const tries = state.attempts || 0;
-            if (age > DO_STALE_ITEM_MS || tries >= DO_MAX_ITEM_ATTEMPTS) {
-                state.status = 'done';
-                state.completedAt = Date.now();
-                state.deadReason = age > DO_STALE_ITEM_MS ? 'stale' : 'max-attempts';
-                await this.state.storage.put(key, state);
-                console.warn(`[DO] ${key} retired (age=${Math.round(age/60000)}min attempts=${tries} reason=${state.deadReason})`);
-                continue;
-            }
-
-            const doneSet = new Set(state.done || []);
-            const targetChats = Array.isArray(state.targetChats) ? state.targetChats : [];
-            const remaining = targetChats.filter((c) => !doneSet.has(c));
-
-            if (remaining.length === 0) {
-                state.status = 'done';
-                state.completedAt = Date.now();
-                state.done = Array.from(doneSet);
-                await this.state.storage.put(key, state);
-                console.log(`[DO] ${key} complete`);
-                continue;
-            }
-
-            console.log(`[DO] ${key} → ${remaining.length}/${targetChats.length}`);
-
-            for (const chatId of remaining) {
-                if (Date.now() > deadline) {
-                    anyPending = true;
-                    break;
-                }
-
-                try {
-                    const lang = await getLang(this.env, chatId);
-                    const res = await this.sendAiring(chatId, state, lang);
-
-                    if (res && res.ok) {
-                        doneSet.add(chatId);
-                        console.log(`[DO] ${key} chat=${chatId} ✅`);
-                        if (state.animeKey) {
-                            const tagList = await getTagList(this.env, chatId, state.animeKey);
-                            if (tagList.length > 0) {
-                                await sendMessage(this.env, chatId, formatTagList(tagList, lang));
-                                await sleep(BROADCAST_GAP_MS);
-                            }
-                        }
-                    } else if (res && (res.error_code === 400 || res.error_code === 403)) {
-                        await removeChatFromBroadcast(this.env, chatId);
-                        doneSet.add(chatId);
-                        const errMsg = `http${res.error_code}: ${res.description || ''}`;
-                        failures.push({ key, chatId, error: errMsg });
-                        console.warn(`[DO] ${key} chat=${chatId} 🚫 ${errMsg}`);
-                    } else if (res && isPermanentSendError(res.description)) {
-                        await removeChatFromBroadcast(this.env, chatId);
-                        doneSet.add(chatId);
-                        const errMsg = 'permanent: ' + (res.description || '');
-                        failures.push({ key, chatId, error: errMsg });
-                        console.warn(`[DO] ${key} chat=${chatId} 🚫 ${errMsg}`);
-                    } else {
-                        anyPending = true;
-                        const errMsg = (res && res.description) || JSON.stringify(res || {}).slice(0, 150);
-                        failures.push({ key, chatId, error: errMsg });
-                        console.warn(`[DO] ${key} chat=${chatId} ⚠️ ${errMsg}`);
-                    }
-                } catch (e) {
-                    anyPending = true;
-                    failures.push({ key, chatId, error: 'exception: ' + e.message });
-                    console.warn(`[DO] ${key} chat=${chatId} ❌ ${e.message}`);
-                }
-
-                await sleep(BROADCAST_GAP_MS);
-            }
-
-            state.attempts = (state.attempts || 0) + 1;
-            maxAttempts = Math.max(maxAttempts, state.attempts);
-
-            const allDone = targetChats.every((c) => doneSet.has(c));
-            if (allDone) {
-                state.status = 'done';
-                state.completedAt = Date.now();
-            } else {
-                anyPending = true;
-            }
-
-            state.done = Array.from(doneSet);
-            await this.state.storage.put(key, state);
-        }
-
-        return { anyPending, maxAttempts, failures };
-    }
-
-    async sendAiring(chatId, state, lang) {
-        const epNum = state.episode;
-        let last = null;
-        for (let attempt = 1; attempt <= BROADCAST_MAX_RETRIES; attempt++) {
-            const res = await sendAiringMessage(
-                this.env, chatId, state.title, epNum, state.totalEps,
-                state.url, lang, '', state.batch || null
+        const lines = [];
+        lines.push('🧪 Manual RSS cron result');
+        lines.push('');
+        lines.push(`targets: ${summary.total}`);
+        lines.push(`sent: ${summary.sent}`);
+        lines.push(`failed: ${summary.failed}`);
+        if (summary.error) lines.push(`error: ${summary.error}`);
+        lines.push('');
+        for (const d of summary.details || []) {
+          lines.push(`· ${d.url}`);
+          if (!d.fetchOk) {
+            lines.push(`   ❌ fetch: ${d.reason}`);
+          } else {
+            const flag = d.seeded ? '🌱 seed' : '➡️';
+            lines.push(
+              `   ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
             );
-            if (res && res.ok) return res;
-            if (res && (res.error_code === 400 || res.error_code === 403)) return res;
-            if (res && isPermanentSendError(res.description)) return res;
-            last = res;
-            if (attempt < BROADCAST_MAX_RETRIES) {
-                const retryAfter = res && res.parameters && res.parameters.retry_after;
-                const waitMs = retryAfter ? (retryAfter + 1) * 1000 : 800 * attempt;
-                console.warn(`[DO] retry ${attempt}/${BROADCAST_MAX_RETRIES} chat=${chatId} in ${waitMs}ms — ${(res && res.description) || JSON.stringify(res || {}).slice(0, 150)}`);
-                await sleep(waitMs);
-            }
+            lines.push(`      newestGuid=${d.newestGuid || '—'}`);
+          }
         }
-        return last;
+
+        lines.push('');
+        lines.push('🧪 Pixel RSS result');
+        lines.push('');
+        lines.push(`targets: ${pixelSummary.total}`);
+        lines.push(`sent: ${pixelSummary.sent}`);
+        lines.push(`failed: ${pixelSummary.failed}`);
+        if (pixelSummary.error) lines.push(`error: ${pixelSummary.error}`);
+        lines.push('');
+        for (const d of pixelSummary.details || []) {
+          lines.push(`· [${d.type || '—'}] ${d.url}`);
+          if (!d.fetchOk) {
+            lines.push(`   ❌ fetch: ${d.reason}`);
+          } else {
+            const flag = d.seeded ? '🌱 seed' : '➡️';
+            lines.push(
+              `   ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+            );
+            lines.push(`      newestGuid=${d.newestGuid || '—'}`);
+          }
+        }
+
+        await sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          { html: linesToRichHtml(lines), is_rtl: false },
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const last = await readCronStatus(env);
+      const lines = [];
+      lines.push('🔍 Cron Debug');
+      lines.push('');
+
+      if (!last) {
+        lines.push('⚠️ No cron run recorded yet.');
+        lines.push('');
+        lines.push('Possible causes:');
+        lines.push('• The `[triggers]` block is missing from wrangler.toml');
+        lines.push('• The worker was never re-deployed after adding crons');
+        lines.push('• No cron has fired since the worker was deployed');
+        lines.push('');
+        lines.push('Try: `/crondebug run` to run the RSS cron manually.');
+      } else {
+        lines.push(`at: ${last.at}`);
+        if (last.startedAt) lines.push(`started: ${last.startedAt}`);
+        lines.push(`cron: ${last.cron || '—'}`);
+        lines.push(`status: ${last.status || '—'}`);
+        lines.push('');
+
+        if (last.rss) {
+          lines.push(`📡 RSS`);
+          lines.push(`  targets: ${last.rss.total ?? 0}`);
+          lines.push(`  sent: ${last.rss.sent ?? 0}`);
+          lines.push(`  failed: ${last.rss.failed ?? 0}`);
+          if (last.rss.error) lines.push(`  error: ${last.rss.error}`);
+          for (const d of last.rss.details || []) {
+            lines.push('');
+            lines.push(`  · ${d.url}`);
+            if (!d.fetchOk) {
+              lines.push(`     ❌ ${d.reason}`);
+            } else {
+              const flag = d.seeded ? '🌱 seed' : '➡️';
+              lines.push(
+                `     ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+              );
+              lines.push(`     newestGuid=${d.newestGuid || '—'}`);
+            }
+          }
+          lines.push('');
+        }
+
+        if (last.pixel) {
+          lines.push(`📡 Pixel RSS`);
+          lines.push(`  targets: ${last.pixel.total ?? 0}`);
+          lines.push(`  sent: ${last.pixel.sent ?? 0}`);
+          lines.push(`  failed: ${last.pixel.failed ?? 0}`);
+          if (last.pixel.error) lines.push(`  error: ${last.pixel.error}`);
+          for (const d of last.pixel.details || []) {
+            lines.push('');
+            lines.push(`  · [${d.type || '—'}] ${d.url}`);
+            if (!d.fetchOk) {
+              lines.push(`     ❌ ${d.reason}`);
+            } else {
+              const flag = d.seeded ? '🌱 seed' : '➡️';
+              lines.push(
+                `     ${flag} items=${d.itemsFound} new=${d.newFound} sent=${d.sent} tracked=${d.tracked}`
+              );
+              lines.push(`     newestGuid=${d.newestGuid || '—'}`);
+            }
+          }
+          lines.push('');
+        }
+
+        lines.push('Run `/crondebug run` to trigger the RSS cron manually.');
+      }
+
+      await sendRichMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        { html: linesToRichHtml(lines), is_rtl: false },
+        threadId ?? undefined
+      );
+      return;
     }
-}
 
-// ============= WORKER ENTRY POINT =============
+    case '/id': {
+      const lines = [];
+      lines.push(`${RLM}🆔 شناسه‌ها`);
+      lines.push('');
+      lines.push(`${RLM}Chat ID: <code>${msg.chat.id}</code>`);
+      lines.push(`${RLM}Chat type: <code>${msg.chat.type}</code>`);
 
-const TAG_KEYWORDS = new Set(['tag', 'تگ', 'تگ کن', 'tag me']);
-const UNTAG_KEYWORDS = new Set(['remove tag', 'untag', 'حذف تگ', 'حذف تگ کن', 'تگ حذف']);
+      if (msg.chat.title) {
+        lines.push(`${RLM}Title: <code>${htmlEsc(msg.chat.title)}</code>`);
+      }
+      if (msg.chat.username) {
+        lines.push(
+          `${RLM}Username: <code>@${htmlEsc(msg.chat.username)}</code>`
+        );
+      }
 
-function normalizeReplyText(text) {
-    return String(text || '').trim().toLowerCase().replace(/\s+/g, ' ');
-}
+      if (msg.chat.type === 'supergroup' || msg.chat.type === 'channel') {
+        lines.push(
+          `${RLM}Chat (full): <code>${String(msg.chat.id).replace(
+            /^-100/,
+            ''
+          )}</code>  ← بدون -100`
+        );
+      }
 
-function isTagReply(msg) {
-    const raw = String(msg.text || '').trim();
-    const lower = raw.toLowerCase();
-    if (TAG_KEYWORDS.has(lower)) return true;
-    if (TAG_KEYWORDS.has(raw)) return true;
-    if (/^(tag|تگ)(\s|$)/i.test(lower)) return true;
-    return false;
-}
+      lines.push('');
+      lines.push(`${RLM}🧵 Topic / Thread`);
+      if (threadId) {
+        lines.push(`${RLM}Thread ID: <code>${threadId}</code>`);
+      } else {
+        lines.push(`${RLM}Thread ID: — (بدون تاپیک)`);
+      }
 
-function isUntagReply(msg) {
-    const t = normalizeReplyText(msg.text);
-    return UNTAG_KEYWORDS.has(t) || UNTAG_KEYWORDS.has(String(msg.text || '').trim());
-}
+      if (msg.from) {
+        lines.push('');
+        lines.push(`${RLM}👤 Sender`);
+        lines.push(`${RLM}User ID: <code>${msg.from.id}</code>`);
+        if (msg.from.username) {
+          lines.push(
+            `${RLM}Username: <code>@${htmlEsc(msg.from.username)}</code>`
+          );
+        }
+        const name = [msg.from.first_name, msg.from.last_name]
+          .filter(Boolean)
+          .join(' ');
+        if (name) {
+          lines.push(`${RLM}Name: <code>${htmlEsc(name)}</code>`);
+        }
+      }
 
-async function enqueueToBroadcaster(env, airings) {
-    try {
-        const id = env.BROADCASTER.idFromName('global');
-        const stub = env.BROADCASTER.get(id);
-        const res = await stub.fetch('https://broadcaster/enqueue', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ airings: airings || [] }),
+      if (msg.is_topic_message) {
+        lines.push('');
+        lines.push(
+          `${RLM}ℹ️ این پیام داخل یک تاپیک ارسال شده.`
+        );
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        lines.join('\n'),
+        threadId ?? undefined,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
+      );
+
+      await logEvent(env, {
+        ev: 'id_cmd',
+        chatId: msg.chat.id,
+        threadId,
+      });
+      return;
+    }
+
+    case '/rss': {
+      const url = msg.text.replace(/^\/rss(@\w+)?\s*/i, '').trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rss <url>`\n\n' +
+            'نام فید از تایتل خود RSS گرفته میشه.\n' +
+            'برای حذف: `/rssunsub <url>`\n' +
+            'برای حذف گروهی بر اساس دامنه: `/rssunsubdomain <domain>`\n' +
+            'برای تنظیمات نمایش تیتر: `/rsssettings <url>` یا `/rsssettings all`\n' +
+            'برای خروجی OPML: `/rssexport`\n' +
+            'برای ورودی OPML: روی فایل `.opml` ریپلای کن و `/rssimport` بزن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const title = r.data.title || 'RSS Feed';
+      const initialGuids = r.data.items
+        .map((i) => rssItemId(i))
+        .filter(Boolean);
+
+      const targets = await readRssTargets(env);
+      const existing = targets.find(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+
+      if (existing) {
+        existing.title = title;
+        existing.sentGuids = initialGuids;
+        existing.seededAt = Date.now();
+        if ('lastGuid' in existing) delete existing.lastGuid;
+        await writeRssTargets(env, targets);
+        await logEvent(env, {
+          ev: 'rss_sub_update',
+          url: url.slice(0, 80),
+          title: title.slice(0, 80),
         });
-        if (!res.ok) {
-            console.warn(`[SCHEDULED] DO enqueue HTTP ${res.status}`);
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `${RLM}♻️ اشتراک «${title}» به‌روزرسانی شد.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      targets.push({
+        chatId: msg.chat.id,
+        threadId,
+        url,
+        title,
+        sentGuids: initialGuids,
+        seededAt: Date.now(),
+        hideTitle: false,
+      });
+      await writeRssTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_sub',
+        url: url.slice(0, 80),
+        title: title.slice(0, 80),
+        total: targets.length,
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `${RLM}✅ اشتراک «${title}» فعال شد. از این به بعد هر وقت آیتم جدیدی در این فید بیاد، در این ${where} ارسال میشه.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rssunsub': {
+      const url = msg.text.replace(/^\/rssunsub(@\w+)?\s*/i, '').trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ `/rssunsub <url>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const targets = await readRssTargets(env);
+      const idx = targets.findIndex(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+      if (idx === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ اشتراکی با این URL در اینجا پیدا نشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const removed = targets.splice(idx, 1)[0];
+      await writeRssTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_unsub',
+        url: removed.url.slice(0, 80),
+        title: (removed.title || '').slice(0, 80),
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ اشتراک «${removed.title || removed.url}» حذف شد.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rssunsubdomain': {
+      const rawArg = msg.text
+        .replace(/^\/rssunsubdomain(@\w+)?\s*/i, '')
+        .trim();
+
+      if (!rawArg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n`/rssunsubdomain <domain>`\n\n' +
+            'مثال: `/rssunsubdomain shitter.thepixora.com`\n' +
+            'همه اشتراک‌های این ' + where + ' که دامنه‌شون برابر یا زیرمجموعه این دامنه باشه حذف میشن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const domain = normalizeDomainArg(rawArg);
+      if (!domain || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ دامنه معتبر نیست: \`${rawArg}\``,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const targets = await readRssTargets(env);
+      const kept = [];
+      const removed = [];
+      for (const t of targets) {
+        const isMine =
+          t.chatId === msg.chat.id && (t.threadId ?? null) === threadId;
+        if (isMine && urlMatchesDomain(t.url, domain)) {
+          removed.push(t);
         } else {
-            const data = await res.json().catch(() => ({}));
-            console.log(`[SCHEDULED] DO enqueued=${data.enqueued ?? '?'} merged=${data.merged ?? 0} (reason: ${data.reason || 'ok'})`);
+          kept.push(t);
         }
-    } catch (e) {
-        console.error(`[SCHEDULED] DO enqueue exception: ${e.message}`);
-    }
-}
+      }
 
-async function scheduledTick(env) {
-    console.log(`[CRON] scheduledTick at ${new Date().toISOString()}`);
-    const week = await fetchScheduleWeek(env);
-    const total = Object.values(week).reduce((s, l) => s + l.length, 0);
-    if (total === 0) {
-        console.log(`[CRON] empty week, still pinging DO to ensureAlarm`);
-        await enqueueToBroadcaster(env, []);
+      if (!removed.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `ℹ️ هیچ اشتراکی با دامنه «${domain}» در این ${where} پیدا نشد.`,
+          threadId ?? undefined
+        );
         return;
+      }
+
+      await writeRssTargets(env, kept);
+      await logEvent(env, {
+        ev: 'rss_unsub_domain',
+        domain,
+        count: removed.length,
+        chatId: msg.chat.id,
+        threadId,
+      });
+
+      const s = [];
+      s.push(`${RLM}✅ ${removed.length} اشتراک با دامنه «${domain}» حذف شد.`);
+      s.push('');
+      const preview = removed.slice(0, 10);
+      for (const r of preview) {
+        s.push(`${RLM}• ${r.title || r.url}`);
+      }
+      if (removed.length > preview.length) {
+        s.push(`${RLM}… و ${removed.length - preview.length} مورد دیگر`);
+      }
+
+      let text = s.join('\n');
+      if (text.length > 4000) text = text.slice(0, 3950) + '\n…';
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        text,
+        threadId ?? undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+      return;
     }
 
-    const nowUnix = Math.floor(Date.now() / 1000);
-    const windowStart = nowUnix - 25 * 60;
-    const windowEnd = nowUnix + 60;
+    case '/rsslist': {
+      const targets = await readRssTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
 
-    const candidates = [];
-    for (const d of Object.keys(week)) {
-        for (const e of week[d]) {
-            if (e.airingAt && e.airingAt >= windowStart && e.airingAt <= windowEnd) candidates.push(e);
-        }
-    }
-    console.log(`[CRON] week=${total}, window=${candidates.length}`);
-
-    if (candidates.length === 0) {
-        await enqueueToBroadcaster(env, []);
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `📭 هیچ RSS ای در این ${where} وجود نداره.\n` +
+            'برای اضافه کردن: `/rss <url>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
         return;
+      }
+
+      const s = [];
+      s.push(`${RLM}📡 RSS در این ${where} (${mine.length})`);
+      s.push('');
+
+      mine.forEach((t, i) => {
+        const titleState = t.hideTitle ? '🔕' : '🔔';
+        s.push(`${RLM}${i + 1}. ${titleState} «${t.title || 'RSS'}»`);
+        s.push(`${RLM}   ${t.url}`);
+      });
+
+      s.push('');
+      s.push(`${RLM}🔔 = تیتر آیتم‌ها نمایش داده میشه`);
+      s.push(`${RLM}🔕 = تیتر آیتم‌ها مخفی میشه`);
+      s.push(`${RLM}برای تغییر: /rsssettings <url> یا /rsssettings all`);
+      s.push(`${RLM}برای حذف: /rssunsub <url>`);
+      s.push(`${RLM}برای حذف گروهی: /rssunsubdomain <domain>`);
+
+      let text = s.join('\n');
+      if (text.length > 4000) {
+        text = text.slice(0, 3950) + '\n…';
+      }
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        text,
+        threadId ?? undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+
+      await logEvent(env, { ev: 'rss_list', count: mine.length });
+      return;
     }
 
-    const toSend = collapseBatches(candidates);
-    const airings = toSend.map((e) => {
-        const epNum = e.batchEpisodes && e.batchEpisodes.max != null ? e.batchEpisodes.max : e.episode;
-        return {
-            idKey: String(e.anilist_id || e.mal_id || e.title),
-            episode: epNum,
-            title: e.title,
-            url: e.url || null,
-            totalEps: e.episodes || null,
-            batch: e.batchEpisodes || null,
-            animeKey: animeKeyFromEntry(e),
-        };
-    });
+    case '/rsssettings': {
+      const arg = msg.text.replace(/^\/rsssettings(@\w+)?\s*/i, '').trim();
 
-    await enqueueToBroadcaster(env, airings);
-}
+      if (!arg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rsssettings all` — تنظیم همه فیدهای این ' + where + '\n' +
+            '`/rsssettings <url>` — تنظیم یک فید خاص\n\n' +
+            'با این تنظیم می‌تونی مشخص کنی تیتر خود آیتم‌ها (item title) توی پیام‌ها نمایش داده بشه یا نه.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
 
-export default {
-    async fetch(request, env, ctx) {
-        SUBREQUEST_COUNT = 0;
-        ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
-        globalThis.ENCRYPTION_KEY = ENCRYPTION_KEY;
+      const targets = await readRssTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
 
-        const reqUrl = new URL(request.url);
-        WORKER_ORIGIN = reqUrl.origin;
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `📭 هیچ RSS ای در این ${where} وجود نداره. اول با /rss اضافه کن.`,
+          threadId ?? undefined
+        );
+        return;
+      }
 
-        if (!env.BOT_TOKEN) return new Response('Bot token missing', { status: 500 });
-
-        await getWebAppLink(env);
-
-        if (request.method === 'GET') {
-            if (reqUrl.pathname === '/' || reqUrl.pathname === '/app') {
-                return handleScheduleApp(env);
-            }
-            if (reqUrl.pathname === '/api/schedule') {
-                return handleApiSchedule(env, request);
-            }
-            if (reqUrl.pathname === '/api/anime') {
-                return handleApiAnime(env, request);
-            }
-            return new Response('OK', { status: 200 });
+      let ref;
+      if (arg.toLowerCase() === 'all') {
+        ref = 'all';
+      } else {
+        if (!/^https?:\/\//i.test(arg)) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            '⚠️ URL باید با http یا https شروع بشه، یا کلمه `all`.',
+            threadId ?? undefined,
+            { parse_mode: 'Markdown' }
+          );
+          return;
         }
+        const match = mine.find((t) => t.url === arg);
+        if (!match) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            '⚠️ اشتراکی با این URL در اینجا پیدا نشد. از /rsslist استفاده کن.',
+            threadId ?? undefined
+          );
+          return;
+        }
+        ref = simpleHash(match.url);
+      }
 
-        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+      const settings = rssSettingsMessage(mine, ref);
+      if (!settings) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ خطا در ساخت تنظیمات. دوباره تلاش کن.',
+          threadId ?? undefined
+        );
+        return;
+      }
 
-        let update;
-        try { update = await request.json(); } catch { return new Response('Bad Request', { status: 400 }); }
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        settings.text,
+        threadId ?? undefined,
+        { reply_markup: rssSettingsKeyboard(settings) }
+      );
+
+      await logEvent(env, { ev: 'rss_settings_open', ref });
+      return;
+    }
+
+    case '/rsstest': {
+      const url = msg.text.replace(/^\/rsstest(@\w+)?\s*/i, '').trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ `/rsstest <url>`\n\n' +
+            'آخرین آیتم فید رو همین الان برای تست ارسال می‌کنه.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const first = r.data.items[0];
+      if (!first) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ این فید آیتمی نداره.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      try {
+        await sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          buildRssItemRichMessage(first, r.data.title, false),
+          threadId ?? undefined
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در ارسال: ${e.message}`,
+          threadId ?? undefined
+        );
+        return;
+      }
+      await logEvent(env, { ev: 'rss_test', url: url.slice(0, 80) });
+      return;
+    }
+
+    case '/rssexport': {
+      const targets = await readRssTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '📭 اشتراکی در این ' + where + ' وجود نداره.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const opml = buildOpml(mine);
+      try {
+        await sendDocument(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'subscriptions.opml',
+          opml,
+          'text/x-opml',
+          threadId ?? undefined
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ خطا در ارسال فایل OPML: ${e.message}`,
+          threadId ?? undefined
+        );
+        await reportError(env, 'rssexport', e);
+        return;
+      }
+      await logEvent(env, { ev: 'rss_export', count: mine.length });
+      return;
+    }
+
+    case '/rssimport': {
+      const reply = msg.reply_to_message;
+      if (!reply || !reply.document) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ روی یک فایل OPML ریپلای کن و `/rssimport` بزن.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      let opml;
+      try {
+        opml = await getFileText(env.BOT_TOKEN, reply.document.file_id);
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `❌ خطا در دریافت فایل: ${e.message}`,
+          threadId ?? undefined
+        );
+        await reportError(env, 'rssimport_fetch', e);
+        return;
+      }
+
+      const feeds = parseOpml(opml);
+      if (!feeds.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ هیچ فید معتبری در OPML پیدا نشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const capped = feeds.slice(0, 50);
+
+      const targets = await readRssTargets(env);
+      let added = 0;
+      let updated = 0;
+      let failed = 0;
+
+      for (const feed of capped) {
+        const r = await fetchRssOnce(feed.url);
+        if (!r.ok) {
+          failed++;
+          continue;
+        }
+        const title = r.data.title || feed.title || feed.url;
+        const initialGuids = r.data.items
+          .map((i) => rssItemId(i))
+          .filter(Boolean);
+
+        const existing = targets.find(
+          (t) =>
+            t.chatId === msg.chat.id &&
+            (t.threadId ?? null) === threadId &&
+            t.url === feed.url
+        );
+        if (existing) {
+          existing.title = title;
+          existing.sentGuids = initialGuids;
+          existing.seededAt = Date.now();
+          if ('lastGuid' in existing) delete existing.lastGuid;
+          updated++;
+        } else {
+          targets.push({
+            chatId: msg.chat.id,
+            threadId,
+            url: feed.url,
+            title,
+            sentGuids: initialGuids,
+            seededAt: Date.now(),
+            hideTitle: false,
+          });
+          added++;
+        }
+      }
+
+      await writeRssTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_import',
+        added,
+        updated,
+        failed,
+        total: capped.length,
+      });
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `${RLM}📥 ایمپورت انجام شد.\n` +
+          `${RLM}✅ ${added} اشتراک جدید، ♻️ ${updated} به‌روزرسانی، ❌ ${failed} ناموفق` +
+          (feeds.length > capped.length
+            ? `\n${RLM}(فقط ${capped.length} فید اول پردازش شد)`
+            : ''),
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rsspixel': {
+      const arg = msg.text.replace(/^\/rsspixel(@\w+)?\s*/i, '').trim();
+      if (!arg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rsspixel <url> <type>`\n\n' +
+            'مثال:\n' +
+            '`/rsspixel https://example.com/feed انیمه`\n\n' +
+            'هر آیتم جدید با این قالب ارسال میشه:\n' +
+            '🟦<b>تریلر جدید &lt;type&gt; &lt;title&gt; منتشر شد</b>\n\n' +
+            '🔹PixelMedia\n' +
+            'به‌همراه یک پیام جداگانه با تصویر و لینک آیتم.',
+          threadId ?? undefined,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      const sp = arg.indexOf(' ');
+      if (sp === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ باید هم URL و هم type بدی. مثال:\n' +
+            '`/rsspixel https://example.com/feed انیمه`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const url = arg.slice(0, sp).trim();
+      const type = arg.slice(sp + 1).trim();
+
+      if (!url || !/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      if (!type) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ type نمی‌تونه خالی باشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const feedTitle = r.data.title || 'RSS Feed';
+      const initialGuids = r.data.items
+        .map((i) => rssItemId(i))
+        .filter(Boolean);
+
+      const targets = await readPixelTargets(env);
+      const existing = targets.find(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+
+      if (existing) {
+        existing.type = type;
+        existing.title = feedTitle;
+        await writePixelTargets(env, targets);
+        await logEvent(env, {
+          ev: 'rss_pixel_sub_update',
+          url: url.slice(0, 80),
+          type: type.slice(0, 40),
+        });
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `${RLM}♻️ اشتراک PixelMedia برای «${feedTitle}» با type «${type}» به‌روزرسانی شد.`,
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      targets.push({
+        chatId: msg.chat.id,
+        threadId,
+        url,
+        title: feedTitle,
+        type,
+        sentGuids: initialGuids,
+        seededAt: Date.now(),
+      });
+      await writePixelTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_pixel_sub',
+        url: url.slice(0, 80),
+        type: type.slice(0, 40),
+        total: targets.length,
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `${RLM}✅ اشتراک PixelMedia فعال شد.\n` +
+          `${RLM}فید: «${feedTitle}»\n` +
+          `${RLM}type: «${type}»\n\n` +
+          `${RLM}از این به بعد هر آیتم جدید در این ${where} با قالب PixelMedia ارسال میشه.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rsspixelunsub': {
+      const url = msg.text
+        .replace(/^\/rsspixelunsub(@\w+)?\s*/i, '')
+        .trim();
+      if (!url) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ `/rsspixelunsub <url>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      const targets = await readPixelTargets(env);
+      const idx = targets.findIndex(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId &&
+          t.url === url
+      );
+      if (idx === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ اشتراک PixelMedia با این URL پیدا نشد.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      const removed = targets.splice(idx, 1)[0];
+      await writePixelTargets(env, targets);
+      await logEvent(env, {
+        ev: 'rss_pixel_unsub',
+        url: removed.url.slice(0, 80),
+      });
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `✅ اشتراک PixelMedia «${removed.title || removed.url}» حذف شد.`,
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/rsspixellist': {
+      const targets = await readPixelTargets(env);
+      const mine = targets.filter(
+        (t) =>
+          t.chatId === msg.chat.id &&
+          (t.threadId ?? null) === threadId
+      );
+
+      if (!mine.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `📭 هیچ اشتراک PixelMedia در این ${where} وجود نداره.\n` +
+            'برای اضافه کردن: `/rsspixel <url> <type>`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const s = [];
+      s.push(`${RLM}📡 PixelMedia در این ${where} (${mine.length})`);
+      s.push('');
+      mine.forEach((t, i) => {
+        s.push(`${RLM}${i + 1}. [${t.type || '—'}] «${t.title || 'RSS'}»`);
+        s.push(`${RLM}   ${t.url}`);
+      });
+      s.push('');
+      s.push(`${RLM}برای حذف: /rsspixelunsub <url>`);
+
+      let text = s.join('\n');
+      if (text.length > 4000) text = text.slice(0, 3950) + '\n…';
+
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        text,
+        threadId ?? undefined,
+        { link_preview_options: { is_disabled: true } }
+      );
+
+      await logEvent(env, { ev: 'rss_pixel_list', count: mine.length });
+      return;
+    }
+
+    case '/rsspixeltest': {
+      const arg = msg.text.replace(/^\/rsspixeltest(@\w+)?\s*/i, '').trim();
+      if (!arg) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          'ℹ️ استفاده:\n' +
+            '`/rsspixeltest <url> <type>`\n\n' +
+            'آخرین آیتم فید رو با قالب PixelMedia و پیام تصویر/لینک، همین الان برای تست ارسال می‌کنه.',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const sp = arg.indexOf(' ');
+      if (sp === -1) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ باید هم URL و هم type بدی. مثال:\n' +
+            '`/rsspixeltest https://example.com/feed انیمه`',
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const url = arg.slice(0, sp).trim();
+      const type = arg.slice(sp + 1).trim();
+
+      if (!url || !/^https?:\/\//i.test(url)) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ URL باید با http یا https شروع بشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      if (!type) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ type نمی‌تونه خالی باشه.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      const r = await fetchRssOnce(url);
+      if (!r.ok) {
+        const hint =
+          /youtube\.com|youtu\.be/i.test(url) && r.status === 404
+            ? '\n\n💡 چک کن که URL از نوع `channel_id=UC...` باشه، نه `@handle`.'
+            : '';
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در دریافت RSS: ${r.reason}${hint}`,
+          threadId ?? undefined,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const first = r.data.items[0];
+      if (!first) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '⚠️ این فید آیتمی نداره.',
+          threadId ?? undefined
+        );
+        return;
+      }
+
+      try {
+        await sendPixelPair(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          threadId ?? undefined,
+          type,
+          first,
+          r.data.title || ''
+        );
+      } catch (e) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          `⚠️ خطا در ارسال: ${e.message}`,
+          threadId ?? undefined
+        );
+        return;
+      }
+      await logEvent(env, {
+        ev: 'rss_pixel_test',
+        url: url.slice(0, 80),
+        type: type.slice(0, 40),
+      });
+      return;
+    }
+
+    case '/rsskvexport': {
+      await handleKvExport(env, msg, threadId);
+      return;
+    }
+
+    case '/rsskvimport': {
+      await handleKvImport(env, msg, threadId);
+      return;
+    }
+
+    case '/errors': {
+      if (msg.from?.id !== ownerId(env)) return;
+      const parts = msg.text.trim().split(/\s+/);
+      let n = 10;
+      if (parts[1]) {
+        const parsed = parseInt(parts[1], 10);
+        if (Number.isFinite(parsed) && parsed > 0 && parsed <= 20) n = parsed;
+      }
+      const raw = await env.BOT_KV.get(ERRORS_KEY, { cacheTtl: KV_CACHE_TTL });
+      let list = [];
+      if (raw) {
+        try {
+          list = decryptData(raw, env.DB_ENCRYPTION_KEY);
+          if (!Array.isArray(list)) list = [];
+        } catch { list = []; }
+      }
+      if (!list.length) {
+        await sendMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          '✅ هیچ خطایی ثبت نشده.',
+          threadId ?? undefined
+        );
+        return;
+      }
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        `📋 *${list.length} error(s) recorded. Showing last ${Math.min(n, list.length)}:*`,
+        threadId ?? undefined,
+        { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+      );
+      for (const e of list.slice(0, n)) {
+        const text =
+          `📍 *${e.where}*\n` +
+          `⏰ ${e.t}\n` +
+          `\n*Message:*\n\`${String(e.msg).replace(/`/g, '')}\`` +
+          (e.stack
+            ? `\n\n*Stack:*\n\`\`\`\n${e.stack.slice(0, 900)}\n\`\`\``
+            : '');
+        try {
+          await sendMessage(env.BOT_TOKEN, msg.chat.id, text, threadId ?? undefined, {
+            parse_mode: 'Markdown',
+            link_preview_options: { is_disabled: true },
+          });
+        } catch (err) {
+          await sendMessage(
+            env.BOT_TOKEN,
+            msg.chat.id,
+            `${e.where} — ${e.msg}\n${e.stack || ''}`,
+            threadId ?? undefined
+          );
+        }
+      }
+      return;
+    }
+
+    case '/clearerrors': {
+      if (msg.from?.id !== ownerId(env)) return;
+      await env.BOT_KV.delete(ERRORS_KEY);
+      await sendMessage(
+        env.BOT_TOKEN,
+        msg.chat.id,
+        '🗑 Error log cleared.',
+        threadId ?? undefined
+      );
+      return;
+    }
+
+    case '/debug': {
+      const send = (lines) =>
+        sendRichMessage(
+          env.BOT_TOKEN,
+          msg.chat.id,
+          { html: linesToRichHtml(lines), is_rtl: false },
+          threadId ?? undefined
+        );
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 1/3 — Basic');
+        s.push('');
+        s.push('📍 Chat');
+        s.push(`  type: ${msg.chat.type}`);
+        s.push(`  thread: ${threadId ?? '—'}`);
+        s.push('');
+        s.push('⚙️ Env');
+        s.push(`  BOT_TOKEN: ${env.BOT_TOKEN ? '✅' : '❌'}`);
+        s.push(`  DB_ENCRYPTION_KEY: ${env.DB_ENCRYPTION_KEY ? '✅' : '❌'}`);
+        s.push(`  BOT_KV: ${env.BOT_KV ? '✅' : '❌'}`);
+        s.push(`  OWNER_ID: ${ownerId(env)}`);
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 1/3 — Basic ⚠️ ${e.message}`]);
+      }
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 2/3 — Subscriptions');
+        s.push('');
 
         try {
-            if (update.message) {
-                const msg = update.message;
-                const chatId = msg.chat.id;
-                const text = msg.text || '';
-                const chatType = msg.chat.type;
-
-                // ── /ultimatecatchrecipe auto-responder ──
-                // Runs for every non-private message before other handlers.
-                if (chatType !== 'private') {
-                    try {
-                        const isSelf = msg.from && msg.from.id === CACHED_BOT_ID;
-                        if (!isSelf) {
-                            const mode = await env.RSS_BOT_KV.get(`${CATCH_MODE_PREFIX}${chatId}`);
-                            if (mode === 'on') {
-                                const sourceText = msg.text || msg.caption || '';
-                                if (hasCatchTrigger(sourceText)) {
-                                    await sendCatchMessage(env, chatId, msg);
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        console.warn(`[CATCH] auto-responder error: ${e.message}`);
-                    }
-                }
-
-                if (msg.reply_to_message && text.trim() === '/debugreply') {
-                    await handleDebugReply(env, msg);
-                    return new Response('OK', { status: 200 });
-                }
-
-                if (msg.reply_to_message && isProfanityReply(msg)) {
-                    const isAiring = await looksLikeAiringMessage(env, msg.reply_to_message);
-                    if (isAiring) {
-                        await handleProfanityReply(env, msg);
-                        return new Response('OK', { status: 200 });
-                    }
-                }
-
-                if (msg.reply_to_message && isUntagReply(msg)) {
-                    await handleUntagReply(env, msg);
-                    return new Response('OK', { status: 200 });
-                }
-
-                if (msg.reply_to_message && isTagReply(msg)) {
-                    await handleTagReply(env, msg);
-                    return new Response('OK', { status: 200 });
-                }
-
-                if (chatType === 'private') {
-                    if (text.startsWith('/do')) {
-                        if (!isAdmin(env, msg)) {
-                            await sendMessage(env, chatId, '❌ Admin only.');
-                            return new Response('OK', { status: 200 });
-                        }
-                        if (text.startsWith('/doself')) await handleDoSelf(env, chatId);
-                        else if (text.startsWith('/dodoctor')) await handleDoDoctor(env, chatId);
-                        else if (text.startsWith('/dodiag')) await handleDoDiag(env, chatId);
-                        else if (text.startsWith('/dostatus')) await handleDoStatus(env, chatId);
-                        else if (text.startsWith('/dodump')) await handleDoDump(env, chatId);
-                        else if (text.startsWith('/dotrigger')) await handleDoTrigger(env, chatId);
-                        else if (text.startsWith('/doflush')) await handleDoFlush(env, chatId);
-                        else if (text.startsWith('/donudge')) await handleDoNudge(env, chatId);
-                        else if (text.startsWith('/docleanup')) await handleDoCleanup(env, chatId);
-                        else if (text.startsWith('/dopurge')) await handleDoPurgeRequest(env, chatId);
-                        else if (text.startsWith('/dotest')) await handleDoTest(env, chatId);
-                        else if (text.startsWith('/dosingle')) await handleDoSingle(env, chatId);
-                        else await sendMessage(env, chatId, 'Unknown /do command.\nTry /doself, /dodoctor, /dodiag, /dostatus, /doflush, /donudge, /dotrigger, /dotest, /dosingle, /dopurge.');
-                        return new Response('OK', { status: 200 });
-                    }
-
-                    if (text.startsWith('/ultimatecatchrecipe')) {
-                        await handleUltimateCatchRecipe(env, msg);
-                        return new Response('OK', { status: 200 });
-                    }
-
-                    if (text.startsWith('/start')) await handleStart(env, chatId);
-                    else if (text.startsWith('/unsub')) await handleUnsub(env, chatId);
-                    else if (text.startsWith('/language')) await handleLanguage(env, chatId);
-                    else if (text.startsWith('/schedule')) await handleSchedule(env, chatId, chatType);
-                    else if (text.startsWith('/app')) await handleAppCommand(env, chatId, chatType);
-                    else if (text.startsWith('/debug')) await handleDebug(env, chatId);
-                } else {
-                    await addChatToBroadcast(env, chatId);
-
-                    if (text.startsWith('/ultimatecatchrecipe')) {
-                        await handleUltimateCatchRecipe(env, msg);
-                        return new Response('OK', { status: 200 });
-                    }
-
-                    if (text.startsWith('/unsub')) await handleUnsubInGroup(env, chatId);
-                    else if (text.startsWith('/language')) await handleLanguage(env, chatId);
-                    else if (text.startsWith('/schedule')) await handleSchedule(env, chatId, chatType);
-                    else if (text.startsWith('/app')) await handleAppCommand(env, chatId, chatType);
-                    else if (text.startsWith('/debug')) await handleDebug(env, chatId);
-                }
-            }
-
-            if (update.callback_query) await handleCallbackQuery(env, update.callback_query);
+          const rts = await readRssTargets(env);
+          s.push(`📡 RSS total (${rts.length})`);
+          rts.forEach((t, i) => {
+            const flag = t.hideTitle ? '🔕' : '🔔';
+            const tracked = Array.isArray(t.sentGuids)
+              ? t.sentGuids.length
+              : (t.lastGuid ? 1 : 0);
+            const seeded = t.seededAt ? '✅' : '❌';
+            s.push(`  ${i + 1}. ${flag} «${t.title || 'RSS'}»`);
+            s.push(`     chat=${t.chatId} thread=${t.threadId ?? '—'} tracked=${tracked} seeded=${seeded}`);
+            s.push(`     ${t.url}`);
+          });
+          s.push('');
         } catch (e) {
-            console.error('[ERROR] Update handling failed:', e);
+          s.push(`📡 RSS ⚠️ ${e.message}`);
+          s.push('');
         }
 
-        return new Response('OK', { status: 200 });
-    },
+        try {
+          const pts = await readPixelTargets(env);
+          s.push(`📡 Pixel total (${pts.length})`);
+          pts.forEach((t, i) => {
+            const tracked = Array.isArray(t.sentGuids)
+              ? t.sentGuids.length
+              : (t.lastGuid ? 1 : 0);
+            const seeded = t.seededAt ? '✅' : '❌';
+            s.push(`  ${i + 1}. [${t.type || '—'}] «${t.title || 'RSS'}»`);
+            s.push(`     chat=${t.chatId} thread=${t.threadId ?? '—'} tracked=${tracked} seeded=${seeded}`);
+            s.push(`     ${t.url}`);
+          });
+          s.push('');
+        } catch (e) {
+          s.push(`📡 Pixel ⚠️ ${e.message}`);
+          s.push('');
+        }
 
-    async scheduled(event, env, ctx) {
-        SUBREQUEST_COUNT = 0;
-        ENCRYPTION_KEY = env.DB_ENCRYPTION_KEY || 'default-key-please-change-me';
-        ctx.waitUntil(scheduledTick(env));
-    },
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 2/3 — Subscriptions ⚠️ ${e.message}`]);
+      }
+
+      try {
+        const s = [];
+        s.push('🔍 Debug 3/3 — Bot & Webhook');
+        s.push('');
+        s.push('🤖 Bot');
+        try {
+          const me = await telegram(env.BOT_TOKEN, 'getMe');
+          s.push(`  @${me.result.username}`);
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        s.push('');
+        s.push('🪝 Webhook');
+        try {
+          const info = await telegram(env.BOT_TOKEN, 'getWebhookInfo');
+          const r = info.result || {};
+          s.push(`  url: ${r.url ? '✅ set' : '❌'}`);
+          s.push(`  pending: ${r.pending_update_count ?? 0}`);
+          if (r.last_error_message) {
+            s.push(`  ⚠️ ${r.last_error_message}`);
+          } else {
+            s.push('  last_error: none ✅');
+          }
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        s.push('');
+        s.push('🚨 Errors');
+        try {
+          const rawErr = await env.BOT_KV.get(ERRORS_KEY, {
+            cacheTtl: KV_CACHE_TTL,
+          });
+          let errCount = 0;
+          if (rawErr) {
+            try {
+              const list = decryptData(rawErr, env.DB_ENCRYPTION_KEY);
+              errCount = Array.isArray(list) ? list.length : 0;
+            } catch { errCount = 0; }
+          }
+          s.push(`  recorded: ${errCount}`);
+          if (errCount > 0) s.push('  use /errors to view');
+        } catch (e) {
+          s.push(`  ⚠️ ${e.message}`);
+        }
+        await send(s);
+      } catch (e) {
+        await send([`🔍 Debug 3/3 — Bot & Webhook ⚠️ ${e.message}`]);
+      }
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//                         WORKER
+// ═══════════════════════════════════════════════════════════
+export default {
+  async fetch(request, env) {
+    try {
+      if (request.method === 'GET') {
+        return new Response('OK', { status: 200 });
+      }
+      if (request.method !== 'POST') {
+        return new Response('OK', { status: 200 });
+      }
+
+      let update;
+      try {
+        update = await request.json();
+      } catch {
+        return new Response('OK', { status: 200 });
+      }
+
+      const gateChatId =
+        update.callback_query?.message?.chat?.id ??
+        update.message?.chat?.id ??
+        update.channel_post?.chat?.id ??
+        update.edited_message?.chat?.id ??
+        update.edited_channel_post?.chat?.id ??
+        null;
+      if (!isAllowedChat(gateChatId)) {
+        console.log(`🚫 Ignored update from disallowed chat: ${gateChatId}`);
+        return new Response('OK', { status: 200 });
+      }
+
+      if (update.callback_query) {
+        const data = update.callback_query.data || '';
+        try {
+          if (data.startsWith('rss:')) {
+            await handleRssCallback(update, env);
+          } else {
+            await answerCallbackQuery(env.BOT_TOKEN, update.callback_query.id);
+          }
+        } catch (err) {
+          await reportError(env, 'fetch.callback', err, { data });
+        }
+        return new Response('OK', { status: 200 });
+      }
+
+      const msg = update.message || update.channel_post;
+      if (!msg) return new Response('OK', { status: 200 });
+
+      try {
+        await handleUpdate(update, env);
+      } catch (err) {
+        await reportError(env, 'handleUpdate', err, {
+          cmd: msg?.text ? parseCommand(msg.text) : null,
+        });
+        if (msg?.chat?.id) {
+          try {
+            await sendMessage(
+              env.BOT_TOKEN,
+              msg.chat.id,
+              `❌ خطای داخلی: ${err.message}`,
+              topicOf(msg)
+            );
+          } catch { /* ignore */ }
+        }
+      }
+      return new Response('OK', { status: 200 });
+    } catch (outer) {
+      await reportError(env, 'fetch.outer', outer);
+      return new Response('OK', { status: 200 });
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    console.log(`⏰ Cron fired: ${event.cron} at ${new Date().toISOString()}`);
+
+    if (!env.BOT_TOKEN || !env.DB_ENCRYPTION_KEY || !env.BOT_KV) {
+      console.error('Missing env bindings');
+      return;
+    }
+
+    try {
+      const fired = await env.BOT_KV.get(CRON_FIRED_FLAG_KEY);
+      if (!fired) {
+        await env.BOT_KV.put(CRON_FIRED_FLAG_KEY, '1');
+        await sendMessage(
+          env.BOT_TOKEN,
+          ownerId(env),
+          `✅ Cron is firing!\n\n` +
+            `first fire at: ${new Date().toISOString()}\n` +
+            `cron: \`${event.cron}\``,
+          undefined,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (e) {
+      console.error('first-fire notify failed:', e.message);
+    }
+
+    const startedAt = new Date().toISOString();
+
+    ctx.waitUntil((async () => {
+      const events = [];
+      let rssSummary = null;
+      let pixelSummary = null;
+      try {
+        rssSummary = await handleRssCron(env, events);
+      } catch (e) {
+        console.error('handleRssCron threw:', e);
+        rssSummary = { error: e.message, details: [], total: 0, sent: 0, failed: 0 };
+      }
+      try {
+        pixelSummary = await handlePixelRssCron(env, events);
+      } catch (e) {
+        console.error('handlePixelRssCron threw:', e);
+        pixelSummary = { error: e.message, details: [], total: 0, sent: 0, failed: 0 };
+      }
+
+      await logEvents(env, events);
+
+      await saveCronStatus(env, {
+        at: new Date().toISOString(),
+        startedAt,
+        cron: event.cron,
+        status: 'done',
+        rss: rssSummary,
+        pixel: pixelSummary,
+      });
+    })());
+  },
 };
+
+// ═══════════════════════════════════════════════════════════
+//                    LOW-LEVEL HELPERS
+// ═══════════════════════════════════════════════════════════
+function topicOf(msg) {
+  return msg.is_topic_message && msg.message_thread_id
+    ? msg.message_thread_id
+    : undefined;
+}
+
+async function sendMessage(token, chatId, text, threadId, extra = {}) {
+  const body = { chat_id: chatId, text, ...extra };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function sendRichMessage(token, chatId, richMessage, threadId, extra = {}) {
+  const body = { chat_id: chatId, rich_message: richMessage, ...extra };
+  if (threadId) body.message_thread_id = threadId;
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/sendRichMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendRichMessage ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function sendDocument(token, chatId, filename, content, mimeType, threadId, extra = {}) {
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (threadId) form.append('message_thread_id', String(threadId));
+  form.append(
+    'document',
+    new Blob([content], { type: mimeType || 'application/octet-stream' }),
+    filename
+  );
+  for (const [k, v] of Object.entries(extra)) {
+    form.append(k, typeof v === 'string' ? v : JSON.stringify(v));
+  }
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/sendDocument`,
+    { method: 'POST', body: form }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `sendDocument ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function getFileText(token, fileId) {
+  const infoRes = await fetch(
+    `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`
+  );
+  const info = await infoRes.json();
+  if (!info.ok) throw new Error(info.description || 'getFile failed');
+  const filePath = info.result.file_path;
+  const fileRes = await fetch(
+    `https://api.telegram.org/file/bot${token}/${filePath}`
+  );
+  if (!fileRes.ok) throw new Error(`file download HTTP ${fileRes.status}`);
+  return await fileRes.text();
+}
+
+async function editMessageText(token, chatId, messageId, text, extra = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/editMessageText`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        ...extra,
+      }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `editMessageText ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function answerCallbackQuery(token, callbackQueryId, extra = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/answerCallbackQuery`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, ...extra }),
+    }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(
+      `answerCallbackQuery ${res.status}: ${data.description || JSON.stringify(data)}`
+    );
+  }
+  return data;
+}
+
+async function telegram(token, method, params = {}) {
+  const res = await fetch(
+    `https://api.telegram.org/bot${token}/${method}`,
+    Object.keys(params).length
+      ? {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        }
+      : undefined
+  );
+  return res.json();
+    }
