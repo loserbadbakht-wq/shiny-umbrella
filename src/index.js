@@ -187,7 +187,7 @@ async function logMention(env, entry) {
       } catch { list = []; }
     }
     list.unshift({ t: new Date().toISOString(), ...entry });
-    list = list.slice(0, 20);
+    list = list.slice(0, 40);
     await env.BOT_KV.put(
       MENTION_LOG_KEY,
       encryptData(list, env.DB_ENCRYPTION_KEY)
@@ -1430,41 +1430,60 @@ async function handleMention(msg, env, botInfo) {
   return true;
 }
 
+// ============= REPLY-TO-BOT NOTIFIER =============
+// Fires whenever someone replies to ANY bot message in a group / channel /
+// topic. No sender filtering — owner, bots, and everyone else are included.
+// Private chats are excluded entirely: owner's DM reply routing is handled
+// separately by handleOwnerReply (via chat:map), and user DMs never trigger
+// notifications.
 async function handleTargetReply(msg, env) {
-  if (msg.chat.id === OWNER_ID) return false;
+  if (!msg) return false;
+  if (msg.chat.type === 'private') return false;
+
+  // Commands are handled by handleCommandNotify, not here.
   if (msg.text && msg.text.startsWith('/')) return false;
+
   const replyTo = msg.reply_to_message;
   if (!replyTo) return false;
   if (!replyTo.from?.is_bot) return false;
 
+  // Notifications should never fire for messages the bot itself posts.
+  // (Bots don't receive their own messages as updates anyway, but keep it
+  // defensive for the case where a proxy refeed sends them.)
+  try {
+    const botInfo = await getBotInfo(env);
+    if (botInfo && msg.from?.id === botInfo.id) return false;
+  } catch { /* ignore */ }
+
   const threadId = topicOf(msg) ?? null;
-  const target = await lookupChatTarget(
-    env,
-    msg.chat.id,
-    threadId,
-    replyTo.message_id
-  );
-  if (!target) return false;
-
-  const isMedia =
-    msg.photo || msg.video || msg.document || msg.audio ||
-    msg.voice || msg.sticker || msg.animation || msg.video_note;
-
   const chatLoc = threadId
     ? `${msg.chat.id}/${threadId}`
     : String(msg.chat.id);
   const senderLink = formatSenderLink(msg.from);
   const originalPreview = buildMessagePreview(replyTo);
 
+  const isMedia =
+    msg.photo || msg.video || msg.document || msg.audio ||
+    msg.voice || msg.sticker || msg.animation || msg.video_note;
+
+  const hasContent = !!msg.text || isMedia || !!msg.caption;
+  if (!hasContent) return false;
+
+  // The target message (what owner's reply will get attached to) is the
+  // bot message being replied to. No need for chat:target_index lookup —
+  // we accept ANY bot message.
+  const targetMsgId = replyTo.message_id;
+
   try {
     let ownerMsgId = null;
+    let headerId = null;
 
     if (msg.text) {
       const notification =
         `${senderLink}\n` +
         `📩 پاسخ در chat (${chatLoc})\n\n` +
         `↩️ در پاسخ به:\n${originalPreview}\n\n` +
-        `💬 پاسخ:\n${htmlEsc(msg.text)}\n\n` +
+        `💬 پاسخ:\n${htmlEsc(safeLimit(msg.text, 800))}\n\n` +
         `↩️ به همین پیام ریپلای کن تا جوابت به همون چت بره.`;
       const res = await sendMessage(
         env.BOT_TOKEN,
@@ -1477,7 +1496,7 @@ async function handleTargetReply(msg, env) {
         }
       );
       ownerMsgId = res.result?.message_id;
-    } else if (isMedia || !msg.text) {
+    } else {
       const headerRes = await sendMessage(
         env.BOT_TOKEN,
         OWNER_ID,
@@ -1491,7 +1510,7 @@ async function handleTargetReply(msg, env) {
           link_preview_options: { is_disabled: true },
         }
       );
-      const headerId = headerRes.result?.message_id;
+      headerId = headerRes.result?.message_id;
 
       const copyRes = await copyMessage(
         env.BOT_TOKEN,
@@ -1501,35 +1520,25 @@ async function handleTargetReply(msg, env) {
         undefined
       );
       ownerMsgId = copyRes.result?.message_id;
-
-      const mapping = {
-        targetChatId: msg.chat.id,
-        targetThreadId: threadId,
-        targetMsgId: msg.message_id,
-        sourceChatId: msg.chat.id,
-        sourceThreadId: threadId,
-        sourceMsgId: msg.message_id,
-        isBridgedReply: true,
-      };
-      if (headerId) await saveChatMapping(env, headerId, mapping);
     }
 
-    if (ownerMsgId) {
-      await saveChatMapping(env, ownerMsgId, {
-        targetChatId: msg.chat.id,
-        targetThreadId: threadId,
-        targetMsgId: msg.message_id,
-        sourceChatId: msg.chat.id,
-        sourceThreadId: threadId,
-        sourceMsgId: msg.message_id,
-        isBridgedReply: true,
-      });
-    }
+    const mapping = {
+      targetChatId: msg.chat.id,
+      targetThreadId: threadId,
+      targetMsgId,
+      sourceChatId: msg.chat.id,
+      sourceThreadId: threadId,
+      sourceMsgId: msg.message_id,
+      isBridgedReply: true,
+    };
+
+    if (headerId) await saveChatMapping(env, headerId, mapping);
+    if (ownerMsgId) await saveChatMapping(env, ownerMsgId, mapping);
 
     await logEvent(env, {
       ev: 'chat_target_reply',
       targetChat: msg.chat.id,
-      targetMsgId: msg.message_id,
+      targetMsgId,
       kind: msg.text ? 'text' : 'media',
     });
   } catch (e) {
@@ -1538,6 +1547,10 @@ async function handleTargetReply(msg, env) {
     });
   }
   return true;
+}
+
+function safeLimit(s, max) {
+  return safeSlice(s, max);
 }
 
 async function handleOwnerReaction(update, env) {
@@ -4073,6 +4086,35 @@ async function handleUpdate(update, env, origin) {
       return;
     }
 
+    case '/replytest': {
+      if (msg.from?.id !== OWNER_ID) return;
+      const target = msg.reply_to_message || msg;
+      const lines = ['🧪 *Reply test*', ''];
+      lines.push(`Chat: \`${target.chat.id}\` (${target.chat.type})`);
+      lines.push(`From: \`${target.from?.id ?? 'n/a'}\` (is_bot=${target.from?.is_bot ?? 'n/a'})`);
+      lines.push(`hasReply: ${!!target.reply_to_message}`);
+      if (target.reply_to_message) {
+        lines.push(`RepliedTo.is_bot: ${!!target.reply_to_message.from?.is_bot}`);
+        lines.push(`RepliedTo.id: \`${target.reply_to_message.message_id}\``);
+      }
+      lines.push('');
+      let result;
+      try {
+        result = await handleTargetReply(target, env);
+      } catch (e) {
+        result = 'THREW: ' + e.message;
+        await reportError(env, 'replytest.manual', e);
+      }
+      lines.push(`handleTargetReply: \`${result}\``);
+      lines.push('');
+      lines.push('Watch your DM. If a message arrived, sending works.');
+      await sendMessage(env.BOT_TOKEN, msg.chat.id, lines.join('\n'), threadId ?? undefined, {
+        parse_mode: 'Markdown',
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
+
     case '/mentionlog': {
       if (msg.from?.id !== OWNER_ID) return;
       const log = await readMentionLog(env);
@@ -5518,12 +5560,12 @@ async function handleUpdate(update, env, origin) {
       lines.push('  /json  /jsontest  /jsonend');
       lines.push('  /chat  (empty → register)  /chat <id|name> [<msg>]  /chat name <id|name> <name>  (owner)');
       lines.push('  /chat chat N <msg>  (JSON-target legacy)  /chatlist  /chatend <id|name>  (owner)');
-      lines.push('  reply + react (in target) → notif  ·  react on notif → mirrors');
+      lines.push('  replies to any bot message in groups → notif');
       lines.push('  /hourstart @username | /hourstart any text  /hourend [force]');
       lines.push('  /button /startgame /start /end /force-end /list /players /test /ping /debug');
       lines.push('  /roozshomar');
       lines.push('  /errors [N]  /clearerrors  (owner)');
-      lines.push('  /testreaction  /setwebhook  /dumpkv  /debugmention  /mentiontest  /mentionlog  /clearbotinfo  (owner)');
+      lines.push('  /testreaction  /setwebhook  /dumpkv  /debugmention  /mentiontest  /mentionlog  /replytest  /clearbotinfo  (owner)');
       lines.push('  /debugdollar  (owner)');
       lines.push('  /buttonlord @username <text>  (owner)');
       lines.push('  /editcounter <number>  (owner)');
@@ -5809,4 +5851,4 @@ async function telegram(token, method, params = {}) {
       : undefined
   );
   return res.json();
-}
+  }
