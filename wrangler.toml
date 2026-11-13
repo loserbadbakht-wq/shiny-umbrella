@@ -1,4 +1,4 @@
-name = "shiny-rss"
+name = "shiny-rss2"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 # ─── KV namespace for subscriptions, errors, telemetry ───
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "a2b3d9a5801e42d19338043f4eac583f"
+id = "47232f47d3044027b6ff45943435ba25"
 
 # ─── Cron: check every feed every 5 minutes ───
 [triggers]
