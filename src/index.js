@@ -2,9 +2,9 @@
  * Telegram bot — Mensch ärgere Dich nicht + Snakes & Ladders
  * Cloudflare Worker + Durable Objects
  *
- * Rich messages are built strictly from blocks. User mentions are embedded
- * as RichTextTextMention objects inside paragraph blocks, ensuring valid
- * delivery without falling back to HTML.
+ * Rich messages are built from structured blocks. User mentions are
+ * RichTextTextMention objects (with full User payloads) nested inside
+ * paragraph blocks. No HTML fallback is used.
  */
 
 import { Resvg, initWasm } from '@resvg/resvg-wasm';
@@ -479,16 +479,15 @@ function withPlayerWord(lang, escapedName) {
 /* ============================ RICH TEXT HELPERS ============================ */
 
 /**
- * Returns a RichTextTextMention object with the full User payload.
- * This is a RichText type, NOT a block. It must be placed inside the
- * text array of a block like InputRichBlockParagraph.
+ * Returns a RichTextTextMention object with a full User payload.
+ * The `text` field is itself a RichText object, per the Bot API schema.
  */
 function mentionFor(player, lang = 'en') {
   const label = withPlayerWord(lang, escapeHtml(player?.name || ''));
   if (player && player.userId) {
     return {
       type: 'text_mention',
-      text: label,
+      text: { type: 'text', text: label },
       user: {
         id: player.userId,
         is_bot: false,
@@ -515,40 +514,18 @@ function plainText(text) {
 }
 
 /**
- * A paragraph block. The `text` field is a single RichText object.
- * For inline formatting, wrap multiple rich-text objects in a
- * RichText array using the `text` property of the block as an array?
- * Actually, the spec says `text` is RichText (a single object).
- * To combine multiple elements, we must use a RichText object of type
- * 'text' that contains the combined string, or use a RichText object
- * that represents a sequence. However, the Bot API does not have a
- * RichTextSequence type. Instead, we can use the fact that most
- * RichText objects can contain nested rich text.
- *
- * The simplest valid approach: the paragraph block's `text` must be
- * a single RichText object. For mixed formatting (bold + mention + text),
- * we can use a RichText object of type 'text' that contains the full
- * string, but that loses formatting. To preserve formatting and mentions,
- * we need to use an array? Let's check the docs: InputRichBlockParagraph
- * has `text` of type RichText. RichText can be a union of many types.
- * To combine multiple, we can use a RichText object of type 'bold'
- * or 'italic' that has a `text` field which can be another RichText,
- * allowing nesting. But to have a sequence of different types,
- * we need to use an array. The spec for RichText does not mention an
- * array type. This is a known limitation/ambiguity.
- *
- * A pragmatic solution that works in practice: the paragraph block's
- * `text` field can accept an array of RichText objects in many
- * implementations (though not explicitly documented). We will use that.
- * If Telegram rejects the array, we will fall back to a single
- * concatenated string with entities (which is what we are trying to
- * avoid). For this fix, we assume the array is accepted.
+ * A paragraph block. The `text` field MUST be a single RichText object.
+ * We wrap an array of rich-text elements in a `text` container so that
+ * mixed formatting (bold, mention, plain text) can be concatenated.
  */
-function paragraphBlock(richTextArray) {
-  return { type: 'paragraph', text: { type: 'text', text: richTextArray } };
+function paragraphBlock(richText) {
+  const text = Array.isArray(richText)
+    ? { type: 'text', text: richText }
+    : richText;
+  return { type: 'paragraph', text };
 }
 
-/** A photo block. The `photo` field must be an InputMediaPhoto. */
+/** A photo block referencing the uploaded board image. */
 function photoBlock(mediaId = 'board') {
   return {
     type: 'photo',
@@ -1014,14 +991,14 @@ function boardPlayersList(game, lang) {
 
 /**
  * Builds an array of InputRichBlock for the board message.
- * Every user mention is a true RichTextTextMention object, embedded
- * within a paragraph block's text array.
+ * Every user mention is a RichTextTextMention object nested inside
+ * a paragraph block's text field.
  */
 function richBoardBlocks(game, lang, mediaId = 'board', prefix = '') {
   const blocks = [];
 
   // ── Header paragraph ─────────────────────────────────────────────
-  const headerEls = [];
+  let headerEls = [];
   if (prefix) {
     headerEls.push({ type: 'text', text: prefix });
     headerEls.push({ type: 'text', text: '\n\n' });
@@ -1038,7 +1015,7 @@ function richBoardBlocks(game, lang, mediaId = 'board', prefix = '') {
   return blocks;
 }
 
-/** Converts the board header into rich-text elements. */
+/** Converts the board header into an array of rich-text elements. */
 function headerToRichText(game, lang) {
   const els = [];
 
@@ -1081,7 +1058,7 @@ function headerToRichText(game, lang) {
   return els;
 }
 
-/** Converts the roster into rich-text elements. */
+/** Converts the roster into an array of rich-text elements. */
 function rosterToRichText(game, lang) {
   const els = [];
   els.push({ type: 'bold', text: `👥 ${t(lang, 'players')}\n` });
@@ -1111,7 +1088,6 @@ function rosterToRichText(game, lang) {
 
 /**
  * Sends a rich message built from blocks, with the board PNG attached.
- * The blocks array is validated against the InputRichBlock schema.
  */
 async function sendRichBoard(env, game, lang, prefix = '') {
   if (game.phase === PHASE.LOBBY) return null;
