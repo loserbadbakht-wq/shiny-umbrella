@@ -3,11 +3,9 @@
  * Cloudflare Worker + Durable Objects
  *
  * Chat-only. Boards are edited in place via rich messages. Dice are sent as
- * replies to the board. Once every active player has rolled, the round enters
- * a CLEANUP phase: the throw button disappears, the caption shows
- * "preparing next turn…", a 10-second countdown runs via a DO alarm (each
- * active player's dice sticker is deleted at the end), and only then does the
- * next round begin.
+ * replies to the board. Once every active player has rolled, the next round
+ * begins immediately — there is no cleanup phase, and dice messages are not
+ * tracked or removed.
  */
 
 import { Resvg, initWasm } from '@resvg/resvg-wasm';
@@ -24,7 +22,7 @@ const GAME_MODES = {
   snakes:  { pieces: 1, homeCells: 1 },
 };
 
-const PHASE = { LOBBY: 'lobby', ROLL: 'roll', MOVE: 'move', CLEANUP: 'cleanup', GAMEOVER: 'gameover' };
+const PHASE = { LOBBY: 'lobby', ROLL: 'roll', MOVE: 'move', GAMEOVER: 'gameover' };
 
 const MIN_PLAYERS = 4;
 const MAX_HUMANS = 20;
@@ -37,7 +35,6 @@ const BOARD_PNG_WIDTH = 900;
 const DEFAULT_LANG = 'en';
 const AVATAR_MAX_BYTES = 40 * 1024;
 const LLOYD_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
-const DICE_CLEANUP_SECONDS = 10;
 
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 
@@ -541,7 +538,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function removeReplyKeyboard() { return { remove_keyboard: true }; }
 
 function replyMarkupFor(game, lang) {
-  if (game.phase === PHASE.CLEANUP) return { inline_keyboard: [] };
   if (game.phase === PHASE.MOVE) {
     const player = game.players[game.current];
     if (!player.isBot && game.legalMoves.length >= 1) {
@@ -559,11 +555,6 @@ function replyMarkupFor(game, lang) {
     return removeReplyKeyboard();
   }
   return removeReplyKeyboard();
-}
-
-function inlineOnlyMarkup(markup) {
-  if (markup && markup.inline_keyboard) return markup;
-  return { inline_keyboard: [] };
 }
 
 /* ============================ AVATARS ============================ */
@@ -838,13 +829,6 @@ async function sendDiceSticker(env, chatId, dice, threadId = null, replyToMessag
   return tg(env, 'sendSticker', payload);
 }
 
-async function deleteMessages(env, chatId, messageIds) {
-  if (!chatId || !messageIds || !messageIds.length) return;
-  for (const msgId of messageIds) {
-    try { await tg(env, 'deleteMessage', { chat_id: chatId, message_id: msgId }); } catch (e) {}
-  }
-}
-
 /* ============================ SVG → PNG ============================ */
 
 let wasmReady = null;
@@ -937,14 +921,6 @@ function boardHeader(game, lang, prefix = '') {
     const winner = game.players[game.winners[game.winners.length - 1]];
     head += `🏆 <b>${mentionFor(winner, lang)}</b> ${t(lang, 'wins')}\n`;
     head += `<i>${t(lang, 'newGameHint')}</i>`;
-  } else if (game.phase === PHASE.CLEANUP) {
-    const reports = Array.isArray(game.roundReports) ? game.roundReports : [];
-    if (reports.length) {
-      head += reports.join('\n\n');
-      head += '\n\n';
-    }
-    head += `<b>${t(lang, 'waitingCleanup')}</b>`;
-    return head;
   } else {
     const player = game.players[game.current];
     const tag = mentionFor(player, lang);
@@ -963,8 +939,7 @@ function boardHeader(game, lang, prefix = '') {
 /* Roster: does NOT prepend the player word. */
 function boardPlayersList(game, lang) {
   const isActivePhase = game.phase !== PHASE.LOBBY
-    && game.phase !== PHASE.GAMEOVER
-    && game.phase !== PHASE.CLEANUP;
+    && game.phase !== PHASE.GAMEOVER;
   const items = game.players.map(p => {
     const isCurrent = isActivePhase && p.index === game.current;
     const checked = isCurrent ? ' checked' : '';
@@ -1020,6 +995,8 @@ async function trySendRich(env, chatId, threadId, png, html, replyMarkup) {
   return await tgForm(env, 'sendRichMessage', f);
 }
 
+/* Always sends a fresh board message. The previous board message is left
+   in the chat untouched, so dice replies keep pointing at a live board. */
 async function sendBoard(env, game, lang, prefix = '') {
   if (game.phase === PHASE.LOBBY) return null;
   const sinceLast = Date.now() - (game.lastBoardAt || 0);
@@ -1038,18 +1015,6 @@ async function sendBoard(env, game, lang, prefix = '') {
 
   const richHtml = richBoardHtml(game, lang, 'board', prefix);
   const replyMarkup = replyMarkupFor(game, lang);
-  const editMarkup = inlineOnlyMarkup(replyMarkup);
-
-  if (game.boardMessageId) {
-    const rr = await tryEditRich(env, game.chatId, game.boardMessageId, png, richHtml, editMarkup);
-    if (rr && rr.ok) return rr;
-    const desc = String((rr && rr.description) || '').toLowerCase();
-    const gone =
-      desc.includes('message to edit not found') ||
-      desc.includes('message_id_invalid') ||
-      desc.includes("message can't be edited");
-    if (!gone) return rr;
-  }
 
   const rich = await trySendRich(env, game.chatId, game.threadId, png, richHtml, replyMarkup);
   if (rich && rich.ok && rich.result && rich.result.message_id) {
@@ -1154,8 +1119,6 @@ function createGame(chatId, threadId, maxPlayers, hostUser, mode = 'classic', ga
     players: [], current: 0, dice: null, legalMoves: [],
     consecutiveSixes: 0, winners: [], turn: 1, log: [],
     avatars: {}, diceLog: [], lastBoardAt: 0, lobbyMessageId: null,
-    diceMessages: [], rolledThisRound: [], roundReports: [],
-    pendingCleanup: null,
   };
 }
 
@@ -1369,29 +1332,6 @@ function advanceTurn(game) {
   game.turn++;
 }
 
-/* ============================ DICE CLEANUP ============================ */
-
-function activePlayerCount(game) {
-  return game.players.filter(p => !p.left).length;
-}
-
-function registerDiceMessage(game, msgId, playerIndex) {
-  if (!Array.isArray(game.diceMessages)) game.diceMessages = [];
-  if (!Array.isArray(game.rolledThisRound)) game.rolledThisRound = [];
-  if (msgId) game.diceMessages.push(msgId);
-  if (!game.rolledThisRound.includes(playerIndex)) game.rolledThisRound.push(playerIndex);
-}
-
-function shouldCleanupDice(game) {
-  return game.rolledThisRound.length >= activePlayerCount(game);
-}
-
-function resetDiceTracking(game) {
-  game.diceMessages = [];
-  game.rolledThisRound = [];
-  game.roundReports = [];
-}
-
 /* ============================ BOT AI ============================ */
 
 function threatLevel(game, pos) {
@@ -1548,7 +1488,7 @@ function renderBoardSVG(game, size = 1000, lloydImg = null) {
 
     const yx = cx + R_YARD * Math.cos(a);
     const yy = cy + R_YARD * Math.sin(a);
-    const isCurrent = game.current === i && game.phase !== PHASE.GAMEOVER && game.phase !== PHASE.LOBBY && game.phase !== PHASE.CLEANUP;
+    const isCurrent = game.current === i && game.phase !== PHASE.GAMEOVER && game.phase !== PHASE.LOBBY;
 
     out.push(`<circle cx="${f(yx)}" cy="${f(yy)}" r="${f(yardR)}" fill="${p.colorLight}" stroke="${p.colorStroke}" stroke-width="3"/>`);
     const uri = avatarUriFor(game, p, lloydImg);
@@ -1792,7 +1732,7 @@ function renderSnakesBoardSVG(game, lloydImg = null) {
     const eTop = listTop + i * entryH;
     const ax = PANEL_CX;
     const ay = eTop + avatarH / 2;
-    const isCurrent = game.current === i && game.phase !== PHASE.GAMEOVER && game.phase !== PHASE.LOBBY && game.phase !== PHASE.CLEANUP;
+    const isCurrent = game.current === i && game.phase !== PHASE.GAMEOVER && game.phase !== PHASE.LOBBY;
 
     if (isCurrent) {
       out.push(`<rect x="${f(ax - avatarW/2 - 4)}" y="${f(ay - avatarH/2 - 4)}" width="${f(avatarW + 8)}" height="${f(avatarH + 8)}" rx="10" fill="none" stroke="${PALETTE.turnRing}" stroke-width="3" opacity="1"/>`);
@@ -1945,76 +1885,6 @@ export class GameRoom {
     return new Response('Not found', { status: 404 });
   }
 
-  /* === ALARM-BASED CLEANUP ===
-     Cloudflare Durable Object alarms are the only reliable way to schedule
-     future work that survives eviction and cannot be silently swallowed.
-     We use one alarm per countdown tick. */
-  async alarm() {
-    try {
-      await this.handleAlarm();
-    } catch (e) {
-      console.error('alarm handler failed:', e && e.stack ? e.stack : e);
-    }
-  }
-
-  async handleAlarm() {
-    const g = await this.load();
-    if (!g) return;
-    if (g.phase !== PHASE.CLEANUP) return;
-    const pc = g.pendingCleanup;
-    if (!pc) return;
-
-    const elapsedSec = Math.floor((Date.now() - pc.startedAt) / 1000);
-    const remaining = DICE_CLEANUP_SECONDS - elapsedSec;
-
-    if (remaining > 0) {
-      if (pc.statusMessageId) {
-        try {
-          await tg(this.env, 'editMessageText', {
-            chat_id: g.chatId, message_id: pc.statusMessageId,
-            text: `⏳ <b>${t(DEFAULT_LANG, 'diceCleanup').replaceAll('{n}', String(remaining))}</b>`,
-            parse_mode: 'HTML',
-          });
-        } catch (e) {}
-      }
-      try { await this.state.storage.setAlarm(Date.now() + 1000); } catch (e) {}
-      return;
-    }
-
-    // Countdown finished → finalise the round.
-    if (pc.statusMessageId) await safeDeleteMessage(this.env, g.chatId, pc.statusMessageId);
-    await deleteMessages(this.env, g.chatId, g.diceMessages || []);
-
-    resetDiceTracking(g);
-    g.pendingCleanup = null;
-    if (g.phase === PHASE.CLEANUP) g.phase = PHASE.ROLL;
-    await this.save(g);
-
-    const lang = pc.lang || DEFAULT_LANG;
-    try {
-      const r = await sendBoard(this.env, g, lang);
-      if (!r || !r.ok) {
-        g.lastBoardAt = 0;
-        await sleep(1500);
-        await sendBoard(this.env, g, lang);
-      }
-    } catch (e) { console.error('cleanup sendBoard failed:', e && e.message); }
-
-    // Chain consecutive bot turns.
-    let guard = 0;
-    while (guard++ < 20) {
-      const cur = g.players[g.current];
-      if (!cur || !cur.isBot) break;
-      if (g.phase === PHASE.GAMEOVER || g.phase === PHASE.CLEANUP) break;
-      try {
-        if (isSnakes(g)) await this.runSnakesBotTurn(g, lang);
-        else await this.runBotTurn(g, '', lang);
-      } catch (e) { break; }
-      await this.save(g);
-    }
-  }
-  /* === END ALARM-BASED CLEANUP === */
-
   async load() {
     const enc = await this.state.storage.get('game');
     if (!enc) return null;
@@ -2028,45 +1898,8 @@ export class GameRoom {
     try { await this.state.storage.put('game', JSON.stringify(game)); } catch (e) {}
   }
 
-  /* Helper called after any action that ended a turn. When all active
-     players have rolled, we enter CLEANUP and schedule a DO alarm for the
-     countdown. */
+  /* Resends the board after any action that ended a turn. */
   async endTurnAndUpdateBoard(game, lang, prefix, events) {
-    if (prefix) {
-      if (!Array.isArray(game.roundReports)) game.roundReports = [];
-      game.roundReports.push(prefix);
-    }
-    if (game.phase === PHASE.GAMEOVER) {
-      await sendBoard(this.env, game, lang, prefix);
-      return;
-    }
-
-    const advanced = events
-      ? events.some(e => e.type === 'next_turn')
-      : true;
-
-    if (advanced && shouldCleanupDice(game)) {
-      game.phase = PHASE.CLEANUP;
-      await this.save(game);
-      await sendBoard(this.env, game, lang, prefix);
-
-      const status = await sendMessage(this.env, game.chatId,
-        `⏳ <b>${t(DEFAULT_LANG, 'diceCleanup').replaceAll('{n}', String(DICE_CLEANUP_SECONDS))}</b>`,
-        {}, DEFAULT_LANG, game.threadId);
-      const statusId = status && status.ok && status.result ? status.result.message_id : null;
-
-      game.pendingCleanup = {
-        startedAt: Date.now(),
-        lang,
-        statusMessageId: statusId,
-      };
-      await this.save(game);
-
-      try { await this.state.storage.setAlarm(Date.now() + 1000); }
-      catch (e) { console.error('setAlarm failed:', e && e.message); }
-      return;
-    }
-
     await sendBoard(this.env, game, lang, prefix);
   }
 
@@ -2108,7 +1941,7 @@ export class GameRoom {
   async runBotTick() {
     const game = await this.load();
     if (!game) return { botsRemaining: 0 };
-    if (game.phase === PHASE.GAMEOVER || game.phase === PHASE.LOBBY || game.phase === PHASE.CLEANUP) {
+    if (game.phase === PHASE.GAMEOVER || game.phase === PHASE.LOBBY) {
       return { botsRemaining: 0 };
     }
     const cur = game.players[game.current];
@@ -2129,7 +1962,7 @@ export class GameRoom {
   async botsRemainingCheck() {
     const game = await this.load();
     if (!game) return { botsRemaining: 0 };
-    if (game.phase === PHASE.GAMEOVER || game.phase === PHASE.LOBBY || game.phase === PHASE.CLEANUP) {
+    if (game.phase === PHASE.GAMEOVER || game.phase === PHASE.LOBBY) {
       return { botsRemaining: 0 };
     }
     const cur = game.players[game.current];
@@ -2304,14 +2137,10 @@ export class GameRoom {
       if (cur.userId !== userId) return undefined;
 
       const dice = 1 + Math.floor(Math.random() * 6);
-      let diceMsgId = null;
       if (chatId) {
-        try {
-          const sr = await sendDiceSticker(env, chatId, dice, threadId, game.boardMessageId);
-          if (sr && sr.ok && sr.result) diceMsgId = sr.result.message_id;
-        } catch (e) {}
+        try { await sendDiceSticker(env, chatId, dice, threadId, game.boardMessageId); }
+        catch (e) {}
       }
-      registerDiceMessage(game, diceMsgId, cur.index);
 
       if (dice === 6) game.consecutiveSixes++; else game.consecutiveSixes = 0;
       if (!Array.isArray(game.diceLog)) game.diceLog = [];
@@ -2426,10 +2255,6 @@ export class GameRoom {
     game.consecutiveSixes = 0;
     game.dice = null;
     game.legalMoves = [];
-    game.diceMessages = [];
-    game.rolledThisRound = [];
-    game.roundReports = [];
-    game.pendingCleanup = null;
 
     try { await ensureAvatarsInGame(env, game); } catch (e) {}
 
@@ -2463,7 +2288,6 @@ export class GameRoom {
     if (!Array.isArray(game.diceLog)) game.diceLog = [];
     game.diceLog.push({ player: cur.name, dice, at: Date.now() });
     if (game.diceLog.length > 200) game.diceLog.shift();
-    registerDiceMessage(game, msg.message_id, cur.index);
 
     if (RULES.threeSixesLoseTurn && game.consecutiveSixes >= 3) {
       advanceTurn(game);
@@ -2500,12 +2324,8 @@ export class GameRoom {
     const bot = game.players[game.current];
     const dice = 1 + Math.floor(Math.random() * 6);
     if (game.chatId) {
-      let stickerMsgId = null;
-      try {
-        const sr = await sendDiceSticker(env, game.chatId, dice, game.threadId, game.boardMessageId);
-        if (sr && sr.ok && sr.result) stickerMsgId = sr.result.message_id;
-      } catch (e) {}
-      registerDiceMessage(game, stickerMsgId, bot.index);
+      try { await sendDiceSticker(env, game.chatId, dice, game.threadId, game.boardMessageId); }
+      catch (e) {}
     }
     if (dice === 6) game.consecutiveSixes++; else game.consecutiveSixes = 0;
     if (!Array.isArray(game.diceLog)) game.diceLog = [];
@@ -2542,12 +2362,8 @@ export class GameRoom {
     const bot = game.players[game.current];
     const dice = 1 + Math.floor(Math.random() * 6);
     if (game.chatId) {
-      let stickerMsgId = null;
-      try {
-        const sr = await sendDiceSticker(env, game.chatId, dice, game.threadId, game.boardMessageId);
-        if (sr && sr.ok && sr.result) stickerMsgId = sr.result.message_id;
-      } catch (e) {}
-      registerDiceMessage(game, stickerMsgId, bot.index);
+      try { await sendDiceSticker(env, game.chatId, dice, game.threadId, game.boardMessageId); }
+      catch (e) {}
     }
     if (dice === 6) game.consecutiveSixes++; else game.consecutiveSixes = 0;
     if (!Array.isArray(game.diceLog)) game.diceLog = [];
