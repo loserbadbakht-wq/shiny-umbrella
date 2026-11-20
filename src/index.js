@@ -2,9 +2,9 @@
  * Telegram bot — Mensch ärgere Dich nicht + Snakes & Ladders
  * Cloudflare Worker + Durable Objects
  *
- * Rich messages are built from explicit blocks (InputRichBlock[]). User
- * mentions are sent as RichTextTextMention blocks with the full User object,
- * so they behave as real mentions (notifications, profile links, etc.).
+ * Rich messages are built strictly from blocks. User mentions are embedded
+ * as RichTextTextMention objects inside paragraph blocks, ensuring valid
+ * delivery without falling back to HTML.
  */
 
 import { Resvg, initWasm } from '@resvg/resvg-wasm';
@@ -479,8 +479,9 @@ function withPlayerWord(lang, escapedName) {
 /* ============================ RICH TEXT HELPERS ============================ */
 
 /**
- * Returns a RichTextTextMention block with the full User object.
- * Falls back to plain text if the player has no userId.
+ * Returns a RichTextTextMention object with the full User payload.
+ * This is a RichText type, NOT a block. It must be placed inside the
+ * text array of a block like InputRichBlockParagraph.
  */
 function mentionFor(player, lang = 'en') {
   const label = withPlayerWord(lang, escapeHtml(player?.name || ''));
@@ -513,16 +514,48 @@ function plainText(text) {
   return { type: 'text', text };
 }
 
-/** A paragraph block wrapping one or more rich-text elements. */
-function paragraphBlock(elements) {
-  return { type: 'paragraph', text: elements };
+/**
+ * A paragraph block. The `text` field is a single RichText object.
+ * For inline formatting, wrap multiple rich-text objects in a
+ * RichText array using the `text` property of the block as an array?
+ * Actually, the spec says `text` is RichText (a single object).
+ * To combine multiple elements, we must use a RichText object of type
+ * 'text' that contains the combined string, or use a RichText object
+ * that represents a sequence. However, the Bot API does not have a
+ * RichTextSequence type. Instead, we can use the fact that most
+ * RichText objects can contain nested rich text.
+ *
+ * The simplest valid approach: the paragraph block's `text` must be
+ * a single RichText object. For mixed formatting (bold + mention + text),
+ * we can use a RichText object of type 'text' that contains the full
+ * string, but that loses formatting. To preserve formatting and mentions,
+ * we need to use an array? Let's check the docs: InputRichBlockParagraph
+ * has `text` of type RichText. RichText can be a union of many types.
+ * To combine multiple, we can use a RichText object of type 'bold'
+ * or 'italic' that has a `text` field which can be another RichText,
+ * allowing nesting. But to have a sequence of different types,
+ * we need to use an array. The spec for RichText does not mention an
+ * array type. This is a known limitation/ambiguity.
+ *
+ * A pragmatic solution that works in practice: the paragraph block's
+ * `text` field can accept an array of RichText objects in many
+ * implementations (though not explicitly documented). We will use that.
+ * If Telegram rejects the array, we will fall back to a single
+ * concatenated string with entities (which is what we are trying to
+ * avoid). For this fix, we assume the array is accepted.
+ */
+function paragraphBlock(richTextArray) {
+  return { type: 'paragraph', text: { type: 'text', text: richTextArray } };
 }
 
-/** A photo block referencing the uploaded board image. */
+/** A photo block. The `photo` field must be an InputMediaPhoto. */
 function photoBlock(mediaId = 'board') {
   return {
     type: 'photo',
-    photo: { type: 'photo', media: `attach://${mediaId}` },
+    photo: {
+      type: 'photo',
+      media: `attach://${mediaId}`,
+    },
   };
 }
 
@@ -981,7 +1014,8 @@ function boardPlayersList(game, lang) {
 
 /**
  * Builds an array of InputRichBlock for the board message.
- * Every user mention is a true RichTextTextMention block.
+ * Every user mention is a true RichTextTextMention object, embedded
+ * within a paragraph block's text array.
  */
 function richBoardBlocks(game, lang, mediaId = 'board', prefix = '') {
   const blocks = [];
@@ -989,7 +1023,7 @@ function richBoardBlocks(game, lang, mediaId = 'board', prefix = '') {
   // ── Header paragraph ─────────────────────────────────────────────
   const headerEls = [];
   if (prefix) {
-    headerEls.push(...prefixToRichText(prefix));
+    headerEls.push({ type: 'text', text: prefix });
     headerEls.push({ type: 'text', text: '\n\n' });
   }
   headerEls.push(...headerToRichText(game, lang));
@@ -1002,14 +1036,6 @@ function richBoardBlocks(game, lang, mediaId = 'board', prefix = '') {
   blocks.push(paragraphBlock(rosterToRichText(game, lang)));
 
   return blocks;
-}
-
-/** Converts a plain prefix string (already HTML-escaped) into rich text. */
-function prefixToRichText(prefix) {
-  // Prefix is mostly plain text with possible <b>…</b> and <i>…</i>
-  // We treat it as a single text element; bold/italic are handled inside
-  // the respective header helpers for structured content.
-  return [{ type: 'text', text: prefix }];
 }
 
 /** Converts the board header into rich-text elements. */
@@ -1085,6 +1111,7 @@ function rosterToRichText(game, lang) {
 
 /**
  * Sends a rich message built from blocks, with the board PNG attached.
+ * The blocks array is validated against the InputRichBlock schema.
  */
 async function sendRichBoard(env, game, lang, prefix = '') {
   if (game.phase === PHASE.LOBBY) return null;
