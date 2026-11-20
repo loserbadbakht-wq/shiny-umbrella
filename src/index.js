@@ -2,10 +2,9 @@
  * Telegram bot — Mensch ärgere Dich nicht + Snakes & Ladders
  * Cloudflare Worker + Durable Objects
  *
- * Chat-only. Boards are edited in place via rich messages. Dice are sent as
- * replies to the board. Once every active player has rolled, the next round
- * begins immediately — there is no cleanup phase, and dice messages are not
- * tracked or removed.
+ * Rich messages are built from explicit blocks (InputRichBlock[]). User
+ * mentions are sent as RichTextTextMention blocks with the full User object,
+ * so they behave as real mentions (notifications, profile links, etc.).
  */
 
 import { Resvg, initWasm } from '@resvg/resvg-wasm';
@@ -327,8 +326,6 @@ const TRANSLATIONS = {
     newGameHint: 'Use /new to start another game.',
     rollButton: '🎲 Throw dice',
     joinButton: '👋 Join',
-    diceCleanup: '⏳ Clearing dice in <b>{n}</b>…',
-    waitingCleanup: '⏳ Preparing next turn…',
 
     beginGame: '🚀 Begin game',
     space: 'space',
@@ -430,8 +427,6 @@ const TRANSLATIONS = {
     newGameHint: '/new بزنید.',
     rollButton: '🎲 تاس',
     joinButton: '👋 پیوستن',
-    diceCleanup: '⏳ پاک کردن در <b>{n}</b>…',
-    waitingCleanup: '⏳ در حال آماده‌سازی نوبت بعدی…',
 
     beginGame: '🚀 شروع',
     space: 'خانه',
@@ -481,23 +476,54 @@ function withPlayerWord(lang, escapedName) {
   return word ? `${word} ${escapedName}` : escapedName;
 }
 
+/* ============================ RICH TEXT HELPERS ============================ */
+
+/**
+ * Returns a RichTextTextMention block with the full User object.
+ * Falls back to plain text if the player has no userId.
+ */
 function mentionFor(player, lang = 'en') {
   const label = withPlayerWord(lang, escapeHtml(player?.name || ''));
-  if (player && player.userId) return `<a href="tg://user?id=${player.userId}">${label}</a>`;
-  return label;
+  if (player && player.userId) {
+    return {
+      type: 'text_mention',
+      text: label,
+      user: {
+        id: player.userId,
+        is_bot: false,
+        first_name: player.name || 'Player',
+      },
+    };
+  }
+  return { type: 'text', text: label };
 }
 
-function isForwardedMessage(msg) {
-  if (!msg) return false;
-  return !!(msg.forward_origin || msg.forward_from || msg.forward_from_chat || msg.forward_sender_name);
+/** A plain bold rich-text element. */
+function boldText(text) {
+  return { type: 'bold', text };
 }
 
-function snakesCellToGrid(cell) {
-  const idx = cell - 1;
-  const row = Math.floor(idx / SNAKES_COLS);
-  const colInRow = idx % SNAKES_COLS;
-  const col = row % 2 === 0 ? colInRow : (SNAKES_COLS - 1 - colInRow);
-  return { col, row };
+/** A plain italic rich-text element. */
+function italicText(text) {
+  return { type: 'italic', text };
+}
+
+/** A plain text rich-text element. */
+function plainText(text) {
+  return { type: 'text', text };
+}
+
+/** A paragraph block wrapping one or more rich-text elements. */
+function paragraphBlock(elements) {
+  return { type: 'paragraph', text: elements };
+}
+
+/** A photo block referencing the uploaded board image. */
+function photoBlock(mediaId = 'board') {
+  return {
+    type: 'photo',
+    photo: { type: 'photo', media: `attach://${mediaId}` },
+  };
 }
 
 /* ============================ UPDATE EXTRACTION ============================ */
@@ -951,54 +977,118 @@ function boardPlayersList(game, lang) {
   return `<b>👥 ${t(lang, 'players')}</b>\n<ul>\n${items.join('\n')}\n</ul>`;
 }
 
-/* Rich HTML: header, then image, then players list. */
-function richBoardHtml(game, lang, mediaId = 'board', prefix = '') {
-  const head = boardHeader(game, lang, prefix);
-  const players = boardPlayersList(game, lang);
-  const headHtml = String(head).replace(/\n/g, '<br/>');
-  const playersHtml = String(players);
-  return `${headHtml}<br/><img src="tg://photo?id=${mediaId}"/><br/>${playersHtml}`;
-}
+/* ============================ RICH BLOCKS CONSTRUCTION ============================ */
 
-/* ============================ BOARD SYNC ============================ */
+/**
+ * Builds an array of InputRichBlock for the board message.
+ * Every user mention is a true RichTextTextMention block.
+ */
+function richBoardBlocks(game, lang, mediaId = 'board', prefix = '') {
+  const blocks = [];
 
-async function renderAnyBoard(game, lloydImg) {
-  if (isSnakes(game)) return renderSnakesBoardSVG(game, lloydImg);
-  return { svg: renderBoardSVG(game, 1000, lloydImg), pngWidth: BOARD_PNG_WIDTH };
-}
-
-async function tryEditRich(env, chatId, messageId, png, html, editMarkup) {
-  const f = new FormData();
-  f.append('chat_id', String(chatId));
-  f.append('message_id', String(messageId));
-  f.append('rich_message', JSON.stringify({
-    html,
-    media: [{ id: 'board', media: { type: 'photo', media: 'attach://board' } }],
-  }));
-  f.append('board', new Blob([png], { type: 'image/png' }), 'board.png');
-  f.append('reply_markup', JSON.stringify(editMarkup));
-  return await tgForm(env, 'editMessageText', f);
-}
-
-async function trySendRich(env, chatId, threadId, png, html, replyMarkup) {
-  const f = new FormData();
-  f.append('chat_id', String(chatId));
-  if (threadId) f.append('message_thread_id', String(threadId));
-  f.append('rich_message', JSON.stringify({
-    html,
-    media: [{ id: 'board', media: { type: 'photo', media: 'attach://board' } }],
-  }));
-  f.append('board', new Blob([png], { type: 'image/png' }), 'board.png');
-  if (replyMarkup && replyMarkup.inline_keyboard) {
-    f.append('reply_markup', JSON.stringify(replyMarkup));
+  // ── Header paragraph ─────────────────────────────────────────────
+  const headerEls = [];
+  if (prefix) {
+    headerEls.push(...prefixToRichText(prefix));
+    headerEls.push({ type: 'text', text: '\n\n' });
   }
-  return await tgForm(env, 'sendRichMessage', f);
+  headerEls.push(...headerToRichText(game, lang));
+  blocks.push(paragraphBlock(headerEls));
+
+  // ── Board image ──────────────────────────────────────────────────
+  blocks.push(photoBlock(mediaId));
+
+  // ── Players roster ───────────────────────────────────────────────
+  blocks.push(paragraphBlock(rosterToRichText(game, lang)));
+
+  return blocks;
 }
 
-/* Always sends a fresh board message. The previous board message is left
-   in the chat untouched, so dice replies keep pointing at a live board. */
-async function sendBoard(env, game, lang, prefix = '') {
+/** Converts a plain prefix string (already HTML-escaped) into rich text. */
+function prefixToRichText(prefix) {
+  // Prefix is mostly plain text with possible <b>…</b> and <i>…</i>
+  // We treat it as a single text element; bold/italic are handled inside
+  // the respective header helpers for structured content.
+  return [{ type: 'text', text: prefix }];
+}
+
+/** Converts the board header into rich-text elements. */
+function headerToRichText(game, lang) {
+  const els = [];
+
+  if (game.phase === PHASE.LOBBY) {
+    const humans = game.players.filter(p => !p.isBot).length;
+    els.push({ type: 'bold', text: `🎮 ${t(lang, 'lobbyOpened')}` });
+    els.push({ type: 'text', text: `\n👥 ${t(lang, 'humans')}: ` });
+    els.push({ type: 'bold', text: `${humans} / ${game.maxPlayers}` });
+    els.push({ type: 'text', text: `\n🎯 ${t(lang, 'modeLabel')}: ` });
+    els.push({ type: 'bold', text: modeLabel(lang, game) });
+    if (isSnakes(game)) {
+      const colorKey = game.boardColor && SNAKES_BOARD_COLORS[game.boardColor] ? game.boardColor : 'green';
+      els.push({ type: 'text', text: `\n🎨 ${t(lang, 'boardColorLabel')}: ` });
+      els.push({
+        type: 'bold',
+        text: `${SNAKES_COLOR_EMOJI[colorKey]} ${snakesColorName(lang, colorKey)}`,
+      });
+    }
+  } else if (game.phase === PHASE.GAMEOVER) {
+    const winner = game.players[game.winners[game.winners.length - 1]];
+    els.push({ type: 'bold', text: `🏆 ${mentionFor(winner, lang)}` });
+    els.push({ type: 'text', text: ` ${t(lang, 'wins')}\n` });
+    els.push({ type: 'italic', text: t(lang, 'newGameHint') });
+  } else {
+    const player = game.players[game.current];
+    els.push({ type: 'bold', text: `🎮 ${t(lang, 'turn')} ${game.turn}` });
+    els.push({ type: 'text', text: ` · ${player.emoji} ` });
+    els.push(mentionFor(player, lang));
+    if (game.phase === PHASE.MOVE) {
+      els.push({ type: 'text', text: `\n${rolledText(lang, game.dice)}\n${t(lang, 'choosePiece')}` });
+    } else if (game.phase === PHASE.ROLL) {
+      if (player.isBot) {
+        els.push({ type: 'text', text: `\n🤖 ${t(lang, 'rolling')}` });
+      } else {
+        els.push({ type: 'text', text: `\n${t(lang, 'tapDice')}` });
+      }
+    }
+  }
+
+  return els;
+}
+
+/** Converts the roster into rich-text elements. */
+function rosterToRichText(game, lang) {
+  const els = [];
+  els.push({ type: 'bold', text: `👥 ${t(lang, 'players')}\n` });
+
+  for (const p of game.players) {
+    const isCurrent = game.phase !== PHASE.LOBBY
+      && game.phase !== PHASE.GAMEOVER
+      && p.index === game.current;
+
+    els.push({ type: 'text', text: p.emoji + ' ' });
+
+    if (isCurrent) {
+      els.push({ type: 'bold', text: p.name });
+    } else {
+      els.push({ type: 'text', text: p.name });
+    }
+
+    if (p.index !== game.players.length - 1) {
+      els.push({ type: 'text', text: '\n' });
+    }
+  }
+
+  return els;
+}
+
+/* ============================ SENDING RICH BLOCKS ============================ */
+
+/**
+ * Sends a rich message built from blocks, with the board PNG attached.
+ */
+async function sendRichBoard(env, game, lang, prefix = '') {
   if (game.phase === PHASE.LOBBY) return null;
+
   const sinceLast = Date.now() - (game.lastBoardAt || 0);
   if (sinceLast < BOARD_COOLDOWN_MS) await sleep(BOARD_COOLDOWN_MS - sinceLast);
   game.lastBoardAt = Date.now();
@@ -1013,14 +1103,54 @@ async function sendBoard(env, game, lang, prefix = '') {
     return null;
   }
 
-  const richHtml = richBoardHtml(game, lang, 'board', prefix);
+  const blocks = richBoardBlocks(game, lang, 'board', prefix);
   const replyMarkup = replyMarkupFor(game, lang);
 
-  const rich = await trySendRich(env, game.chatId, game.threadId, png, richHtml, replyMarkup);
-  if (rich && rich.ok && rich.result && rich.result.message_id) {
-    game.boardMessageId = rich.result.message_id;
+  const f = new FormData();
+  f.append('chat_id', String(game.chatId));
+  if (game.threadId) f.append('message_thread_id', String(game.threadId));
+  f.append('rich_message', JSON.stringify({ blocks, media: [{ id: 'board', media: { type: 'photo', media: 'attach://board' } }] }));
+  f.append('board', new Blob([png], { type: 'image/png' }), 'board.png');
+  if (replyMarkup && replyMarkup.inline_keyboard) {
+    f.append('reply_markup', JSON.stringify(replyMarkup));
   }
-  return rich;
+
+  const res = await tgForm(env, 'sendRichMessage', f);
+  if (res && res.ok && res.result && res.result.message_id) {
+    game.boardMessageId = res.result.message_id;
+  }
+  return res;
+}
+
+/**
+ * Edits an existing rich message (used for the lobby preview).
+ */
+async function editRichBoard(env, game, lang, messageId) {
+  if (!messageId) return null;
+
+  let png;
+  try {
+    const needsLloyd = game.players.some(p => p.isBot && p.name === SPECIAL_BOT_NAME);
+    const lloydImg = needsLloyd ? await ensureLloydImage(env) : null;
+    const r = await renderAnyBoard(game, lloydImg);
+    png = await svgToPng(r.svg, r.pngWidth);
+  } catch (e) {
+    return null;
+  }
+
+  const blocks = richBoardBlocks(game, lang, 'board');
+  const replyMarkup = replyMarkupFor(game, lang);
+
+  const f = new FormData();
+  f.append('chat_id', String(game.chatId));
+  f.append('message_id', String(messageId));
+  f.append('rich_message', JSON.stringify({ blocks, media: [{ id: 'board', media: { type: 'photo', media: 'attach://board' } }] }));
+  f.append('board', new Blob([png], { type: 'image/png' }), 'board.png');
+  if (replyMarkup && replyMarkup.inline_keyboard) {
+    f.append('reply_markup', JSON.stringify(replyMarkup));
+  }
+
+  return await tgForm(env, 'editMessageText', f);
 }
 
 /* ============================ LOBBY PREVIEW ============================ */
@@ -1082,14 +1212,23 @@ async function sendLobbyPreview(env, game, lang) {
   try { png = await renderLobbyPreviewPng(game); }
   catch (e) { return null; }
 
-  const richHtml = richBoardHtml(game, lang, 'board');
+  const blocks = richBoardBlocks(game, lang, 'board');
   const replyMarkup = lobbyKeyboard(game, lang);
 
-  const rich = await trySendRich(env, game.chatId, game.threadId, png, richHtml, replyMarkup);
-  if (rich && rich.ok && rich.result && rich.result.message_id) {
-    game.boardMessageId = rich.result.message_id;
+  const f = new FormData();
+  f.append('chat_id', String(game.chatId));
+  if (game.threadId) f.append('message_thread_id', String(game.threadId));
+  f.append('rich_message', JSON.stringify({ blocks, media: [{ id: 'board', media: { type: 'photo', media: 'attach://board' } }] }));
+  f.append('board', new Blob([png], { type: 'image/png' }), 'board.png');
+  if (replyMarkup && replyMarkup.inline_keyboard) {
+    f.append('reply_markup', JSON.stringify(replyMarkup));
   }
-  return rich;
+
+  const res = await tgForm(env, 'sendRichMessage', f);
+  if (res && res.ok && res.result && res.result.message_id) {
+    game.boardMessageId = res.result.message_id;
+  }
+  return res;
 }
 
 async function updateLobbyPreview(env, game, lang, messageId) {
@@ -1100,10 +1239,19 @@ async function updateLobbyPreview(env, game, lang, messageId) {
   try { png = await renderLobbyPreviewPng(game); }
   catch (e) { return null; }
 
-  const richHtml = richBoardHtml(game, lang, 'board');
+  const blocks = richBoardBlocks(game, lang, 'board');
   const replyMarkup = lobbyKeyboard(game, lang);
 
-  return await tryEditRich(env, game.chatId, targetMsgId, png, richHtml, replyMarkup);
+  const f = new FormData();
+  f.append('chat_id', String(game.chatId));
+  f.append('message_id', String(targetMsgId));
+  f.append('rich_message', JSON.stringify({ blocks, media: [{ id: 'board', media: { type: 'photo', media: 'attach://board' } }] }));
+  f.append('board', new Blob([png], { type: 'image/png' }), 'board.png');
+  if (replyMarkup && replyMarkup.inline_keyboard) {
+    f.append('reply_markup', JSON.stringify(replyMarkup));
+  }
+
+  return await tgForm(env, 'editMessageText', f);
 }
 
 /* ============================ GAME LOGIC ============================ */
@@ -1900,7 +2048,7 @@ export class GameRoom {
 
   /* Resends the board after any action that ended a turn. */
   async endTurnAndUpdateBoard(game, lang, prefix, events) {
-    await sendBoard(this.env, game, lang, prefix);
+    await sendRichBoard(this.env, game, lang, prefix);
   }
 
   async handleUpdate(update, workerUrl) {
@@ -2069,7 +2217,7 @@ export class GameRoom {
       }
       case '/board': {
         if (!game) { await sendMessage(env, chatId, t(lang, 'noGameHere'), {}, lang, threadId); return undefined; }
-        await sendBoard(env, game, lang);
+        await sendRichBoard(env, game, lang);
         return undefined;
       }
       case '/end': {
@@ -2176,7 +2324,7 @@ export class GameRoom {
       game.legalMoves = moves;
       game.phase = PHASE.MOVE;
       await this.save(game);
-      await sendBoard(env, game, lang);
+      await sendRichBoard(env, game, lang);
       return SAVED_SENTINEL;
     }
 
@@ -2268,7 +2416,7 @@ export class GameRoom {
     if (botCount > 0) prefix += ` · 🤖 ${t(lang, 'bot')}: <b>${botCount}</b>`;
 
     await this.save(game);
-    await sendBoard(env, game, lang, prefix);
+    await sendRichBoard(env, game, lang, prefix);
     return game;
   }
 
@@ -2315,7 +2463,7 @@ export class GameRoom {
     game.legalMoves = moves;
     game.phase = PHASE.MOVE;
     await this.save(game);
-    await sendBoard(env, game, lang);
+    await sendRichBoard(env, game, lang);
     return SAVED_SENTINEL;
   }
 
